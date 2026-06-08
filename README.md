@@ -17,6 +17,7 @@ Bake_Groups/
   Python tool files
   localization files
   icons
+  bg_math_core.cpp source file
   bg_math_core.pyd builds for Maya 2022-2027
 ```
 
@@ -49,4 +50,3 @@ Then follow the shelf installation steps in:
 - `PCA Shape` is the default HP analysis strategy.
 - `Ignore Floaters` can be enabled in the Algorithm section to skip the floater/decal pass during Analyze HP.
 - ZBrush geometry should be placed into a display layer with `zbrush` in its name so smoothing is skipped correctly during export.
-
