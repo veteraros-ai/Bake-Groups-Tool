@@ -1,0 +1,149 @@
+<mxfile host="app.diagrams.net" modified="2026-06-06T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="analyze-hp-flow-ru" name="Analyze HP">
+    <mxGraphModel dx="1800" dy="1400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="2200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Что происходит после нажатия Analyze HP" style="text;html=1;strokeColor=none;fillColor=none;fontSize=26;fontStyle=1;fontColor=#FFFFFF;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="330" y="30" width="740" height="50" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n1" value="Нажали Analyze HP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2F80ED;strokeColor=#1B4F9C;fontColor=#FFFFFF;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="100" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="n2" value="Найти активную главу и HP / LP root" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="190" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="d1" value="HP root найден?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#3A2F52;strokeColor=#8E6CC7;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="565" y="295" width="250" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="stop1" value="Остановить анализ" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8E3B3B;strokeColor=#C55353;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="940" y="315" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="n3" value="Проверить возможные ZBrush-меши вне ZBrush layer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="430" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="d2" value="Есть подозрительные ZBrush?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#3A2F52;strokeColor=#8E6CC7;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="565" y="535" width="250" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="n4" value="Окно предупреждения: Skip / Select" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#765214;strokeColor=#D69B2D;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="930" y="560" width="250" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="stop2" value="Select: выделить меши и остановить Analyze HP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8E3B3B;strokeColor=#C55353;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="930" y="680" width="250" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n5" value="Собрать настройки алгоритма из UI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="690" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="d3" value="Keep HP включён?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#3A2F52;strokeColor=#8E6CC7;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="565" y="800" width="250" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="keep1" value="Оставить текущие HP-сабгруппы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#31543A;strokeColor=#5E9B69;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="940" y="820" width="250" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="keep2" value="Обновить UI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#31543A;strokeColor=#5E9B69;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="940" y="920" width="250" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n6" value="Разобрать незаблокированные HP-сабгруппы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="940" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n7" value="Перенести HP-меши обратно в HP root" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1040" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n8" value="Удалить старые незаблокированные группы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1140" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n9" value="Собрать HP mesh data: bbox, volume, uuid, ZBrush-флаг" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1240" width="300" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="n10" value="Собрать LP mesh data и virtual LP shells для combined LP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1350" width="300" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="n11" value="Закэшировать вершины HP / LP и boundary holes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1460" width="300" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="worker" value="HPGroupingWorker" style="swimlane;whiteSpace=wrap;html=1;fillColor=#1F2B3A;strokeColor=#4F78A8;fontColor=#FFFFFF;fontSize=15;fontStyle=1;startSize=34;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1580" width="860" height="610" as="geometry"/>
+        </mxCell>
+        <mxCell id="w1" value="Step 0: Semantic ZBrush grouping" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="40" y="55" width="260" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="w2" value="Step 1-2: HP → LP matching по BBox, PCA / Topology / Vertex distance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="330" y="55" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="w3" value="Если HP не найден: оставить unassigned или применить fallback для ZBrush" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="330" y="155" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="w4" value="Step 2.5: поиск floaters / decals рядом с boundary holes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="330" y="255" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="w5" value="Step 3: кластеризация похожих LP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="40" y="255" width="260" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="w6" value="Step 4: расчёт размерных порогов сцены" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="40" y="350" width="260" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="w7" value="Step 5: кластеризация одиночных HP и внедрение GT / manual links" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="330" y="350" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="w8" value="Step 6: категории Huge / Large / Medium / Small / Bolts / ZBrush" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="330" y="455" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="w9" value="Step 7: Spatial packing и финальное сжатие совместимых групп" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#64748B;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="worker">
+          <mxGeometry x="40" y="455" width="260" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n12" value="Worker возвращает groups + logs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="2240" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n13" value="Удалить старые незаблокированные HP-группы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="2340" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n14" value="Создать новые HP-сабгруппы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="2440" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="n15" value="Перенести меши внутрь новых групп" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#607D8B;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="2540" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="done" value="Обновить UI. Готово." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#219653;strokeColor=#0E6B35;fontColor=#FFFFFF;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="2640" width="300" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n1" target="n2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n2" target="d1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e3" value="нет" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#C55353;fontColor=#FFFFFF;" edge="1" parent="1" source="d1" target="stop1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e4" value="да" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="d1" target="n3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n3" target="d2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e6" value="да" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D69B2D;fontColor=#FFFFFF;" edge="1" parent="1" source="d2" target="n4"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e7" value="Select" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#C55353;fontColor=#FFFFFF;" edge="1" parent="1" source="n4" target="stop2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e8" value="Skip" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n4" target="n5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e9" value="нет" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="d2" target="n5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n5" target="d3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e11" value="да" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#5E9B69;fontColor=#FFFFFF;" edge="1" parent="1" source="d3" target="keep1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#5E9B69;fontColor=#FFFFFF;" edge="1" parent="1" source="keep1" target="keep2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e13" value="нет" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="d3" target="n6"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n6" target="n7"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n7" target="n8"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n8" target="n9"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n9" target="n10"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n10" target="n11"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n11" target="worker"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w1" target="w2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w2" target="w3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w3" target="w4"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w4" target="w5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w5" target="w6"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w6" target="w7"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w7" target="w8"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="ew8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="worker" source="w8" target="w9"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="worker" target="n12"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n12" target="n13"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n13" target="n14"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e23" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n14" target="n15"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#A7B5C4;fontColor=#FFFFFF;" edge="1" parent="1" source="n15" target="done"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

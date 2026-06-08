@@ -1,0 +1,15 @@
+{
+  "default": "en",
+  "languages": [
+    {
+      "label": "Russian",
+      "code": "ru",
+      "file": "ru.json"
+    },
+    {
+      "label": "English",
+      "code": "en",
+      "file": "en.json"
+    }
+  ]
+}
