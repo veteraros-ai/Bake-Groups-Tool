@@ -216,6 +216,105 @@ bool py_check_mesh_collision(const std::vector<float>& verts_a, const std::vecto
     return check_mesh_collision(verts_a, verts_b, threshold);
 }
 
+bool are_symmetric_axis(
+    const std::vector<float>& verts_a,
+    const std::vector<float>& verts_b,
+    int axis,
+    float tolerance,
+    float min_match_ratio)
+{
+    size_t count_a = verts_a.size() / 3;
+    size_t count_b = verts_b.size() / 3;
+    if (count_a == 0 || count_a != count_b) return false;
+
+    float center_a = 0.0f;
+    float center_b = 0.0f;
+    for (size_t i = 0; i < count_a; ++i) {
+        center_a += verts_a[i * 3 + axis];
+        center_b += verts_b[i * 3 + axis];
+    }
+    center_a /= static_cast<float>(count_a);
+    center_b /= static_cast<float>(count_b);
+
+    float mirror_plane = (center_a + center_b) * 0.5f;
+    float cell_size = std::max(tolerance, 1e-6f);
+    float tolerance_sq = tolerance * tolerance;
+
+    std::unordered_map<std::tuple<int, int, int>, std::vector<size_t>, PosHash> grid;
+    grid.reserve(count_b * 2);
+
+    for (size_t i = 0; i < count_b; ++i) {
+        float x = verts_b[i * 3];
+        float y = verts_b[i * 3 + 1];
+        float z = verts_b[i * 3 + 2];
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+        int gx = static_cast<int>(std::floor(x / cell_size));
+        int gy = static_cast<int>(std::floor(y / cell_size));
+        int gz = static_cast<int>(std::floor(z / cell_size));
+        grid[{gx, gy, gz}].push_back(i);
+    }
+
+    std::vector<unsigned char> used(count_b, 0);
+    size_t matched = 0;
+
+    for (size_t i = 0; i < count_a; ++i) {
+        float p[3] = {verts_a[i * 3], verts_a[i * 3 + 1], verts_a[i * 3 + 2]};
+        if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+        p[axis] = mirror_plane * 2.0f - p[axis];
+
+        int gx = static_cast<int>(std::floor(p[0] / cell_size));
+        int gy = static_cast<int>(std::floor(p[1] / cell_size));
+        int gz = static_cast<int>(std::floor(p[2] / cell_size));
+
+        bool found = false;
+        for (int dx = -1; dx <= 1 && !found; ++dx) {
+            for (int dy = -1; dy <= 1 && !found; ++dy) {
+                for (int dz = -1; dz <= 1 && !found; ++dz) {
+                    auto it = grid.find({gx + dx, gy + dy, gz + dz});
+                    if (it == grid.end()) continue;
+                    for (size_t idx : it->second) {
+                        if (used[idx]) continue;
+                        float bx = verts_b[idx * 3];
+                        float by = verts_b[idx * 3 + 1];
+                        float bz = verts_b[idx * 3 + 2];
+                        float ddx = p[0] - bx;
+                        float ddy = p[1] - by;
+                        float ddz = p[2] - bz;
+                        if ((ddx * ddx + ddy * ddy + ddz * ddz) <= tolerance_sq) {
+                            used[idx] = 1;
+                            ++matched;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return (static_cast<float>(matched) / static_cast<float>(count_a)) >= min_match_ratio;
+}
+
+bool are_symmetric(const std::vector<float>& verts_a, const std::vector<float>& verts_b, float tolerance) {
+    if (verts_a.size() < 9 || verts_b.size() < 9) return false;
+    if ((verts_a.size() % 3) != 0 || (verts_b.size() % 3) != 0) return false;
+    if ((verts_a.size() / 3) != (verts_b.size() / 3)) return false;
+
+    float safe_tolerance = std::max(tolerance, 1e-6f);
+    const float min_match_ratio = 0.85f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (are_symmetric_axis(verts_a, verts_b, axis, safe_tolerance, min_match_ratio)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool py_are_symmetric(const std::vector<float>& verts_a, const std::vector<float>& verts_b, float tolerance) {
+    py::gil_scoped_release release;
+    return are_symmetric(verts_a, verts_b, tolerance);
+}
+
 std::string generate_fingerprint_data(const std::vector<float>& verts, const std::vector<float>& center) {
     if (verts.size() < 3 || center.size() < 3) return "empty";
     
@@ -535,6 +634,7 @@ PYBIND11_MODULE(bg_math_core, m) {
     m.def("calculate_min_distance", &py_calculate_min_distance, "Calculate absolute minimum distance between two vertex clouds (Multi-threaded)");
     
     m.def("check_mesh_collision", &py_check_mesh_collision, "Fast spatial hash-based collision detection between vertex clouds");
+    m.def("are_symmetric", &py_are_symmetric, py::arg("verts_a"), py::arg("verts_b"), py::arg("tolerance") = 0.01f, "Check mirrored point-cloud symmetry across the best world axis");
     m.def("resolve_hp_collision", &py_resolve_hp_collision, "Resolve high-poly to low-poly candidate assignment collisions");
     m.def("calculate_vertex_owner_scores", &py_calculate_vertex_owner_scores, "Calculate LP/HP nearest-vertex ownership scores for candidate pairs");
     

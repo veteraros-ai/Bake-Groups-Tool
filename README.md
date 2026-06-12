@@ -45,8 +45,18 @@ Then follow the shelf installation steps in:
 - `_Documentation/Installation EN.md`
 - `_Documentation/Установка RU.md`
 
+## Building bg_math_core
+
+The compiled `bg_math_core.pyd` files can be rebuilt from the repository root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_math_core.ps1
+```
+
+By default, the script builds Maya 2022-2027 into `Bake_Groups\bin\<version>`.
+
 ## Current Notes
 
 - `PCA Shape` is the default HP analysis strategy.
-- `Ignore Floaters` can be enabled in the Algorithm section to skip the floater/decal pass during Analyze HP.
+- `Ignore Floaters` is enabled by default in the Algorithm section to skip the floater/decal pass during Analyze HP.
 - ZBrush geometry should be placed into a display layer with `zbrush` in its name so smoothing is skipped correctly during export.
