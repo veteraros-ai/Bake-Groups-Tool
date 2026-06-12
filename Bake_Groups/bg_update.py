@@ -343,6 +343,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         super(UpdateAvailableDialog, self).__init__(parent)
         self.update_info = update_info or {}
         self.install_worker = None
+        self.install_success = False
         self.setWindowTitle(bg_l10n.text("Bake Groups Tool Update"))
         self.setObjectName("BakeGroupsUpdateDialog")
         self.setModal(True)
@@ -457,11 +458,13 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.later_btn.setEnabled(True)
         self.later_btn.setText(bg_l10n.text("Close"))
         if result.get("success"):
+            self.install_success = True
             self.progress_bar.setValue(100)
-            self.update_btn.setEnabled(False)
-            self.update_btn.setText(bg_l10n.text("Installed"))
-            self.status_label.setText(bg_l10n.text("Update installed. Restart Bake Groups Tool to load version {version}.").format(version=result.get("version", "")))
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(bg_l10n.text("Restart Tool"))
+            self.status_label.setText(bg_l10n.text("Update installed. Press Restart Tool to load version {version}.").format(version=result.get("version", "")))
         else:
+            self.install_success = False
             self.update_btn.setEnabled(True)
             self.update_btn.setText(bg_l10n.text("Retry"))
             self.status_label.setText(bg_l10n.text("Update installation failed: {error}").format(error=result.get("error", "")))
@@ -564,11 +567,48 @@ def open_url(url):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
+def restart_tool(dialog):
+    bootstrap_dir = _bootstrap_dir()
+    launcher_path = os.path.join(bootstrap_dir, "launcher.py")
+    if not os.path.exists(launcher_path):
+        dialog.status_label.setText(bg_l10n.text("Launcher not found: {path}").format(path=launcher_path))
+        dialog.status_label.show()
+        return
+
+    parent = dialog.parent()
+    dialog.accept()
+
+    def run_launcher():
+        try:
+            if parent:
+                try:
+                    parent.close()
+                except Exception:
+                    pass
+            namespace = {"__file__": launcher_path, "__name__": "__main__"}
+            with open(launcher_path, "rb") as handle:
+                source = handle.read()
+            if not isinstance(source, str):
+                source = source.decode("utf-8", "replace")
+            exec(compile(source, launcher_path, "exec"), namespace, namespace)
+        except Exception as exc:
+            try:
+                import maya.cmds as cmds
+                cmds.warning("Bake Groups restart failed: {}".format(exc))
+            except Exception:
+                print("Bake Groups restart failed: {}".format(exc))
+
+    QtCore.QTimer.singleShot(250, run_launcher)
+
+
 def show_update_dialog(update_info, parent=None):
     dialog = UpdateAvailableDialog(update_info, parent)
     dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
 
     def start_install():
+        if getattr(dialog, "install_success", False):
+            restart_tool(dialog)
+            return
         if dialog.install_worker and dialog.install_worker.isRunning():
             return
         dialog.set_installing()
