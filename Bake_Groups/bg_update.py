@@ -4,6 +4,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import zipfile
 from datetime import datetime
@@ -36,18 +38,28 @@ def is_newer_version(remote_version, current_version):
 
 
 def _read_url(url, timeout=4):
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
-            "Accept": "application/json,text/plain",
-        }
-    )
-    response = urlopen(request, timeout=timeout)
-    data = response.read()
-    if not isinstance(data, str):
-        data = data.decode("utf-8", "replace")
-    return data
+    try:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
+                "Accept": "application/json,text/plain",
+            }
+        )
+        response = urlopen(request, timeout=timeout)
+        data = response.read()
+        if not isinstance(data, str):
+            data = data.decode("utf-8", "replace")
+        return data
+    except Exception:
+        temp_dir = tempfile.mkdtemp(prefix="BakeGroupsNet_")
+        try:
+            path = os.path.join(temp_dir, "response.txt")
+            _download_with_powershell(url, path, timeout)
+            with open(path, "rb") as handle:
+                return handle.read().decode("utf-8", "replace")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def fetch_remote_version(timeout=4):
@@ -122,15 +134,57 @@ def _bootstrap_dir():
 
 
 def _read_bytes_url(url, timeout=30):
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
-            "Accept": "application/zip,application/octet-stream,*/*",
-        }
+    try:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
+                "Accept": "application/zip,application/octet-stream,*/*",
+            }
+        )
+        response = urlopen(request, timeout=timeout)
+        return response.read()
+    except Exception:
+        temp_dir = tempfile.mkdtemp(prefix="BakeGroupsNet_")
+        try:
+            path = os.path.join(temp_dir, "package.bin")
+            _download_with_powershell(url, path, timeout)
+            with open(path, "rb") as handle:
+                return handle.read()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _download_with_powershell(url, target_path, timeout=60):
+    script = (
+        "& { "
+        "param([string]$u,[string]$o) "
+        "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
+        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; "
+        "Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing "
+        "}"
     )
-    response = urlopen(request, timeout=timeout)
-    return response.read()
+    cmd = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", script,
+        url,
+        target_path,
+    ]
+    kwargs = {"stderr": subprocess.STDOUT}
+    if sys.version_info[0] >= 3:
+        kwargs["timeout"] = max(30, int(timeout or 60))
+    try:
+        subprocess.check_output(cmd, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        output = exc.output
+        if not isinstance(output, str):
+            output = output.decode("utf-8", "replace")
+        raise RuntimeError("PowerShell download failed: {}".format(output.strip()))
+    if not os.path.exists(target_path) or os.path.getsize(target_path) <= 0:
+        raise RuntimeError("PowerShell download produced an empty file")
 
 
 def _copy_runtime_tree(source_dir, target_dir):
