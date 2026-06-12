@@ -449,6 +449,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         layout.addLayout(buttons)
 
     def set_installing(self):
+        self._set_status_warning(False)
         self.status_label.setText(bg_l10n.text("Installing update..."))
         self.status_label.show()
         self.progress_bar.setValue(0)
@@ -456,8 +457,10 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.update_btn.setEnabled(False)
         self.release_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
+        self.later_btn.show()
 
     def set_install_progress(self, value, message):
+        self._set_status_warning(False)
         self.progress_bar.setValue(max(0, min(100, int(value or 0))))
         if message:
             self.status_label.setText(message)
@@ -472,13 +475,26 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.progress_bar.setValue(100)
             self.update_btn.setEnabled(True)
             self.update_btn.setText(bg_l10n.text("Close"))
+            self.later_btn.hide()
+            self._set_status_warning(True)
             self.status_label.setText(bg_l10n.text("Update installed. Restart Maya to complete the update."))
         else:
             self.install_success = False
             self.update_btn.setEnabled(True)
             self.update_btn.setText(bg_l10n.text("Retry"))
+            self.later_btn.show()
+            self._set_status_warning(False)
             self.status_label.setText(bg_l10n.text("Update installation failed: {error}").format(error=result.get("error", "")))
         self.status_label.show()
+
+    def _set_status_warning(self, enabled):
+        object_name = "UpdateStatusWarning" if enabled else "UpdateStatus"
+        if self.status_label.objectName() == object_name:
+            return
+        self.status_label.setObjectName(object_name)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        self.status_label.update()
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -519,6 +535,14 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
                 background-color: #1f2b2c;
                 border: 1px solid #34595c;
                 border-radius: 5px;
+                padding: 8px;
+            }
+            QLabel#UpdateStatusWarning {
+                color: #f3ca63;
+                background-color: #332c1b;
+                border: 1px solid #8a6b25;
+                border-radius: 5px;
+                font-weight: 700;
                 padding: 8px;
             }
             QProgressBar#UpdateProgress {
