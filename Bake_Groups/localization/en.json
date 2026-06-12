@@ -183,7 +183,13 @@
     "Update installation failed: {error}": "Update installation failed: {error}",
     "Installed": "Installed",
     "Retry": "Retry",
-    "Close": "Close"
+    "Close": "Close",
+    "Preparing update...": "Preparing update...",
+    "Downloading update package...": "Downloading update package...",
+    "Extracting update package...": "Extracting update package...",
+    "Installing update files...": "Installing update files...",
+    "Activating update...": "Activating update...",
+    "Update installed.": "Update installed."
   },
   "tooltips": {
     "Lock subgroup": "Lock this subgroup so Analyze HP and Assign LP Meshes do not rebuild it.",

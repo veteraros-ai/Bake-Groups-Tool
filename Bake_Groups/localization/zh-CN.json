@@ -183,7 +183,13 @@
     "Update installation failed: {error}": "更新安装失败: {error}",
     "Installed": "已安装",
     "Retry": "重试",
-    "Close": "关闭"
+    "Close": "关闭",
+    "Preparing update...": "正在准备更新...",
+    "Downloading update package...": "正在下载更新包...",
+    "Extracting update package...": "正在解压更新包...",
+    "Installing update files...": "正在安装更新文件...",
+    "Activating update...": "正在激活更新...",
+    "Update installed.": "更新已安装。"
   },
   "tooltips": {
     "Lock subgroup": "锁定此子组，使分析 HP 和分配 LP 网格不会重建它。",

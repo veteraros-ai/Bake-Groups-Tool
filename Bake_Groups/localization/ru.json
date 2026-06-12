@@ -183,7 +183,13 @@
     "Update installation failed: {error}": "Не удалось установить обновление: {error}",
     "Installed": "Установлено",
     "Retry": "Повторить",
-    "Close": "Закрыть"
+    "Close": "Закрыть",
+    "Preparing update...": "Подготовка обновления...",
+    "Downloading update package...": "Скачивание пакета обновления...",
+    "Extracting update package...": "Распаковка обновления...",
+    "Installing update files...": "Установка файлов обновления...",
+    "Activating update...": "Активация обновления...",
+    "Update installed.": "Обновление установлено."
   },
   "tooltips": {
     "Lock subgroup": "Заблокировать сабгруппу, чтобы Analyze HP и Assign LP Meshes не пересобирали ее.",

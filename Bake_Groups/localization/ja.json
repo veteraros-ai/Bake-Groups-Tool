@@ -183,7 +183,13 @@
     "Update installation failed: {error}": "更新のインストールに失敗しました: {error}",
     "Installed": "インストール済み",
     "Retry": "再試行",
-    "Close": "閉じる"
+    "Close": "閉じる",
+    "Preparing update...": "更新を準備しています...",
+    "Downloading update package...": "更新パッケージをダウンロードしています...",
+    "Extracting update package...": "更新を展開しています...",
+    "Installing update files...": "更新ファイルをインストールしています...",
+    "Activating update...": "更新を有効化しています...",
+    "Update installed.": "更新がインストールされました。"
   },
   "tooltips": {
     "Lock subgroup": "このサブグループをロックし、HP解析とLPメッシュ割り当てで再構築されないようにします。",

@@ -23,6 +23,9 @@ except ImportError:
 import bg_localization as bg_l10n
 import bg_version
 
+PACKAGE_DOWNLOAD_TIMEOUT = 300
+DEFAULT_PACKAGE_URL = "https://codeload.github.com/{}/zip/refs/heads/main".format(bg_version.GITHUB_REPOSITORY)
+
 
 def _version_tuple(value):
     value = str(value or "").strip().lstrip("vV")
@@ -83,7 +86,7 @@ def _manifest_info_from_text(data):
         "remote_version": remote_version,
         "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
-        "package_url": manifest.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
+        "package_url": manifest.get("package_url") or DEFAULT_PACKAGE_URL,
     }
 
 
@@ -102,7 +105,7 @@ def fetch_update_info(timeout=4):
         "remote_version": fetch_remote_version(timeout),
         "github_url": bg_version.GITHUB_URL,
         "releases_url": bg_version.RELEASES_URL,
-        "package_url": "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
+        "package_url": DEFAULT_PACKAGE_URL,
     }
 
 
@@ -117,7 +120,7 @@ def check_for_update():
         "is_update_available": is_newer_version(update_info.get("remote_version"), current_version),
         "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
-        "package_url": update_info.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
+        "package_url": update_info.get("package_url") or DEFAULT_PACKAGE_URL,
     }
 
 
@@ -133,7 +136,12 @@ def _bootstrap_dir():
     return runtime_dir
 
 
-def _read_bytes_url(url, timeout=30):
+def _progress(progress_callback, value, message_key):
+    if progress_callback:
+        progress_callback(value, bg_l10n.text(message_key))
+
+
+def _read_bytes_url(url, timeout=PACKAGE_DOWNLOAD_TIMEOUT, progress_callback=None):
     try:
         request = Request(
             url,
@@ -143,12 +151,31 @@ def _read_bytes_url(url, timeout=30):
             }
         )
         response = urlopen(request, timeout=timeout)
-        return response.read()
+        total_raw = response.headers.get("Content-Length") if hasattr(response, "headers") else None
+        try:
+            total = int(total_raw) if total_raw else 0
+        except Exception:
+            total = 0
+        chunks = []
+        loaded = 0
+        while True:
+            chunk = response.read(1024 * 512)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            loaded += len(chunk)
+            if total > 0:
+                value = 15 + int(min(40, (loaded * 40.0) / float(total)))
+                _progress(progress_callback, value, "Downloading update package...")
+        _progress(progress_callback, 55, "Downloading update package...")
+        return b"".join(chunks)
     except Exception:
         temp_dir = tempfile.mkdtemp(prefix="BakeGroupsNet_")
         try:
             path = os.path.join(temp_dir, "package.bin")
+            _progress(progress_callback, 20, "Downloading update package...")
             _download_with_powershell(url, path, timeout)
+            _progress(progress_callback, 55, "Downloading update package...")
             with open(path, "rb") as handle:
                 return handle.read()
         finally:
@@ -217,7 +244,8 @@ def _copy_bootstrap_launcher(source_dir, bootstrap_dir):
         shutil.copy2(source_launcher, target_launcher)
 
 
-def install_update(update_info):
+def install_update(update_info, progress_callback=None):
+    _progress(progress_callback, 5, "Preparing update...")
     version = str(update_info.get("remote_version") or "").strip()
     if not version:
         raise RuntimeError("Update version is not available")
@@ -225,11 +253,13 @@ def install_update(update_info):
     bootstrap_dir = _bootstrap_dir()
     versions_dir = os.path.join(bootstrap_dir, "versions")
     target_dir = os.path.join(versions_dir, version)
-    package_url = update_info.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY)
+    package_url = update_info.get("package_url") or DEFAULT_PACKAGE_URL
 
     if os.path.exists(os.path.join(target_dir, "bg_main_window.py")):
+        _progress(progress_callback, 90, "Activating update...")
         _write_active_version(bootstrap_dir, version, target_dir)
         _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        _progress(progress_callback, 100, "Update installed.")
         return {
             "success": True,
             "version": version,
@@ -248,20 +278,24 @@ def install_update(update_info):
 
         zip_path = os.path.join(work_dir, "package.zip")
         with open(zip_path, "wb") as handle:
-            handle.write(_read_bytes_url(package_url))
+            handle.write(_read_bytes_url(package_url, PACKAGE_DOWNLOAD_TIMEOUT, progress_callback))
 
+        _progress(progress_callback, 60, "Extracting update package...")
         extract_dir = os.path.join(work_dir, "extract")
         with zipfile.ZipFile(zip_path, "r") as archive:
             archive.extractall(extract_dir)
 
+        _progress(progress_callback, 75, "Installing update files...")
         source_dir = _find_runtime_source(extract_dir)
         _copy_runtime_tree(source_dir, staging_dir)
 
         if os.path.exists(target_dir):
             shutil.rmtree(target_dir)
         os.rename(staging_dir, target_dir)
+        _progress(progress_callback, 90, "Activating update...")
         _write_active_version(bootstrap_dir, version, target_dir)
         _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        _progress(progress_callback, 100, "Update installed.")
         return {
             "success": True,
             "version": version,
@@ -286,6 +320,7 @@ class UpdateCheckWorker(QtCore.QThread):
 
 
 class UpdateInstallWorker(QtCore.QThread):
+    install_progress = QtCore.Signal(int, str)
     install_result = QtCore.Signal(dict)
 
     def __init__(self, update_info, parent=None):
@@ -294,7 +329,7 @@ class UpdateInstallWorker(QtCore.QThread):
 
     def run(self):
         try:
-            result = install_update(self.update_info)
+            result = install_update(self.update_info, self.install_progress.emit)
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
         self.install_result.emit(result)
@@ -357,6 +392,13 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.status_label.hide()
         layout.addWidget(self.status_label)
 
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setObjectName("UpdateProgress")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
         versions = QtWidgets.QFrame()
         versions.setObjectName("VersionPanel")
         versions_layout = QtWidgets.QGridLayout(versions)
@@ -398,15 +440,24 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
     def set_installing(self):
         self.status_label.setText(bg_l10n.text("Installing update..."))
         self.status_label.show()
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
         self.update_btn.setEnabled(False)
         self.release_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
+
+    def set_install_progress(self, value, message):
+        self.progress_bar.setValue(max(0, min(100, int(value or 0))))
+        if message:
+            self.status_label.setText(message)
+            self.status_label.show()
 
     def set_install_result(self, result):
         self.release_btn.setEnabled(True)
         self.later_btn.setEnabled(True)
         self.later_btn.setText(bg_l10n.text("Close"))
         if result.get("success"):
+            self.progress_bar.setValue(100)
             self.update_btn.setEnabled(False)
             self.update_btn.setText(bg_l10n.text("Installed"))
             self.status_label.setText(bg_l10n.text("Update installed. Restart Bake Groups Tool to load version {version}.").format(version=result.get("version", "")))
@@ -456,6 +507,18 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
                 border: 1px solid #34595c;
                 border-radius: 5px;
                 padding: 8px;
+            }
+            QProgressBar#UpdateProgress {
+                background-color: #1f1f1f;
+                border: 1px solid #353535;
+                border-radius: 5px;
+                color: #dcdcdc;
+                height: 14px;
+                text-align: center;
+            }
+            QProgressBar#UpdateProgress::chunk {
+                background-color: #2c7775;
+                border-radius: 4px;
             }
             QFrame#VersionPanel {
                 background-color: #1f1f1f;
@@ -511,6 +574,7 @@ def show_update_dialog(update_info, parent=None):
         dialog.set_installing()
         worker = UpdateInstallWorker(update_info, dialog)
         dialog.install_worker = worker
+        worker.install_progress.connect(dialog.set_install_progress)
         worker.install_result.connect(dialog.set_install_result)
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(lambda: setattr(dialog, "install_worker", None))
