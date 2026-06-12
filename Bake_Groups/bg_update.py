@@ -567,6 +567,39 @@ def open_url(url):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
+def _workspace_name():
+    module = sys.modules.get("bg_core")
+    config = getattr(module, "BakeConfig", None)
+    return getattr(config, "WORKSPACE_NAME", None) or "BakeManagerUIWorkspaceControl"
+
+
+def _close_existing_tool(parent):
+    module = sys.modules.get("bg_main_window")
+    widget = getattr(module, "bake_manager_ui", None)
+    for target in (parent, widget):
+        if target:
+            try:
+                target.close()
+            except Exception:
+                pass
+            try:
+                target.deleteLater()
+            except Exception:
+                pass
+    if module:
+        try:
+            module.bake_manager_ui = None
+        except Exception:
+            pass
+    try:
+        import maya.cmds as cmds
+        workspace_name = _workspace_name()
+        if cmds.workspaceControl(workspace_name, exists=True):
+            cmds.deleteUI(workspace_name, control=True)
+    except Exception:
+        pass
+
+
 def restart_tool(dialog):
     bootstrap_dir = _bootstrap_dir()
     launcher_path = os.path.join(bootstrap_dir, "launcher.py")
@@ -580,11 +613,7 @@ def restart_tool(dialog):
 
     def run_launcher():
         try:
-            if parent:
-                try:
-                    parent.close()
-                except Exception:
-                    pass
+            _close_existing_tool(parent)
             namespace = {"__file__": launcher_path, "__name__": "__main__"}
             with open(launcher_path, "rb") as handle:
                 source = handle.read()
