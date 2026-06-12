@@ -2165,6 +2165,7 @@ class SceneInteractionMixin:
         menu.addAction(widget_action)
         menu.addSeparator()
         run_action = menu.addAction("Find ZBrush now")
+        add_to_layer_action = menu.addAction("Add mesh in ZBrush layer")
         bg_l10n.localize_menu(menu)
 
         btn = getattr(self, 'btn_find_zbrush', None)
@@ -2172,6 +2173,113 @@ class SceneInteractionMixin:
         action = menu.exec_(global_pos)
         if action == run_action:
             self.find_zbrush_meshes()
+        elif action == add_to_layer_action:
+            self.add_selected_zbrush_meshes_to_layer()
+
+    def _find_zbrush_display_layers(self):
+        layers = cmds.ls(type="displayLayer") or []
+        return sorted([layer for layer in layers if layer and "zbrush" in layer.lower()], key=lambda item: item.lower())
+
+    def _create_zbrush_display_layer(self):
+        base_names = ["ZBrush", "ZBrush_BakeGroups"]
+        for name in base_names:
+            if not cmds.objExists(name):
+                return cmds.createDisplayLayer(name=name, empty=True)
+
+        idx = 1
+        while cmds.objExists("ZBrush_BakeGroups_{:02d}".format(idx)):
+            idx += 1
+        return cmds.createDisplayLayer(name="ZBrush_BakeGroups_{:02d}".format(idx), empty=True)
+
+    def _choose_zbrush_display_layer(self, layers):
+        if not layers:
+            return self._create_zbrush_display_layer()
+        if len(layers) == 1:
+            return layers[0]
+
+        create_label = bg_l10n.text("Create New ZBrush Layer")
+        choices = list(layers) + [create_label]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            bg_l10n.text("Multiple ZBrush Layers"),
+            bg_l10n.text("Multiple ZBrush layers found. Choose target ZBrush layer:"),
+            choices,
+            0,
+            False
+        )
+        if not ok or not choice:
+            return None
+        if choice == create_label:
+            return self._create_zbrush_display_layer()
+        return choice
+
+    def _selected_mesh_transforms_under(self, root_node):
+        selected = cmds.ls(selection=True, long=True, flatten=True) or []
+        mesh_transforms = []
+        seen = set()
+
+        for item in selected:
+            node = item.split(".")[0]
+            if not cmds.objExists(node):
+                continue
+
+            if cmds.objectType(node) == "mesh":
+                parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                node = parents[0] if parents else node
+
+            shapes = cmds.listRelatives(node, shapes=True, fullPath=True, type="mesh") or []
+            shapes = [shape for shape in shapes if not cmds.getAttr(shape + ".intermediateObject")]
+            if not shapes:
+                continue
+
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            is_inside_root = long_node == root_node
+            if not is_inside_root:
+                try:
+                    is_inside_root = bool(self.core.is_descendant_of(long_node, root_node))
+                except Exception:
+                    is_inside_root = long_node.startswith(root_node + "|")
+
+            if is_inside_root and long_node not in seen:
+                mesh_transforms.append(long_node)
+                seen.add(long_node)
+
+        return mesh_transforms
+
+    def add_selected_zbrush_meshes_to_layer(self):
+        if not self.active_root_id:
+            return cmds.warning(bg_l10n.text("No active chapter selected."))
+
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+
+        hp_main, _, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not cmds.objExists(hp_main):
+            return cmds.warning(bg_l10n.text("HP root not found for active chapter."))
+
+        meshes = self._selected_mesh_transforms_under(hp_main)
+        if not meshes:
+            cmds.warning(bg_l10n.text("No selected ZBrush mesh candidates found."))
+            self.log(bg_l10n.text("No selected ZBrush mesh candidates found."), "orange")
+            return
+
+        layer = self._choose_zbrush_display_layer(self._find_zbrush_display_layers())
+        if not layer:
+            return
+
+        with bg_core.undo_chunk("AddZBrushMeshesToLayer"):
+            cmds.editDisplayLayerMembers(layer, meshes, noRecurse=True)
+
+        cmds.select(meshes, replace=True)
+        message = bg_l10n.text("Added {count} mesh(es) to ZBrush layer: {layer}").format(
+            count=len(meshes),
+            layer=layer
+        )
+        self.log(message, "lightgreen")
+        if hasattr(self, 'record_user_action'):
+            self.record_user_action("Add ZBrush layer meshes", "count={} | layer={}".format(len(meshes), layer))
+        cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
 
     def _get_triangle_face_ratio(self, mesh_transform):
         try:
