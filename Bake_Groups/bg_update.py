@@ -398,7 +398,12 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         icon.setFixedSize(52, 52)
         icon.setObjectName("UpdateIcon")
         icon.setAlignment(QtCore.Qt.AlignCenter)
-        icon.setText("BG")
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Bake_Group.png")
+        pixmap = QtGui.QPixmap(icon_path)
+        if pixmap.isNull():
+            icon.setText("BG")
+        else:
+            icon.setPixmap(pixmap.scaled(40, 40, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
         header_layout.addWidget(icon)
 
         title_layout = QtWidgets.QVBoxLayout()
