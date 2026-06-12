@@ -181,6 +181,7 @@
     "Installing update...": "Установка обновления...",
     "Update installed. Restart Bake Groups Tool to load version {version}.": "Обновление установлено. Перезапустите Bake Groups Tool, чтобы загрузить версию {version}.",
     "Update installed. Press Restart Tool to load version {version}.": "Обновление установлено. Нажмите Перезапустить Bake Groups, чтобы загрузить версию {version}.",
+    "Update installed. Restart Maya to complete the update.": "Обновление установлено. Для корректной работы перезапустите программу Maya.",
     "Update installation failed: {error}": "Не удалось установить обновление: {error}",
     "Installed": "Установлено",
     "Restart Tool": "Перезапустить Bake Groups",

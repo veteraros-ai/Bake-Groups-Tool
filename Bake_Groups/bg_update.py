@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import traceback
 import zipfile
 from datetime import datetime
 
@@ -472,8 +471,8 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.install_success = True
             self.progress_bar.setValue(100)
             self.update_btn.setEnabled(True)
-            self.update_btn.setText(bg_l10n.text("Restart Tool"))
-            self.status_label.setText(bg_l10n.text("Update installed. Press Restart Tool to load version {version}.").format(version=result.get("version", "")))
+            self.update_btn.setText(bg_l10n.text("Close"))
+            self.status_label.setText(bg_l10n.text("Update installed. Restart Maya to complete the update."))
         else:
             self.install_success = False
             self.update_btn.setEnabled(True)
@@ -578,99 +577,13 @@ def open_url(url):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
-def _workspace_name():
-    module = sys.modules.get("bg_core")
-    config = getattr(module, "BakeConfig", None)
-    return getattr(config, "WORKSPACE_NAME", None) or "BakeManagerUIWorkspaceControl"
-
-
-def _close_existing_tool(parent):
-    module = sys.modules.get("bg_main_window")
-    widget = getattr(module, "bake_manager_ui", None)
-    for target in (parent, widget):
-        if target:
-            try:
-                target.close()
-            except Exception:
-                pass
-            try:
-                target.deleteLater()
-            except Exception:
-                pass
-    if module:
-        try:
-            module.bake_manager_ui = None
-        except Exception:
-            pass
-    try:
-        import maya.cmds as cmds
-        workspace_name = _workspace_name()
-        if cmds.workspaceControl(workspace_name, exists=True):
-            cmds.deleteUI(workspace_name, control=True)
-    except Exception:
-        pass
-
-
-def _execute_launcher(launcher_path):
-    namespace = {"__file__": launcher_path, "__name__": "__main__"}
-    with open(launcher_path, "rb") as handle:
-        source = handle.read()
-    if not isinstance(source, str):
-        source = source.decode("utf-8", "replace")
-    exec(compile(source, launcher_path, "exec"), namespace, namespace)
-
-
-def _warn_restart_failed(error):
-    message = "Bake Groups restart failed: {}".format(error)
-    detail = traceback.format_exc()
-    try:
-        import maya.cmds as cmds
-        cmds.warning(message)
-        print(detail)
-    except Exception:
-        print(message)
-        print(detail)
-
-
-def _run_deferred(callable_obj):
-    try:
-        import maya.utils as maya_utils
-        maya_utils.executeDeferred(callable_obj)
-        return
-    except Exception:
-        pass
-    QtCore.QTimer.singleShot(100, callable_obj)
-
-
-def restart_tool(dialog):
-    bootstrap_dir = _bootstrap_dir()
-    launcher_path = os.path.join(bootstrap_dir, "launcher.py")
-    if not os.path.exists(launcher_path):
-        dialog.status_label.setText(bg_l10n.text("Launcher not found: {path}").format(path=launcher_path))
-        dialog.status_label.show()
-        return
-
-    parent = dialog.parent()
-
-    def run_launcher():
-        try:
-            _close_existing_tool(parent)
-            print("Bake Groups restart: {}".format(launcher_path))
-            _execute_launcher(launcher_path)
-        except Exception as exc:
-            _warn_restart_failed(exc)
-
-    dialog.accept()
-    _run_deferred(run_launcher)
-
-
 def show_update_dialog(update_info, parent=None):
     dialog = UpdateAvailableDialog(update_info, parent)
     dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
 
     def start_install():
         if getattr(dialog, "install_success", False):
-            restart_tool(dialog)
+            dialog.accept()
             return
         if dialog.install_worker and dialog.install_worker.isRunning():
             return

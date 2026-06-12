@@ -181,6 +181,7 @@
     "Installing update...": "Installing update...",
     "Update installed. Restart Bake Groups Tool to load version {version}.": "Update installed. Restart Bake Groups Tool to load version {version}.",
     "Update installed. Press Restart Tool to load version {version}.": "Update installed. Press Restart Bake Groups to load version {version}.",
+    "Update installed. Restart Maya to complete the update.": "Update installed. Restart Maya to complete the update.",
     "Update installation failed: {error}": "Update installation failed: {error}",
     "Installed": "Installed",
     "Restart Tool": "Restart Bake Groups",

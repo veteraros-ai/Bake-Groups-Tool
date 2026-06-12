@@ -181,6 +181,7 @@
     "Installing update...": "更新をインストールしています...",
     "Update installed. Restart Bake Groups Tool to load version {version}.": "更新がインストールされました。バージョン {version} を読み込むには Bake Groups Tool を再起動してください。",
     "Update installed. Press Restart Tool to load version {version}.": "更新がインストールされました。バージョン {version} を読み込むには Bake Groups を再起動してください。",
+    "Update installed. Restart Maya to complete the update.": "更新がインストールされました。更新を完了するには Maya を再起動してください。",
     "Update installation failed: {error}": "更新のインストールに失敗しました: {error}",
     "Installed": "インストール済み",
     "Restart Tool": "Bake Groups を再起動",

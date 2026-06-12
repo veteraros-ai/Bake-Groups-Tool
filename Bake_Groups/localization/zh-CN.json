@@ -181,6 +181,7 @@
     "Installing update...": "正在安装更新...",
     "Update installed. Restart Bake Groups Tool to load version {version}.": "更新已安装。请重新启动 Bake Groups Tool 以加载版本 {version}。",
     "Update installed. Press Restart Tool to load version {version}.": "更新已安装。请重启 Bake Groups 以加载版本 {version}。",
+    "Update installed. Restart Maya to complete the update.": "更新已安装。请重启 Maya 以完成更新。",
     "Update installation failed: {error}": "更新安装失败: {error}",
     "Installed": "已安装",
     "Restart Tool": "重启 Bake Groups",
