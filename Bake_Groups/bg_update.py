@@ -252,6 +252,30 @@ def _copy_bootstrap_launcher(source_dir, bootstrap_dir):
     target_launcher = os.path.join(bootstrap_dir, "launcher.py")
     if os.path.exists(source_launcher):
         shutil.copy2(source_launcher, target_launcher)
+    target_main_window = os.path.join(bootstrap_dir, "bg_main_window.py")
+    bootstrap_source = """from __future__ import print_function, division, absolute_import
+
+import os
+
+
+def main():
+    script_dir = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
+    launcher_path = os.path.join(script_dir, "launcher.py")
+    if not os.path.exists(launcher_path):
+        raise RuntimeError("Bake Groups launcher not found: {}".format(launcher_path))
+    namespace = {"__file__": launcher_path, "__name__": "__main__"}
+    with open(launcher_path, "rb") as handle:
+        source = handle.read()
+    if not isinstance(source, str):
+        source = source.decode("utf-8", "replace")
+    exec(compile(source, launcher_path, "exec"), namespace, namespace)
+
+
+if __name__ == "__main__":
+    main()
+"""
+    with open(target_main_window, "w") as handle:
+        handle.write(bootstrap_source)
 
 
 def install_update(update_info, progress_callback=None):
