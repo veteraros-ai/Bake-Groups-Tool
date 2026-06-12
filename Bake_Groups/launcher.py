@@ -17,8 +17,9 @@ def _prepare_versioned_math_core_path():
         if bin_dir in sys.path:
             sys.path.remove(bin_dir)
         sys.path.insert(0, bin_dir)
-    if script_dir not in sys.path:
-        sys.path.append(script_dir)
+    if script_dir in sys.path:
+        sys.path.remove(script_dir)
+    sys.path.insert(0, script_dir)
 
 
 _prepare_versioned_math_core_path()

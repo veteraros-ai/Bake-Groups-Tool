@@ -1,5 +1,7 @@
 from __future__ import print_function, division, absolute_import
 
+import json
+import os
 import re
 
 try:
@@ -29,35 +31,74 @@ def is_newer_version(remote_version, current_version):
     return _version_tuple(remote_version) > _version_tuple(current_version)
 
 
-def fetch_remote_version(timeout=4):
+def _read_url(url, timeout=4):
     request = Request(
-        bg_version.VERSION_SOURCE_URL,
+        url,
         headers={
             "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
-            "Accept": "text/plain",
+            "Accept": "application/json,text/plain",
         }
     )
     response = urlopen(request, timeout=timeout)
     data = response.read()
     if not isinstance(data, str):
         data = data.decode("utf-8", "replace")
+    return data
+
+
+def fetch_remote_version(timeout=4):
+    data = _read_url(bg_version.VERSION_SOURCE_URL, timeout)
     match = re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", data)
     if not match:
         raise ValueError("Remote version marker not found")
     return match.group(1).strip()
 
 
+def _local_manifest_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_manifest.json")
+
+
+def _manifest_info_from_text(data):
+    manifest = json.loads(data)
+    remote_version = str(manifest.get("latest_version") or manifest.get("version") or "").strip()
+    if not remote_version:
+        raise ValueError("Remote manifest version not found")
+    return {
+        "remote_version": remote_version,
+        "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
+        "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
+    }
+
+
+def fetch_update_info(timeout=4):
+    try:
+        return _manifest_info_from_text(_read_url(bg_version.UPDATE_MANIFEST_URL, timeout))
+    except Exception:
+        pass
+
+    path = _local_manifest_path()
+    if os.path.exists(path):
+        with open(path, "r") as handle:
+            return _manifest_info_from_text(handle.read())
+
+    return {
+        "remote_version": fetch_remote_version(timeout),
+        "github_url": bg_version.GITHUB_URL,
+        "releases_url": bg_version.RELEASES_URL,
+    }
+
+
 def check_for_update():
-    remote_version = fetch_remote_version()
+    update_info = fetch_update_info()
     current_version = bg_version.__version__
     return {
         "plugin_name": bg_version.PLUGIN_NAME,
         "author": bg_version.AUTHOR_NAME,
         "current_version": current_version,
-        "remote_version": remote_version,
-        "is_update_available": is_newer_version(remote_version, current_version),
-        "github_url": bg_version.GITHUB_URL,
-        "releases_url": bg_version.RELEASES_URL,
+        "remote_version": update_info.get("remote_version"),
+        "is_update_available": is_newer_version(update_info.get("remote_version"), current_version),
+        "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
+        "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
     }
 
 
@@ -81,7 +122,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.update_info = update_info or {}
         self.setWindowTitle(bg_l10n.text("Bake Groups Tool Update"))
         self.setObjectName("BakeGroupsUpdateDialog")
-        self.setModal(False)
+        self.setModal(True)
         self.setMinimumWidth(520)
         self.setMaximumWidth(560)
         self._build_ui()
@@ -245,4 +286,6 @@ def show_update_dialog(update_info, parent=None):
     dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
     dialog.release_notes_requested.connect(dialog.accept)
     dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
     return dialog
