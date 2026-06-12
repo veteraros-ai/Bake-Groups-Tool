@@ -2229,14 +2229,51 @@ class SceneInteractionMixin:
 
         message = bg_l10n.text("Freeze Transformations required. Selected invalid root groups or meshes.")
         detail = "{}: {}".format(bg_l10n.text("Invalid transforms"), ", ".join(preview))
-        cmds.warning(message)
-        self.log("{} {}".format(message, detail), "red")
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Freeze Transformations"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText(message)
+        box.setInformativeText("{}\n\n{}".format(detail, bg_l10n.text("Do you want to run Freeze Transformations now?")))
+        yes_btn = box.addButton(bg_l10n.text("Yes"), QtWidgets.QMessageBox.AcceptRole)
+        no_btn = box.addButton(bg_l10n.text("No"), QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(yes_btn)
+        box.exec_()
+
+        if box.clickedButton() != yes_btn:
+            cmds.warning(message)
+            self.log("{} {}".format(message, detail), "red")
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action(
+                    "Freeze Transformations check failed",
+                    "{} | invalid={}".format(action_name or "Action", len(invalid))
+                )
+            return False
+
+        try:
+            with bg_core.undo_chunk("FreezeTransformations"):
+                cmds.makeIdentity(invalid, apply=True, translate=True, rotate=True, scale=True, normal=False)
+        except Exception as exc:
+            cmds.warning(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc))
+            self.log(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc), "red")
+            return False
+
+        invalid_after = self._unfrozen_transforms(roots)
+        invalid_after.extend(self._unfrozen_transforms(mesh_nodes))
+        invalid_after = list(dict((node, None) for node in invalid_after).keys())
+        if invalid_after:
+            cmds.select(invalid_after, replace=True)
+            cmds.warning(bg_l10n.text("Freeze Transformations did not clear all invalid transforms."))
+            self.log(bg_l10n.text("Freeze Transformations did not clear all invalid transforms."), "red")
+            return False
+
+        cmds.select(clear=True)
+        self.log(bg_l10n.text("Freeze Transformations completed."), "lightgreen")
         if hasattr(self, 'record_user_action'):
             self.record_user_action(
-                "Freeze Transformations check failed",
-                "{} | invalid={}".format(action_name or "Action", len(invalid))
+                "Freeze Transformations completed",
+                "{} | fixed={}".format(action_name or "Action", len(invalid))
             )
-        return False
+        return True
 
     def show_find_zbrush_context_menu(self, point):
         menu = QtWidgets.QMenu(self)
