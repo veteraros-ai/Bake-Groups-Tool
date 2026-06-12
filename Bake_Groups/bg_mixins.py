@@ -156,6 +156,9 @@ class HPAnalysisMixin:
             cmds.warning("HighPoly root not found.")
             return
 
+        if not self.validate_frozen_transforms([hp_main], [hp_main], bg_l10n.text("Analyze HP")):
+            return
+
         if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
             return
 
@@ -819,6 +822,9 @@ class LPMatchingMixin:
             return self.log("No active pair selected.", "orange")
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         if not hp_main or not lp_main:
+            return
+
+        if not self.validate_frozen_transforms([hp_main, lp_main], [hp_main, lp_main], bg_l10n.text("Assign LP Meshes")):
             return
 
         final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
@@ -2136,6 +2142,102 @@ class GroupManagementMixin:
 class SceneInteractionMixin:
     """Methods for picking nodes, creating root pair, tools, find similar, etc."""
 
+    def _mesh_transforms_under_root(self, root_node):
+        if not root_node or not cmds.objExists(root_node):
+            return []
+
+        candidates = []
+        root_shapes = cmds.listRelatives(root_node, shapes=True, fullPath=True, type='mesh') or []
+        if any(not cmds.getAttr(shape + ".intermediateObject") for shape in root_shapes):
+            candidates.append((cmds.ls(root_node, long=True) or [root_node])[0])
+
+        shapes = cmds.listRelatives(root_node, allDescendents=True, fullPath=True, type='mesh') or []
+        valid_shapes = [shape for shape in shapes if not cmds.getAttr(shape + ".intermediateObject")]
+        for shape in valid_shapes:
+            parent = cmds.listRelatives(shape, parent=True, fullPath=True) or []
+            if parent:
+                candidates.append(parent[0])
+
+        result = []
+        seen = set()
+        for node in candidates:
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            if long_node not in seen:
+                result.append(long_node)
+                seen.add(long_node)
+        return result
+
+    def _is_transform_frozen(self, node, tolerance=0.0001):
+        if not node or not cmds.objExists(node):
+            return True
+
+        attr_defaults = {
+            "translateX": 0.0, "translateY": 0.0, "translateZ": 0.0,
+            "rotateX": 0.0, "rotateY": 0.0, "rotateZ": 0.0,
+            "scaleX": 1.0, "scaleY": 1.0, "scaleZ": 1.0,
+            "shearXY": 0.0, "shearXZ": 0.0, "shearYZ": 0.0,
+        }
+
+        for attr, default in attr_defaults.items():
+            plug = "{}.{}".format(node, attr)
+            if not cmds.objExists(plug):
+                continue
+            try:
+                value = float(cmds.getAttr(plug))
+            except Exception:
+                continue
+            if abs(value - default) > tolerance:
+                return False
+        return True
+
+    def _unfrozen_transforms(self, nodes):
+        result = []
+        seen = set()
+        for node in nodes or []:
+            if not node or not cmds.objExists(node):
+                continue
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            if long_node in seen:
+                continue
+            seen.add(long_node)
+            if not self._is_transform_frozen(long_node):
+                result.append(long_node)
+        return result
+
+    def validate_frozen_transforms(self, root_nodes, mesh_roots=None, action_name=""):
+        roots = [(cmds.ls(node, long=True) or [node])[0] for node in (root_nodes or []) if node and cmds.objExists(node)]
+        mesh_nodes = []
+        for root_node in mesh_roots or []:
+            mesh_nodes.extend(self._mesh_transforms_under_root(root_node))
+
+        invalid_roots = self._unfrozen_transforms(roots)
+        invalid_meshes = self._unfrozen_transforms(mesh_nodes)
+        invalid = []
+        seen = set()
+        for node in invalid_roots + invalid_meshes:
+            if node not in seen:
+                invalid.append(node)
+                seen.add(node)
+
+        if not invalid:
+            return True
+
+        cmds.select(invalid, replace=True)
+        preview = [node.split('|')[-1] for node in invalid[:12]]
+        if len(invalid) > 12:
+            preview.append("... +{} more".format(len(invalid) - 12))
+
+        message = bg_l10n.text("Freeze Transformations required. Selected invalid root groups or meshes.")
+        detail = "{}: {}".format(bg_l10n.text("Invalid transforms"), ", ".join(preview))
+        cmds.warning(message)
+        self.log("{} {}".format(message, detail), "red")
+        if hasattr(self, 'record_user_action'):
+            self.record_user_action(
+                "Freeze Transformations check failed",
+                "{} | invalid={}".format(action_name or "Action", len(invalid))
+            )
+        return False
+
     def show_find_zbrush_context_menu(self, point):
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
@@ -2372,6 +2474,13 @@ class SceneInteractionMixin:
             return cmds.warning("Invalid HP node.")
         if not self.picked_lp or not cmds.objExists(self.picked_lp):
             return cmds.warning("Invalid LP node.")
+
+        if not self.validate_frozen_transforms(
+            [self.picked_hp, self.picked_lp],
+            [self.picked_hp, self.picked_lp],
+            bg_l10n.text("Create Pair")
+        ):
+            return
 
         with bg_core.undo_chunk("CreateRootPair"):
             hp_node = self.picked_hp
