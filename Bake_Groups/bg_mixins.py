@@ -3,11 +3,9 @@ from __future__ import print_function, division, absolute_import
 
 import sys
 
-# Принудительная перезагрузка модулей, чтобы избежать старых версий в памяти
 if sys.version_info[0] >= 3:
     from importlib import reload
 
-# Список модулей, которые необходимо перезагрузить
 modules_to_reload = [
     'bg_core',
     'bg_worker_hp',
@@ -27,7 +25,6 @@ for mod_name in modules_to_reload:
     else:
         print("bg_mixins: {} not loaded yet".format(mod_name))
 
-# После перезагрузки импортируем нужные символы
 import bg_core
 import bg_worker_hp
 from bg_worker_hp import HPGroupingWorker
@@ -729,7 +726,7 @@ class HPAnalysisMixin:
             wire_elongation=self.spin_wire_elong.value(),
             compound_link_verts=worker_params['compound_link_verts'],
             compound_link_dist_pct=worker_params['compound_link_dist_pct'],
-            detect_floaters=not worker_params.get('ignore_floaters', False),
+            detect_floaters=not worker_params.get('ignore_floaters', True),
             floater_radius=0.1
         )
 
@@ -878,7 +875,7 @@ class LPMatchingMixin:
             maya_main_window.setEnabled(False)
 
 # ---------------------------------------------------------
-        # ВНУТРЕННИЕ ФУНКЦИИ СБОРА ТОЧЕК (Main Thread Safe)
+        # (Main Thread Safe)
         # ---------------------------------------------------------
         def get_flat_verts_safe(mesh_path, density):
             try:
@@ -1005,7 +1002,6 @@ class LPMatchingMixin:
         hp_verts_cache = {}
         lp_verts_cache_fast = {}
         lp_verts_cache_full = {}
-        # Генерация fingerprint для LP (аналогично HP)
         
 
         try:

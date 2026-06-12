@@ -10,6 +10,16 @@
       "label": "English",
       "code": "en",
       "file": "en.json"
+    },
+    {
+      "label": "Chinese",
+      "code": "zh-CN",
+      "file": "zh-CN.json"
+    },
+        {
+      "label": "Japanese",
+      "code": "ja",
+      "file": "ja.json"
     }
   ]
 }

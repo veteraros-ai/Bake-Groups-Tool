@@ -330,6 +330,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.splitter.addWidget(self.right_panel)
         self.splitter.setSizes([350, 250])
         bg_l10n.localize_widget_tree(self)
+        self.chk_ignore_floaters.setChecked(True)
 
     def rebuild_algorithm_settings_ui(self, layout):
         self.algo_group = CollapsibleSection("Algorithm")
@@ -363,7 +364,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         self.hp_group_limit = 12
         self.chk_ignore_floaters = QtWidgets.QCheckBox("Ignore Floaters")
-        self.chk_ignore_floaters.setChecked(False)
+        self.chk_ignore_floaters.setChecked(True)
         grid.addWidget(self.chk_ignore_floaters, 0, 2, 1, 2)
 
         grid.addWidget(QtWidgets.QLabel("HP Link Vtx:"), 1, 0)
