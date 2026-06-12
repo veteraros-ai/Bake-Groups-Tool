@@ -3,6 +3,10 @@ from __future__ import print_function, division, absolute_import
 import json
 import os
 import re
+import shutil
+import tempfile
+import zipfile
+from datetime import datetime
 
 try:
     from urllib.request import Request, urlopen
@@ -67,6 +71,7 @@ def _manifest_info_from_text(data):
         "remote_version": remote_version,
         "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
+        "package_url": manifest.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
     }
 
 
@@ -85,6 +90,7 @@ def fetch_update_info(timeout=4):
         "remote_version": fetch_remote_version(timeout),
         "github_url": bg_version.GITHUB_URL,
         "releases_url": bg_version.RELEASES_URL,
+        "package_url": "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
     }
 
 
@@ -99,7 +105,119 @@ def check_for_update():
         "is_update_available": is_newer_version(update_info.get("remote_version"), current_version),
         "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
+        "package_url": update_info.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY),
     }
+
+
+def _current_runtime_dir():
+    return os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _bootstrap_dir():
+    runtime_dir = _current_runtime_dir()
+    parent = os.path.dirname(runtime_dir)
+    if os.path.basename(parent).lower() == "versions":
+        return os.path.dirname(parent)
+    return runtime_dir
+
+
+def _read_bytes_url(url, timeout=30):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
+            "Accept": "application/zip,application/octet-stream,*/*",
+        }
+    )
+    response = urlopen(request, timeout=timeout)
+    return response.read()
+
+
+def _copy_runtime_tree(source_dir, target_dir):
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".vs", "build")
+    shutil.copytree(source_dir, target_dir, ignore=ignore)
+
+
+def _find_runtime_source(extract_dir):
+    for root, dirs, files in os.walk(extract_dir):
+        if os.path.basename(root) == "Bake_Groups" and "bg_main_window.py" in files and "launcher.py" in files:
+            return root
+    raise RuntimeError("Bake_Groups runtime folder not found in update package")
+
+
+def _write_active_version(bootstrap_dir, version, target_dir):
+    data = {
+        "active_version": version,
+        "installed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "path": os.path.normpath(target_dir),
+    }
+    path = os.path.join(bootstrap_dir, "active_version.json")
+    with open(path, "w") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def _copy_bootstrap_launcher(source_dir, bootstrap_dir):
+    source_launcher = os.path.join(source_dir, "launcher.py")
+    target_launcher = os.path.join(bootstrap_dir, "launcher.py")
+    if os.path.exists(source_launcher):
+        shutil.copy2(source_launcher, target_launcher)
+
+
+def install_update(update_info):
+    version = str(update_info.get("remote_version") or "").strip()
+    if not version:
+        raise RuntimeError("Update version is not available")
+
+    bootstrap_dir = _bootstrap_dir()
+    versions_dir = os.path.join(bootstrap_dir, "versions")
+    target_dir = os.path.join(versions_dir, version)
+    package_url = update_info.get("package_url") or "https://github.com/{}/archive/refs/heads/main.zip".format(bg_version.GITHUB_REPOSITORY)
+
+    if os.path.exists(os.path.join(target_dir, "bg_main_window.py")):
+        _write_active_version(bootstrap_dir, version, target_dir)
+        _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        return {
+            "success": True,
+            "version": version,
+            "target_dir": target_dir,
+            "already_installed": True,
+        }
+
+    if not os.path.exists(versions_dir):
+        os.makedirs(versions_dir)
+
+    work_dir = tempfile.mkdtemp(prefix="BakeGroupsUpdate_")
+    staging_dir = os.path.join(versions_dir, ".install_{}".format(version))
+    try:
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir)
+
+        zip_path = os.path.join(work_dir, "package.zip")
+        with open(zip_path, "wb") as handle:
+            handle.write(_read_bytes_url(package_url))
+
+        extract_dir = os.path.join(work_dir, "extract")
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+
+        source_dir = _find_runtime_source(extract_dir)
+        _copy_runtime_tree(source_dir, staging_dir)
+
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        os.rename(staging_dir, target_dir)
+        _write_active_version(bootstrap_dir, version, target_dir)
+        _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        return {
+            "success": True,
+            "version": version,
+            "target_dir": target_dir,
+            "already_installed": False,
+        }
+    finally:
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 class UpdateCheckWorker(QtCore.QThread):
@@ -113,6 +231,21 @@ class UpdateCheckWorker(QtCore.QThread):
         self.update_result.emit(result)
 
 
+class UpdateInstallWorker(QtCore.QThread):
+    install_result = QtCore.Signal(dict)
+
+    def __init__(self, update_info, parent=None):
+        super(UpdateInstallWorker, self).__init__(parent)
+        self.update_info = update_info or {}
+
+    def run(self):
+        try:
+            result = install_update(self.update_info)
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+        self.install_result.emit(result)
+
+
 class UpdateAvailableDialog(QtWidgets.QDialog):
     update_requested = QtCore.Signal()
     release_notes_requested = QtCore.Signal()
@@ -120,6 +253,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
     def __init__(self, update_info, parent=None):
         super(UpdateAvailableDialog, self).__init__(parent)
         self.update_info = update_info or {}
+        self.install_worker = None
         self.setWindowTitle(bg_l10n.text("Bake Groups Tool Update"))
         self.setObjectName("BakeGroupsUpdateDialog")
         self.setModal(True)
@@ -163,6 +297,12 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         body.setWordWrap(True)
         layout.addWidget(body)
 
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setObjectName("UpdateStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        layout.addWidget(self.status_label)
+
         versions = QtWidgets.QFrame()
         versions.setObjectName("VersionPanel")
         versions_layout = QtWidgets.QGridLayout(versions)
@@ -189,17 +329,38 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         buttons.setSpacing(8)
         buttons.addStretch(1)
 
-        release_btn = QtWidgets.QPushButton(bg_l10n.text("Release Notes"))
-        later_btn = QtWidgets.QPushButton(bg_l10n.text("Later"))
-        update_btn = QtWidgets.QPushButton(bg_l10n.text("Update Now"))
-        update_btn.setObjectName("PrimaryButton")
-        release_btn.clicked.connect(self.release_notes_requested.emit)
-        later_btn.clicked.connect(self.reject)
-        update_btn.clicked.connect(self.update_requested.emit)
-        buttons.addWidget(release_btn)
-        buttons.addWidget(later_btn)
-        buttons.addWidget(update_btn)
+        self.release_btn = QtWidgets.QPushButton(bg_l10n.text("Release Notes"))
+        self.later_btn = QtWidgets.QPushButton(bg_l10n.text("Later"))
+        self.update_btn = QtWidgets.QPushButton(bg_l10n.text("Update Now"))
+        self.update_btn.setObjectName("PrimaryButton")
+        self.release_btn.clicked.connect(self.release_notes_requested.emit)
+        self.later_btn.clicked.connect(self.reject)
+        self.update_btn.clicked.connect(self.update_requested.emit)
+        buttons.addWidget(self.release_btn)
+        buttons.addWidget(self.later_btn)
+        buttons.addWidget(self.update_btn)
         layout.addLayout(buttons)
+
+    def set_installing(self):
+        self.status_label.setText(bg_l10n.text("Installing update..."))
+        self.status_label.show()
+        self.update_btn.setEnabled(False)
+        self.release_btn.setEnabled(False)
+        self.later_btn.setEnabled(False)
+
+    def set_install_result(self, result):
+        self.release_btn.setEnabled(True)
+        self.later_btn.setEnabled(True)
+        self.later_btn.setText(bg_l10n.text("Close"))
+        if result.get("success"):
+            self.update_btn.setEnabled(False)
+            self.update_btn.setText(bg_l10n.text("Installed"))
+            self.status_label.setText(bg_l10n.text("Update installed. Restart Bake Groups Tool to load version {version}.").format(version=result.get("version", "")))
+        else:
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(bg_l10n.text("Retry"))
+            self.status_label.setText(bg_l10n.text("Update installation failed: {error}").format(error=result.get("error", "")))
+        self.status_label.show()
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -234,6 +395,13 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             QLabel#UpdateBody {
                 color: #b9b9b9;
                 line-height: 145%;
+            }
+            QLabel#UpdateStatus {
+                color: #83ddd6;
+                background-color: #1f2b2c;
+                border: 1px solid #34595c;
+                border-radius: 5px;
+                padding: 8px;
             }
             QFrame#VersionPanel {
                 background-color: #1f1f1f;
@@ -281,9 +449,20 @@ def open_url(url):
 
 def show_update_dialog(update_info, parent=None):
     dialog = UpdateAvailableDialog(update_info, parent)
-    dialog.update_requested.connect(lambda: open_url(update_info.get("github_url") or bg_version.GITHUB_URL))
-    dialog.update_requested.connect(dialog.accept)
     dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
+
+    def start_install():
+        if dialog.install_worker and dialog.install_worker.isRunning():
+            return
+        dialog.set_installing()
+        worker = UpdateInstallWorker(update_info, dialog)
+        dialog.install_worker = worker
+        worker.install_result.connect(dialog.set_install_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: setattr(dialog, "install_worker", None))
+        worker.start()
+
+    dialog.update_requested.connect(start_install)
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()

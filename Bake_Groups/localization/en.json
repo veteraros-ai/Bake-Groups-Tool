@@ -177,7 +177,13 @@
     "Latest:": "Latest:",
     "Release Notes": "Release Notes",
     "Later": "Later",
-    "Update Now": "Update Now"
+    "Update Now": "Update Now",
+    "Installing update...": "Installing update...",
+    "Update installed. Restart Bake Groups Tool to load version {version}.": "Update installed. Restart Bake Groups Tool to load version {version}.",
+    "Update installation failed: {error}": "Update installation failed: {error}",
+    "Installed": "Installed",
+    "Retry": "Retry",
+    "Close": "Close"
   },
   "tooltips": {
     "Lock subgroup": "Lock this subgroup so Analyze HP and Assign LP Meshes do not rebuild it.",

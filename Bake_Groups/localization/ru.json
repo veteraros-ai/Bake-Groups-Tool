@@ -177,7 +177,13 @@
     "Latest:": "Новая:",
     "Release Notes": "Что нового",
     "Later": "Позже",
-    "Update Now": "Обновить"
+    "Update Now": "Обновить",
+    "Installing update...": "Установка обновления...",
+    "Update installed. Restart Bake Groups Tool to load version {version}.": "Обновление установлено. Перезапустите Bake Groups Tool, чтобы загрузить версию {version}.",
+    "Update installation failed: {error}": "Не удалось установить обновление: {error}",
+    "Installed": "Установлено",
+    "Retry": "Повторить",
+    "Close": "Закрыть"
   },
   "tooltips": {
     "Lock subgroup": "Заблокировать сабгруппу, чтобы Analyze HP и Assign LP Meshes не пересобирали ее.",

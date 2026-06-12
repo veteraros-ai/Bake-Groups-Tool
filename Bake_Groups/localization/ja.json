@@ -177,7 +177,13 @@
     "Latest:": "最新:",
     "Release Notes": "リリースノート",
     "Later": "後で",
-    "Update Now": "今すぐ更新"
+    "Update Now": "今すぐ更新",
+    "Installing update...": "更新をインストールしています...",
+    "Update installed. Restart Bake Groups Tool to load version {version}.": "更新がインストールされました。バージョン {version} を読み込むには Bake Groups Tool を再起動してください。",
+    "Update installation failed: {error}": "更新のインストールに失敗しました: {error}",
+    "Installed": "インストール済み",
+    "Retry": "再試行",
+    "Close": "閉じる"
   },
   "tooltips": {
     "Lock subgroup": "このサブグループをロックし、HP解析とLPメッシュ割り当てで再構築されないようにします。",
