@@ -5,7 +5,7 @@ import os
 script_dir = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
 
 button_label = "BAKE GROUPS"
-icon_name = "BAKE_GROUP.PNG"
+icon_name = "Bake_Group.png"
 icon_path = os.path.join(script_dir, icon_name)
 tooltip = "RUN BAKE GROUPS"
 
