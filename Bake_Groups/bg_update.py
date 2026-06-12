@@ -284,7 +284,6 @@ def show_update_dialog(update_info, parent=None):
     dialog.update_requested.connect(lambda: open_url(update_info.get("github_url") or bg_version.GITHUB_URL))
     dialog.update_requested.connect(dialog.accept)
     dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
-    dialog.release_notes_requested.connect(dialog.accept)
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()
