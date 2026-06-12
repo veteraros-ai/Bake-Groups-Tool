@@ -91,23 +91,33 @@ def _manifest_info_from_text(data):
     }
 
 
+def _merge_source_version(update_info, timeout=4):
+    try:
+        source_version = fetch_remote_version(timeout)
+        if is_newer_version(source_version, update_info.get("remote_version")):
+            update_info["remote_version"] = source_version
+    except Exception:
+        pass
+    return update_info
+
+
 def fetch_update_info(timeout=4):
     try:
-        return _manifest_info_from_text(_read_url(bg_version.UPDATE_MANIFEST_URL, timeout))
+        return _merge_source_version(_manifest_info_from_text(_read_url(bg_version.UPDATE_MANIFEST_URL, timeout)), timeout)
     except Exception:
         pass
 
     path = _local_manifest_path()
     if os.path.exists(path):
         with open(path, "r") as handle:
-            return _manifest_info_from_text(handle.read())
+            return _merge_source_version(_manifest_info_from_text(handle.read()), timeout)
 
-    return {
+    return _merge_source_version({
         "remote_version": fetch_remote_version(timeout),
         "github_url": bg_version.GITHUB_URL,
         "releases_url": bg_version.RELEASES_URL,
         "package_url": DEFAULT_PACKAGE_URL,
-    }
+    }, timeout)
 
 
 def check_for_update():
