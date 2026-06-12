@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import zipfile
 from datetime import datetime
 
@@ -600,6 +601,37 @@ def _close_existing_tool(parent):
         pass
 
 
+def _execute_launcher(launcher_path):
+    namespace = {"__file__": launcher_path, "__name__": "__main__"}
+    with open(launcher_path, "rb") as handle:
+        source = handle.read()
+    if not isinstance(source, str):
+        source = source.decode("utf-8", "replace")
+    exec(compile(source, launcher_path, "exec"), namespace, namespace)
+
+
+def _warn_restart_failed(error):
+    message = "Bake Groups restart failed: {}".format(error)
+    detail = traceback.format_exc()
+    try:
+        import maya.cmds as cmds
+        cmds.warning(message)
+        print(detail)
+    except Exception:
+        print(message)
+        print(detail)
+
+
+def _run_deferred(callable_obj):
+    try:
+        import maya.utils as maya_utils
+        maya_utils.executeDeferred(callable_obj)
+        return
+    except Exception:
+        pass
+    QtCore.QTimer.singleShot(100, callable_obj)
+
+
 def restart_tool(dialog):
     bootstrap_dir = _bootstrap_dir()
     launcher_path = os.path.join(bootstrap_dir, "launcher.py")
@@ -609,25 +641,17 @@ def restart_tool(dialog):
         return
 
     parent = dialog.parent()
-    dialog.accept()
 
     def run_launcher():
         try:
             _close_existing_tool(parent)
-            namespace = {"__file__": launcher_path, "__name__": "__main__"}
-            with open(launcher_path, "rb") as handle:
-                source = handle.read()
-            if not isinstance(source, str):
-                source = source.decode("utf-8", "replace")
-            exec(compile(source, launcher_path, "exec"), namespace, namespace)
+            print("Bake Groups restart: {}".format(launcher_path))
+            _execute_launcher(launcher_path)
         except Exception as exc:
-            try:
-                import maya.cmds as cmds
-                cmds.warning("Bake Groups restart failed: {}".format(exc))
-            except Exception:
-                print("Bake Groups restart failed: {}".format(exc))
+            _warn_restart_failed(exc)
 
-    QtCore.QTimer.singleShot(250, run_launcher)
+    dialog.accept()
+    _run_deferred(run_launcher)
 
 
 def show_update_dialog(update_info, parent=None):
