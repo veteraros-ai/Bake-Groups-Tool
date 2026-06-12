@@ -168,7 +168,16 @@
     "Group into Book (Ctrl+G)": "ブックにグループ化",
     "Add to": "追加先",
     "Extract from the book": "ブックから抽出",
-    "Delete Selection": "項目削除"
+    "Delete Selection": "項目削除",
+    "Bake Groups Tool Update": "Bake Groups Tool の更新",
+    "by {author}": "{author} による制作",
+    "New version available": "新しいバージョンがあります",
+    "A newer build is available for your current installation.": "現在のインストールより新しいビルドを利用できます。",
+    "Installed:": "インストール済み:",
+    "Latest:": "最新:",
+    "Release Notes": "リリースノート",
+    "Later": "後で",
+    "Update Now": "今すぐ更新"
   },
   "tooltips": {
     "Lock subgroup": "このサブグループをロックし、HP解析とLPメッシュ割り当てで再構築されないようにします。",

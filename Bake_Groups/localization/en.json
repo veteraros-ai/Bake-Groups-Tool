@@ -168,7 +168,16 @@
     "Group into Book (Ctrl+G)": "Group into Book",
     "Add to": "Add to",
     "Extract from the book": "Extract from Book",
-    "Delete Selection": "Delete Entry"
+    "Delete Selection": "Delete Entry",
+    "Bake Groups Tool Update": "Bake Groups Tool Update",
+    "by {author}": "by {author}",
+    "New version available": "New version available",
+    "A newer build is available for your current installation.": "A newer build is available for your current installation.",
+    "Installed:": "Installed:",
+    "Latest:": "Latest:",
+    "Release Notes": "Release Notes",
+    "Later": "Later",
+    "Update Now": "Update Now"
   },
   "tooltips": {
     "Lock subgroup": "Lock this subgroup so Analyze HP and Assign LP Meshes do not rebuild it.",

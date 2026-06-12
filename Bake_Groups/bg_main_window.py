@@ -12,6 +12,7 @@ import bg_core
 import bg_gt_matcher
 import bg_final_export
 import bg_localization as bg_l10n
+import bg_update
 
 from bg_worker_hp import HPGroupingWorker
 from bg_worker_lp import LPMatchingWorker
@@ -61,11 +62,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.zbrush_triangle_threshold = 50
         self.last_debug_lines = []
         self.user_action_lines = []
+        self.update_worker = None
+        self.update_dialog = None
 
         self.init_ui()
         self.apply_stylesheet()
         self.refresh_right_panel()
         self.setup_script_jobs()
+        QtCore.QTimer.singleShot(1200, self.start_update_check)
 
     # ------------------------------------------------------------------------
     # UI Initialization
@@ -564,6 +568,24 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def setup_script_jobs(self):
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
 
+    def start_update_check(self):
+        if self.update_worker and self.update_worker.isRunning():
+            return
+        worker = bg_update.UpdateCheckWorker(self)
+        self.update_worker = worker
+        worker.update_result.connect(self.handle_update_check_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self.clear_update_worker)
+        worker.start()
+
+    def handle_update_check_result(self, result):
+        if not result or not result.get("is_update_available"):
+            return
+        self.update_dialog = bg_update.show_update_dialog(result, self)
+
+    def clear_update_worker(self):
+        self.update_worker = None
+
     @contextlib.contextmanager
     def suspend_isolation(self):
         panels = cmds.getPanel(type='modelPanel') or []
@@ -585,6 +607,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.hp_worker.stop()
         if hasattr(self, 'lp_worker') and self.lp_worker.isRunning():
             self.lp_worker.stop()
+        worker = self.update_worker
+        if worker and worker.isRunning():
+            worker.wait(5000)
+        self.update_worker = None
         for job_id in self.script_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):

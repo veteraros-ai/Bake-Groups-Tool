@@ -168,7 +168,16 @@
     "Extract from the book": "Убрать из книги",
     "Delete Selection": "Удалить запись",
     "HP Link Vtx:": "HP Link Vtx:",
-    "HP Link Dist (%):": "HP Link Dist (%):"
+    "HP Link Dist (%):": "HP Link Dist (%):",
+    "Bake Groups Tool Update": "Обновление Bake Groups Tool",
+    "by {author}": "от {author}",
+    "New version available": "Доступна новая версия",
+    "A newer build is available for your current installation.": "Для вашей текущей установки доступна более новая сборка.",
+    "Installed:": "Установлена:",
+    "Latest:": "Новая:",
+    "Release Notes": "Что нового",
+    "Later": "Позже",
+    "Update Now": "Обновить"
   },
   "tooltips": {
     "Lock subgroup": "Заблокировать сабгруппу, чтобы Analyze HP и Assign LP Meshes не пересобирали ее.",

@@ -1,0 +1,9 @@
+from __future__ import print_function, division, absolute_import
+
+PLUGIN_NAME = "Bake Groups Tool"
+AUTHOR_NAME = "Veteraros AI"
+__version__ = "1.0.0"
+GITHUB_REPOSITORY = "veteraros-ai/Bake-Groups-Tool"
+GITHUB_URL = "https://github.com/{}".format(GITHUB_REPOSITORY)
+RELEASES_URL = "{}/releases".format(GITHUB_URL)
+VERSION_SOURCE_URL = "https://raw.githubusercontent.com/{}/main/Bake_Groups/bg_version.py".format(GITHUB_REPOSITORY)

@@ -24,6 +24,7 @@ def _prepare_versioned_math_core_path():
 _prepare_versioned_math_core_path()
 
 modules_to_reload = [
+    'bg_version',
     'bg_core',
     'bg_worker_hp',
     'bg_worker_lp',
@@ -31,6 +32,7 @@ modules_to_reload = [
     'bg_final_export',
     'bg_ui_widgets',
     'bg_localization',
+    'bg_update',
     'bg_mixins',
     'bg_main_window'
 ]
