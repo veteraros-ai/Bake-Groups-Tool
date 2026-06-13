@@ -516,6 +516,13 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.status_label.setText(bg_l10n.text("Update installation failed: {error}").format(error=result.get("error", "")))
         self.status_label.show()
 
+    def closeEvent(self, event):
+        worker = self.install_worker
+        if worker and worker.isRunning():
+            event.ignore()
+            return
+        super(UpdateAvailableDialog, self).closeEvent(event)
+
     def _set_status_warning(self, enabled):
         object_name = "UpdateStatusWarning" if enabled else "UpdateStatus"
         if self.status_label.objectName() == object_name:

@@ -62,14 +62,19 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.zbrush_triangle_threshold = 50
         self.last_debug_lines = []
         self.user_action_lines = []
+        self._is_closing = False
         self.update_worker = None
         self.update_dialog = None
+        self.update_check_timer = None
 
         self.init_ui()
         self.apply_stylesheet()
         self.refresh_right_panel()
         self.setup_script_jobs()
-        QtCore.QTimer.singleShot(1200, self.start_update_check)
+        self.update_check_timer = QtCore.QTimer(self)
+        self.update_check_timer.setSingleShot(True)
+        self.update_check_timer.timeout.connect(self.start_update_check)
+        self.update_check_timer.start(1200)
 
     # ------------------------------------------------------------------------
     # UI Initialization
@@ -569,9 +574,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
 
     def start_update_check(self):
+        if self._is_closing:
+            return
         if self.update_worker and self.update_worker.isRunning():
             return
-        worker = bg_update.UpdateCheckWorker(self)
+        worker = bg_update.UpdateCheckWorker()
         self.update_worker = worker
         worker.update_result.connect(self.handle_update_check_result)
         worker.finished.connect(worker.deleteLater)
@@ -579,12 +586,80 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         worker.start()
 
     def handle_update_check_result(self, result):
+        if self._is_closing:
+            return
+        try:
+            self.objectName()
+        except RuntimeError:
+            return
         if not result or not result.get("is_update_available"):
             return
         self.update_dialog = bg_update.show_update_dialog(result, self)
+        self.update_dialog.destroyed.connect(self.clear_update_dialog)
 
     def clear_update_worker(self):
+        sender = self.sender()
+        if sender is None or sender == self.update_worker:
+            self.update_worker = None
+
+    def clear_update_dialog(self, *args):
+        self.update_dialog = None
+
+    def _disconnect_signal(self, signal, slot=None):
+        try:
+            if slot is None:
+                signal.disconnect()
+            else:
+                signal.disconnect(slot)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _stop_worker_for_close(self, attr_name):
+        worker = getattr(self, attr_name, None)
+        if not worker:
+            return True
+        try:
+            running = worker.isRunning()
+        except RuntimeError:
+            setattr(self, attr_name, None)
+            return True
+        if running:
+            try:
+                worker.stop()
+            except AttributeError:
+                pass
+            worker.wait(5000)
+        try:
+            if worker.isRunning():
+                return False
+        except RuntimeError:
+            pass
+        return True
+
+    def _stop_update_worker_for_close(self):
+        worker = self.update_worker
+        if not worker:
+            return True
+        self._disconnect_signal(worker.update_result, self.handle_update_check_result)
+        self._disconnect_signal(worker.finished, self.clear_update_worker)
+        try:
+            running = worker.isRunning()
+        except RuntimeError:
+            self.update_worker = None
+            return True
+        if running:
+            worker.wait(6000)
+        try:
+            if worker.isRunning():
+                return False
+        except RuntimeError:
+            pass
         self.update_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+        return True
 
     @contextlib.contextmanager
     def suspend_isolation(self):
@@ -603,14 +678,31 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     cmds.isolateSelect(panel, state=True)
 
     def closeEvent(self, event):
-        if hasattr(self, 'hp_worker') and self.hp_worker.isRunning():
-            self.hp_worker.stop()
-        if hasattr(self, 'lp_worker') and self.lp_worker.isRunning():
-            self.lp_worker.stop()
-        worker = self.update_worker
-        if worker and worker.isRunning():
-            worker.wait(5000)
-        self.update_worker = None
+        self._is_closing = True
+        if self.update_check_timer:
+            self.update_check_timer.stop()
+        dialog = self.update_dialog
+        install_worker = getattr(dialog, "install_worker", None) if dialog else None
+        if install_worker and install_worker.isRunning():
+            event.ignore()
+            self._is_closing = False
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        if not self._stop_worker_for_close('hp_worker'):
+            event.ignore()
+            self._is_closing = False
+            return
+        if not self._stop_worker_for_close('lp_worker'):
+            event.ignore()
+            self._is_closing = False
+            return
+        if not self._stop_update_worker_for_close():
+            event.ignore()
+            self._is_closing = False
+            return
+        if dialog:
+            dialog.close()
         for job_id in self.script_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):
