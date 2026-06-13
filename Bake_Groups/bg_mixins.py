@@ -1202,6 +1202,11 @@ class FinalViewMixin:
             # Даем Maya 100 мс на укладку памяти перед отрисовкой
             QtCore.QTimer.singleShot(100, safe_refresh)
 
+    def disable_preview_smoothing_for_export(self):
+        if not getattr(self, 'is_preview_active', False):
+            return
+        self.toggle_preview_smoothing()
+
     def update_single_preview(self, full_prefix, combo):
         if not getattr(self, 'is_preview_active', False):
             return
@@ -1402,8 +1407,6 @@ class FinalViewMixin:
                                 cmds.isolateSelect(panel, addDagObject=lp_main)
 
         self.refresh_left_panel()
-        if hasattr(self, 'record_user_action'):
-            self.record_user_action("Rename Final Group", "{} -> {}".format(old_name, new_name))
 
     def render_final_view(self):
         self.final_mesh_widgets = []
@@ -1687,6 +1690,7 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        self.disable_preview_smoothing_for_export()
 
         with self.suspend_isolation():
             self.log("Suspended viewport isolation for export...", "lightblue")
@@ -1727,6 +1731,7 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        self.disable_preview_smoothing_for_export()
 
         success_count = 0
         with self.suspend_isolation():
@@ -1767,6 +1772,7 @@ class ExportMixin:
         if not export_dir:
             return
         export_dir = export_dir[0]
+        self.disable_preview_smoothing_for_export()
         if self._export_lp_for_pair(pair, export_dir):
             cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
         else:
@@ -1790,6 +1796,7 @@ class ExportMixin:
         if not export_dir:
             return
         export_dir = export_dir[0]
+        self.disable_preview_smoothing_for_export()
         success_count = 0
         for pair in self.root_pairs:
             if self._export_lp_for_pair(pair, export_dir):
@@ -1813,6 +1820,7 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        self.disable_preview_smoothing_for_export()
         success_count = 0
         for pair in book_pairs:
             if self._export_lp_for_pair(pair, export_dir):

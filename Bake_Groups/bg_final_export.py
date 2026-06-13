@@ -39,7 +39,7 @@ class FinalExportProcessor(object):
 
         FinalExportProcessor._set_fbx_bool("FBXExportGenerateLog", False)
         FinalExportProcessor._set_fbx_bool("FBXExportInputConnections", False)
-        FinalExportProcessor._set_fbx_bool("FBXExportSmoothMesh", True)
+        FinalExportProcessor._set_fbx_bool("FBXExportSmoothMesh", False)
         try:
             cmds.file(export_path, force=True, type="FBX export", exportSelected=True)
         finally:
@@ -99,79 +99,32 @@ class FinalExportProcessor(object):
         return default_level
 
     @staticmethod
-    def _valid_mesh_shapes(mesh_transform):
-        if not mesh_transform or not cmds.objExists(mesh_transform):
-            return []
-        shapes = cmds.listRelatives(mesh_transform, shapes=True, fullPath=True, type='mesh') or []
-        return [shape for shape in shapes if not cmds.getAttr(shape + ".intermediateObject")]
+    def _resolve_child_under_parent(node, parent):
+        parent_long = cmds.ls(parent, long=True)
+        parent_long = parent_long[0] if parent_long else parent
+        node_short = node.split('|')[-1]
+
+        matches = cmds.ls(node, long=True) or []
+        for match in matches:
+            if match.startswith(parent_long + "|"):
+                return match
+
+        children = cmds.listRelatives(parent_long, children=True, fullPath=True, type='transform') or []
+        for child in children:
+            if child.split('|')[-1] == node_short:
+                return child
+
+        return matches[0] if matches else node
 
     @staticmethod
-    def _capture_smooth_preview_state(shape, state):
-        if shape in state:
-            return
-
-        attrs = {}
-        for attr in ("displaySmoothMesh", "smoothLevel", "useSmoothPreviewForRender", "renderSmoothLevel"):
-            plug = "{}.{}".format(shape, attr)
-            if cmds.objExists(plug):
-                try:
-                    attrs[attr] = cmds.getAttr(plug)
-                except Exception:
-                    pass
-        state[shape] = attrs
-
-    @staticmethod
-    def _apply_export_smooth_preview(meshes, level, state):
-        try:
-            level = max(0, int(level or 0))
-        except Exception:
-            level = 0
-
-        for mesh in meshes:
-            if not mesh or not cmds.objExists(mesh):
-                continue
-
-            is_zbrush_mesh = FinalExportProcessor._is_zbrush_mesh(mesh)
-
-            for shape in FinalExportProcessor._valid_mesh_shapes(mesh):
-                FinalExportProcessor._capture_smooth_preview_state(shape, state)
-                try:
-                    if is_zbrush_mesh or level == 0:
-                        if cmds.objExists(shape + ".displaySmoothMesh"):
-                            cmds.setAttr(shape + ".displaySmoothMesh", 0)
-                        continue
-
-                    if cmds.objExists(shape + ".smoothLevel"):
-                        cmds.setAttr(shape + ".smoothLevel", level)
-                    if cmds.objExists(shape + ".renderSmoothLevel"):
-                        cmds.setAttr(shape + ".renderSmoothLevel", level)
-                    if cmds.objExists(shape + ".useSmoothPreviewForRender"):
-                        cmds.setAttr(shape + ".useSmoothPreviewForRender", 1)
-                    if cmds.objExists(shape + ".displaySmoothMesh"):
-                        cmds.setAttr(shape + ".displaySmoothMesh", 2)
-                except Exception as e:
-                    cmds.warning("Could not update export smoothing for '{}': {}".format(shape, e))
-
-    @staticmethod
-    def _restore_smooth_preview_state(state):
-        for shape, attrs in state.items():
-            if not shape or not cmds.objExists(shape):
-                continue
-            for attr, value in attrs.items():
-                plug = "{}.{}".format(shape, attr)
-                if cmds.objExists(plug):
-                    try:
-                        cmds.setAttr(plug, value)
-                    except Exception:
-                        pass
-
-    @staticmethod
-    def _make_zero_transform_hp_export_copies(meshes):
+    def _make_zero_transform_hp_export_copies(meshes, smooth_levels=None):
         """Create temporary HP export copies with world-space geometry and zeroed transforms."""
         if not meshes:
             return meshes, None
 
+        smooth_levels = smooth_levels or {}
         temp_root = cmds.group(em=True, name="BG_HP_Export_Zero_Temp#", world=True)
+        temp_root = cmds.ls(temp_root, long=True)[0]
         prepared = []
 
         for mesh in meshes:
@@ -184,10 +137,34 @@ class FinalExportProcessor(object):
                 continue
 
             try:
+                long_mesh = cmds.ls(mesh, long=True)
+                long_mesh = long_mesh[0] if long_mesh else mesh
+                is_zbrush_mesh = FinalExportProcessor._is_zbrush_mesh(mesh)
+                level = smooth_levels.get(long_mesh, smooth_levels.get(short_name.lower(), 0))
+                if not level and not is_zbrush_mesh:
+                    short_lower = short_name.lower()
+                    for key, value in smooth_levels.items():
+                        if not str(key).startswith("prefix:"):
+                            continue
+                        prefix = str(key).split(":", 1)[1]
+                        if short_lower.startswith(prefix + "_high"):
+                            level = value
+                            break
+                if is_zbrush_mesh:
+                    level = 0
+
                 dup = cmds.duplicate(mesh, returnRootsOnly=True)[0]
+                dup = cmds.ls(dup, long=True)[0]
+                if level > 0:
+                    try:
+                        cmds.polySmooth(dup, divisions=int(level), keepBorder=False, constructionHistory=False)
+                        cmds.delete(dup, constructionHistory=True)
+                    except Exception as e:
+                        cmds.warning("Could not smooth HP export copy '{}': {}".format(short_name, e))
                 dup = cmds.parent(dup, temp_root, absolute=True)[0]
                 dup = cmds.rename(dup, short_name)
-                if FinalExportProcessor._is_zbrush_mesh(mesh):
+                dup = FinalExportProcessor._resolve_child_under_parent(dup, temp_root)
+                if is_zbrush_mesh:
                     for shape in cmds.listRelatives(dup, shapes=True, fullPath=True) or []:
                         if cmds.objExists(shape + ".displaySmoothMesh"):
                             cmds.setAttr(shape + ".displaySmoothMesh", 0)
@@ -195,7 +172,7 @@ class FinalExportProcessor(object):
                     cmds.makeIdentity(dup, apply=True, t=True, r=True, s=True, n=False, pn=True)
                 except Exception as e:
                     cmds.warning("Could not zero HP export transform '{}': {}".format(short_name, e))
-                prepared.append(cmds.ls(dup, long=True)[0])
+                prepared.append(FinalExportProcessor._resolve_child_under_parent(dup, temp_root))
             except Exception as e:
                 cmds.warning("Could not create zero-transform HP export copy '{}': {}".format(short_name, e))
                 prepared.append(mesh)
@@ -524,7 +501,8 @@ class FinalExportProcessor(object):
             for item in final_mesh_widgets:
                 prefixes_to_process.append({
                     'prefix': item['full_prefix'].lower(),
-                    'smooth_level': FinalExportProcessor._smooth_level_from_item(item)
+                    'smooth_level': FinalExportProcessor._smooth_level_from_item(item),
+                    'hp_nodes': item.get('hp_nodes') or []
                 })
         else:
             # Batch mode: use saved UI state when available; otherwise keep UI default Smooth 2.
@@ -547,7 +525,7 @@ class FinalExportProcessor(object):
         progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
         progress_dlg.show()
         
-        smooth_preview_state = {}
+        smooth_levels = {}
         temp_nodes = []
         cmds.refresh(suspend=True)
         
@@ -562,6 +540,10 @@ class FinalExportProcessor(object):
                 
                 full_prefix_lower = item['prefix']
                 smooth_level = item['smooth_level']
+                try:
+                    smooth_level_value = max(0, int(smooth_level or 0))
+                except Exception:
+                    smooth_level_value = 0
                 
                 progress_dlg.setLabelText(bg_l10n.text("Preparing: {name}").format(name=full_prefix_lower))
                 progress_dlg.setValue(i)
@@ -569,12 +551,33 @@ class FinalExportProcessor(object):
                 
                 hp_meshes = [m for m in hp_all if m.split('|')[-1].lower().startswith(full_prefix_lower + "_high")]
                 lp_meshes = [m for m in lp_all if m.split('|')[-1].lower().startswith(full_prefix_lower + "_low")]
+                item_hp_meshes = []
+                for hp_node in item.get('hp_nodes', []) or []:
+                    for hp_match in cmds.ls(hp_node, long=True) or []:
+                        if hp_match in hp_all:
+                            item_hp_meshes.append(hp_match)
+                if item_hp_meshes:
+                    hp_meshes = list(set(hp_meshes + item_hp_meshes))
                 
                 if not hp_meshes:
                     cmds.warning("Warning: No HP meshes found for LP prefix '{}'. Check naming.".format(full_prefix_lower))
 
-                if mode in ['both', 'hp']:
-                    FinalExportProcessor._apply_export_smooth_preview(hp_meshes, smooth_level, smooth_preview_state)
+                smoothable_hp_shorts = set()
+                if smooth_level_value > 0 and mode in ['both', 'hp']:
+                    smooth_levels["prefix:{}".format(full_prefix_lower)] = max(
+                        smooth_levels.get("prefix:{}".format(full_prefix_lower), 0),
+                        smooth_level_value
+                    )
+                    for hp in hp_meshes:
+                        short_name = hp.split('|')[-1].lower()
+                        if FinalExportProcessor._is_zbrush_mesh(hp):
+                            cmds.warning("Skipped smooth for '{}' (ZBrush geometry)".format(hp))
+                        else:
+                            hp_long = cmds.ls(hp, long=True)
+                            hp_long = hp_long[0] if hp_long else hp
+                            smoothable_hp_shorts.add(short_name)
+                            smooth_levels[hp_long] = max(smooth_levels.get(hp_long, 0), smooth_level_value)
+                            smooth_levels[short_name] = max(smooth_levels.get(short_name, 0), smooth_level_value)
                 
                 # --- MULTI-MATERIAL LOGIC ---
                 was_split = False
@@ -589,6 +592,14 @@ class FinalExportProcessor(object):
                         new_lps, new_hps = FinalExportProcessor._process_multimaterial_mesh(lp, hp_meshes, mat_dict)
                         temp_nodes.extend(new_lps)
                         temp_nodes.extend(new_hps)
+                        if smooth_level_value > 0 and mode in ['both', 'hp']:
+                            for hp in new_hps:
+                                short_name = hp.split('|')[-1].lower()
+                                if any(short_name.startswith(source + "_mat") for source in smoothable_hp_shorts):
+                                    hp_long = cmds.ls(hp, long=True)
+                                    hp_long = hp_long[0] if hp_long else hp
+                                    smooth_levels[hp_long] = max(smooth_levels.get(hp_long, 0), smooth_level_value)
+                                    smooth_levels[short_name] = max(smooth_levels.get(short_name, 0), smooth_level_value)
                         final_lp_for_export.update(new_lps)
                         final_hp_for_export.update(new_hps)
                         exported_meshes.add(lp)
@@ -628,7 +639,7 @@ class FinalExportProcessor(object):
             if all_to_export:
                 export_nodes = all_to_export
                 if mode in ['both', 'hp']:
-                    export_nodes, temp_root = FinalExportProcessor._make_zero_transform_hp_export_copies(all_to_export)
+                    export_nodes, temp_root = FinalExportProcessor._make_zero_transform_hp_export_copies(all_to_export, smooth_levels)
                     if temp_root:
                         temp_nodes.append(temp_root)
 
@@ -650,21 +661,16 @@ class FinalExportProcessor(object):
             return False
         
         finally:
-            FinalExportProcessor._restore_smooth_preview_state(smooth_preview_state)
             existing_temp_nodes = [node for node in reversed(temp_nodes) if node and cmds.objExists(node)]
             if existing_temp_nodes:
-                try:
-                    cmds.delete(existing_temp_nodes)
-                except Exception as e:
-                    cmds.warning("Could not clean export temporary nodes: {}".format(e))
+                for node in existing_temp_nodes:
+                    if cmds.objExists(node + ".visibility"):
+                        try:
+                            cmds.setAttr(node + ".visibility", False)
+                        except Exception:
+                            pass
             cmds.select(clear=True)
             cmds.refresh(suspend=False)
-            def safe_refresh():
-                try:
-                    cmds.refresh()
-                except Exception:
-                    pass
-            QtCore.QTimer.singleShot(100, safe_refresh)
             progress_dlg.close()
             
         return False
