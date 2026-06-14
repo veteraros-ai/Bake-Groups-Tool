@@ -62,6 +62,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.zbrush_triangle_threshold = 50
         self.last_debug_lines = []
         self.user_action_lines = []
+        self.subgroup_color_override_cache = {}
+        self.subgroup_color_index_map = {}
         self._is_closing = False
         self.update_worker = None
         self.update_dialog = None
@@ -127,8 +129,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         g_layout.addWidget(btn_create_main)
 
         tool_layout = QtWidgets.QHBoxLayout()
-        self.cb_auto_isolate = QtWidgets.QCheckBox("Auto-Isolate")
-        self.cb_auto_isolate.setChecked(True)
+        self.cb_color_subgroups = QtWidgets.QCheckBox("Color Groups")
+        self.cb_color_subgroups.setChecked(False)
+        self.cb_color_subgroups.toggled.connect(self.on_color_by_subgroups_toggled)
         self.cb_keep_hp_structure = QtWidgets.QCheckBox("Keep HP")
         self.cb_keep_hp_structure.setChecked(False)
         self.cb_keep_hp_structure.toggled.connect(lambda checked: self.refresh_left_panel())
@@ -151,7 +154,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         tool_checks = QtWidgets.QVBoxLayout()
         tool_checks.setSpacing(0)
-        tool_checks.addWidget(self.cb_auto_isolate)
+        tool_checks.addWidget(self.cb_color_subgroups)
         tool_checks.addWidget(self.cb_keep_hp_structure)
         tool_layout.addLayout(tool_checks)
 
@@ -605,6 +608,395 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def clear_update_dialog(self, *args):
         self.update_dialog = None
 
+    def on_color_by_subgroups_toggled(self, checked):
+        if checked:
+            self.subgroup_color_index_map = {}
+            self.update_subgroup_colors()
+        else:
+            self.restore_subgroup_colors()
+            self.subgroup_color_index_map = {}
+        self.refresh_left_panel()
+
+    def subgroup_color_for_name(self, name):
+        palette = [
+            (0.953, 0.071, 0.027),
+            (0.988, 0.424, 0.012),
+            (0.953, 0.851, 0.443),
+            (0.196, 0.831, 0.145),
+            (0.145, 0.831, 0.824),
+            (0.090, 0.247, 0.827),
+            (0.647, 0.090, 0.827),
+            (0.827, 0.090, 0.820),
+            (1.000, 1.000, 1.000),
+            (0.000, 0.506, 0.000),
+            (0.000, 0.506, 0.482),
+            (0.000, 0.000, 0.498),
+            (0.114, 0.000, 0.498),
+            (0.498, 0.000, 0.478),
+            (0.518, 0.518, 0.518),
+            (0.518, 0.176, 0.110),
+            (0.278, 0.204, 0.129),
+            (0.518, 0.459, 0.404),
+            (1.000, 0.945, 0.145),
+        ]
+        index_map = getattr(self, 'subgroup_color_index_map', {}) or {}
+        if name in index_map:
+            index = index_map[name]
+        else:
+            value = 0
+            for char_index, char in enumerate(str(name or "")):
+                value += (char_index + 1) * ord(char)
+            index = value
+        base = palette[index % len(palette)]
+        pass_index = index // len(palette)
+        shade = 1.0 if pass_index == 0 else max(0.38, 0.62 ** pass_index)
+        return tuple(max(0.0, min(1.0, channel * shade)) for channel in base)
+
+    def ensure_subgroup_color_indices(self, names, reset=False):
+        if reset:
+            self.subgroup_color_index_map = {}
+        index_map = getattr(self, 'subgroup_color_index_map', None)
+        if index_map is None:
+            index_map = {}
+            self.subgroup_color_index_map = index_map
+        next_index = max(index_map.values()) + 1 if index_map else 0
+        for name in names or []:
+            if name not in index_map:
+                index_map[name] = next_index
+                next_index += 1
+        return index_map
+
+    def color_to_qss_rgb(self, color, scale=255):
+        return "rgb({}, {}, {})".format(
+            max(0, min(255, int(color[0] * scale))),
+            max(0, min(255, int(color[1] * scale))),
+            max(0, min(255, int(color[2] * scale)))
+        )
+
+    def color_to_qss_rgba(self, color, alpha):
+        return "rgba({}, {}, {}, {})".format(
+            max(0, min(255, int(color[0] * 255))),
+            max(0, min(255, int(color[1] * 255))),
+            max(0, min(255, int(color[2] * 255))),
+            max(0, min(255, int(alpha)))
+        )
+
+    def viewport_subgroup_color(self, color):
+        neutral = 0.22
+        mix = 0.18
+        brightness = 0.68
+        return tuple(
+            max(0.0, min(0.85, ((channel * (1.0 - mix)) + (neutral * mix)) * brightness))
+            for channel in color
+        )
+
+    def subgroup_row_style(self, subgroup_name, active=False):
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+            color = self.subgroup_color_for_name(subgroup_name)
+            border = "#f1f5f2" if active else self.color_to_qss_rgb(color)
+            bg = self.color_to_qss_rgba(color, 30 if not active else 66)
+            width = 2 if active else 1
+            return "QFrame { background-color: %s; border: %dpx solid %s; border-radius: 4px; }" % (bg, width, border)
+        if active:
+            return "QFrame { background-color: rgba(88, 129, 96, 48); border: 2px solid #f1f5f2; border-radius: 4px; }"
+        return "QFrame { background-color: transparent; border: 1px solid #333; border-radius: 4px; }"
+
+    def subgroup_name_style(self, subgroup_name, active=False):
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+            color = self.subgroup_color_for_name(subgroup_name)
+            bg = self.color_to_qss_rgba(color, 68 if active else 28)
+            border = self.color_to_qss_rgba(color, 180 if active else 95)
+            weight = "bold" if active else "normal"
+            return "background-color: %s; border: 1px solid %s; border-radius: 3px; font-weight: %s; text-align: left; padding-left: 5px;" % (bg, border, weight)
+        if active:
+            return "background-color: #3a5375; font-weight: bold; text-align: left; padding-left: 5px;"
+        return "background-color: transparent; text-align: left; padding-left: 5px;"
+
+    def subgroup_add_button_style(self, active=False):
+        if active:
+            return "QPushButton { background-color: #8fbd72; color: #102410; border: 1px solid #e7f5d8; border-radius: 4px; font-weight: bold; padding: 0px; } QPushButton:hover { background-color: #9cca7f; }"
+        return "QPushButton { background-color: #425c42; color: white; border: 1px solid #425c42; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #4f704f; }"
+
+    def iter_colorable_nodes(self, transform):
+        if not transform or not cmds.objExists(transform):
+            return []
+        if cmds.nodeType(transform) == "mesh":
+            if not cmds.getAttr(transform + ".intermediateObject"):
+                return [transform]
+            return []
+        transforms = [transform]
+        transforms.extend(cmds.listRelatives(transform, allDescendents=True, type='transform', fullPath=True) or [])
+        nodes = []
+        seen = set()
+        for item in transforms:
+            if not item or not cmds.objExists(item):
+                continue
+            shapes = cmds.listRelatives(item, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
+            for shape in shapes:
+                if shape in seen:
+                    continue
+                if cmds.objExists(shape) and cmds.attributeQuery("overrideEnabled", node=shape, exists=True):
+                    seen.add(shape)
+                    nodes.append(shape)
+        return nodes
+
+    def store_override_state(self, node):
+        if node in self.subgroup_color_override_cache:
+            return
+        attrs = {}
+        try:
+            node_uuid = cmds.ls(node, uuid=True) or []
+            if node_uuid:
+                attrs["__uuid"] = node_uuid[0]
+        except Exception:
+            pass
+        for attr in ("overrideEnabled", "overrideRGBColors", "overrideColor"):
+            plug = "{}.{}".format(node, attr)
+            if cmds.objExists(plug):
+                try:
+                    attrs[attr] = cmds.getAttr(plug)
+                except Exception:
+                    pass
+        plug = "{}.overrideColorRGB".format(node)
+        if cmds.objExists(plug):
+            try:
+                value = cmds.getAttr(plug)
+                attrs["overrideColorRGB"] = value[0] if isinstance(value, list) else value
+            except Exception:
+                pass
+        for attr in ("displayColors", "displayColorChannel"):
+            plug = "{}.{}".format(node, attr)
+            if cmds.objExists(plug):
+                try:
+                    attrs[attr] = cmds.getAttr(plug)
+                except Exception:
+                    pass
+        target = self.color_target_for_shape(node)
+        if target:
+            try:
+                color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+                attrs["__had_color_set"] = "BG_Subgroup_Color" in color_sets
+                current = cmds.polyColorSet(target, query=True, currentColorSet=True) or []
+                if current:
+                    attrs["__current_color_set"] = current[0]
+            except Exception:
+                pass
+        self.subgroup_color_override_cache[node] = attrs
+
+    def color_target_for_shape(self, node):
+        if not node or not cmds.objExists(node):
+            return None
+        if cmds.nodeType(node) == "mesh":
+            parent = cmds.listRelatives(node, parent=True, fullPath=True) or []
+            return parent[0] if parent else None
+        shapes = cmds.listRelatives(node, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
+        return node if shapes else None
+
+    def mesh_shape_for_color_node(self, node):
+        if not node or not cmds.objExists(node):
+            return None
+        if cmds.nodeType(node) == "mesh":
+            return node
+        shapes = cmds.listRelatives(node, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
+        return shapes[0] if shapes else None
+
+    def ensure_subgroup_color_set(self, target):
+        color_set = "BG_Subgroup_Color"
+        color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+        if color_set not in color_sets:
+            cmds.polyColorSet(target, create=True, colorSet=color_set)
+        cmds.polyColorSet(target, currentColorSet=True, colorSet=color_set)
+        return color_set
+
+    def apply_override_color(self, node, color):
+        if not node or not cmds.objExists(node):
+            return
+        self.store_override_state(node)
+        target = self.color_target_for_shape(node)
+        shape = self.mesh_shape_for_color_node(node)
+        if not target:
+            return
+        try:
+            self.ensure_subgroup_color_set(target)
+            cmds.polyColorPerVertex(target, rgb=self.viewport_subgroup_color(color), colorDisplayOption=True, notUndoable=True)
+            if shape and cmds.objExists("{}.displayColors".format(shape)):
+                cmds.setAttr("{}.displayColors".format(shape), True)
+            if shape and cmds.objExists("{}.displayColorChannel".format(shape)):
+                cmds.setAttr("{}.displayColorChannel".format(shape), "color", type="string")
+            try:
+                cmds.polyOptions(target, colorShadedDisplay=True, colorMaterialChannel="ambientDiffuse")
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def delete_preview_materials(self):
+        initial_sg = "initialShadingGroup"
+        for sg in cmds.ls("BG_ColorPreview_SG_*") or []:
+            if initial_sg and cmds.objExists(initial_sg):
+                try:
+                    members = cmds.sets(sg, query=True) or []
+                except Exception:
+                    members = []
+                for member in members:
+                    try:
+                        cmds.sets(member, edit=True, forceElement=initial_sg)
+                    except Exception:
+                        pass
+            try:
+                cmds.delete(sg)
+            except Exception:
+                pass
+        for node in cmds.ls("BG_ColorPreview_MAT_*") or []:
+            try:
+                cmds.delete(node)
+            except Exception:
+                pass
+
+    def restore_subgroup_colors(self):
+        cache = getattr(self, 'subgroup_color_override_cache', {})
+        for node, attrs in list(cache.items()):
+            if not cmds.objExists(node):
+                node_uuid = attrs.get("__uuid")
+                matches = cmds.ls(node_uuid, long=True) if node_uuid else []
+                if matches:
+                    node = matches[0]
+                else:
+                    continue
+            try:
+                if "overrideRGBColors" in attrs:
+                    cmds.setAttr("{}.overrideRGBColors".format(node), attrs["overrideRGBColors"])
+                if "overrideColorRGB" in attrs:
+                    rgb = attrs["overrideColorRGB"]
+                    cmds.setAttr("{}.overrideColorRGB".format(node), rgb[0], rgb[1], rgb[2])
+                if "overrideColor" in attrs:
+                    cmds.setAttr("{}.overrideColor".format(node), attrs["overrideColor"])
+                if "overrideEnabled" in attrs:
+                    cmds.setAttr("{}.overrideEnabled".format(node), attrs["overrideEnabled"])
+                target = self.color_target_for_shape(node)
+                has_external_color_set = False
+                if target:
+                    try:
+                        color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+                        if "BG_Subgroup_Color" in color_sets:
+                            cmds.polyColorSet(target, delete=True, colorSet="BG_Subgroup_Color")
+                            color_sets = [name for name in color_sets if name != "BG_Subgroup_Color"]
+                        has_external_color_set = bool(color_sets)
+                    except Exception:
+                        pass
+                    if attrs.get("__current_color_set"):
+                        try:
+                            cmds.polyColorSet(target, currentColorSet=True, colorSet=attrs["__current_color_set"])
+                        except Exception:
+                            pass
+                if "displayColorChannel" in attrs and cmds.objExists("{}.displayColorChannel".format(node)):
+                    cmds.setAttr("{}.displayColorChannel".format(node), attrs["displayColorChannel"], type="string")
+                if "displayColors" in attrs and cmds.objExists("{}.displayColors".format(node)):
+                    cmds.setAttr("{}.displayColors".format(node), False if has_external_color_set else attrs["displayColors"])
+            except Exception:
+                pass
+        self.subgroup_color_override_cache = {}
+        self.delete_preview_materials()
+
+    @contextlib.contextmanager
+    def suspend_subgroup_color_preview(self):
+        was_enabled = hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked()
+        if was_enabled:
+            self.restore_subgroup_colors()
+        try:
+            yield
+        finally:
+            if was_enabled and hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+                self.update_subgroup_colors()
+
+    def update_subgroup_colors(self):
+        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
+            return
+        self.restore_subgroup_colors()
+        if not self.active_root_id:
+            return
+        if getattr(self, 'is_final_view', False):
+            colored_count = 0
+            self.ensure_subgroup_color_indices([w.get('subgroup_name') for w in getattr(self, 'final_mesh_widgets', []) if w.get('subgroup_name')])
+            for widget_data in getattr(self, 'final_mesh_widgets', []):
+                name = widget_data.get('subgroup_name')
+                color = self.subgroup_color_for_name(name)
+                for node in widget_data.get('hp_nodes', []):
+                    for color_node in self.iter_colorable_nodes(node):
+                        if self.apply_override_color(color_node, color):
+                            colored_count += 1
+                prefix = widget_data.get('full_prefix')
+                if prefix:
+                    for node in cmds.ls("{}_low".format(prefix), long=True) or []:
+                        for color_node in self.iter_colorable_nodes(node):
+                            if self.apply_override_color(color_node, color):
+                                colored_count += 1
+            self.log("Color Groups: colored {} mesh shapes.".format(colored_count), "lightblue")
+            return
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        group_names = []
+        for root in (hp_main, lp_main):
+            if not root or not cmds.objExists(root):
+                continue
+            for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
+                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                    continue
+                short_name = child.split('|')[-1]
+                ui_name = short_name
+                for suffix in (bg_core.BakeConfig.SUFFIX_HP, bg_core.BakeConfig.SUFFIX_LP):
+                    if ui_name.endswith(suffix):
+                        ui_name = ui_name[:-len(suffix)]
+                        break
+                if ui_name not in group_names:
+                    group_names.append(ui_name)
+        self.ensure_subgroup_color_indices(sorted(group_names))
+        colored_count = 0
+        for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP), (lp_main, bg_core.BakeConfig.SUFFIX_LP)):
+            if not root or not cmds.objExists(root):
+                continue
+            children = cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []
+            for child in children:
+                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                    continue
+                short_name = child.split('|')[-1]
+                if not self.cb_keep_hp_structure.isChecked():
+                    attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                    if cmds.objExists(attr):
+                        group_type = cmds.getAttr(attr)
+                        if suffix == bg_core.BakeConfig.SUFFIX_HP and group_type != "HP":
+                            continue
+                        if suffix == bg_core.BakeConfig.SUFFIX_LP and group_type != "LP":
+                            continue
+                    elif not short_name.endswith(suffix):
+                        continue
+                ui_name = short_name
+                if short_name.endswith(suffix):
+                    ui_name = short_name[:-len(suffix)]
+                color = self.subgroup_color_for_name(ui_name)
+                for color_node in self.iter_colorable_nodes(child):
+                    if self.apply_override_color(color_node, color):
+                        colored_count += 1
+        self.log("Color Groups: colored {} mesh shapes.".format(colored_count), "lightblue")
+
+    def recolor_moved_subgroup_nodes(self, nodes, subgroup_name):
+        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
+            return
+        self.ensure_subgroup_color_indices([subgroup_name])
+        color = self.subgroup_color_for_name(subgroup_name)
+        colored_count = 0
+        for node in nodes or []:
+            if not node or not cmds.objExists(node):
+                continue
+            for color_node in self.iter_colorable_nodes(node):
+                if self.apply_override_color(color_node, color):
+                    colored_count += 1
+        if colored_count:
+            self.log("Color Groups: recolored {} moved mesh shapes.".format(colored_count), "lightblue")
+
     def _disconnect_signal(self, signal, slot=None):
         try:
             if slot is None:
@@ -703,6 +1095,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             return
         if dialog:
             dialog.close()
+        self.restore_subgroup_colors()
         for job_id in self.script_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):
@@ -895,9 +1288,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 groups[ui_name] = {'hp': None, 'lp': child}
 
         locked_list = pair.get('locked', [])
-        for ui_name in sorted(groups.keys()):
+        sorted_group_names = sorted(groups.keys())
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+            self.ensure_subgroup_color_indices(sorted_group_names)
+        for ui_name in sorted_group_names:
             hp_node, lp_node = groups[ui_name]['hp'], groups[ui_name]['lp']
+            is_active_subgroup = self.active_subgroup_name == ui_name
             frame = QtWidgets.QFrame()
+            frame.setStyleSheet(self.subgroup_row_style(ui_name, is_active_subgroup))
             layout = QtWidgets.QHBoxLayout(frame)
             layout.setContentsMargins(4, 4, 4, 4)
 
@@ -909,10 +1307,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(ui_name)
-            if self.active_subgroup_name == ui_name:
-                btn_name.setStyleSheet("background-color: #3a5375; font-weight: bold; text-align: left; padding-left: 5px;")
-            else:
-                btn_name.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
+            btn_name.setStyleSheet(self.subgroup_name_style(ui_name, is_active_subgroup))
             btn_name.clicked.connect(lambda checked=False, n=ui_name: self.set_active_subgroup(n))
             btn_name.doubleClicked.connect(lambda checked=False, h=hp_node, l=lp_node: self.select_meshes_in_group(h, l))
             btn_name.rightClicked.connect(lambda checked=False, old_name=ui_name, h=hp_node, l=lp_node: self.rename_subgroup_ui(old_name, h, l))
@@ -920,7 +1315,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
             btn_plus = QtWidgets.QPushButton("Add")
             btn_plus.setFixedSize(56, 24)
-            btn_plus.setStyleSheet("background-color: #425c42; font-weight: bold;")
+            btn_plus.setStyleSheet(self.subgroup_add_button_style(is_active_subgroup))
             btn_plus.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, pm_hp=hp_main, pm_lp=lp_main: self.add_to_groups_ui(h, l, pm_hp, pm_lp))
             layout.addWidget(btn_plus)
 
@@ -961,30 +1356,31 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.active_subgroup_name = None
             self.is_isolated = True
 
-        if self.cb_auto_isolate.isChecked():
-            panel = 'modelPanel4'
-            if not cmds.modelEditor(panel, exists=True):
-                panel = cmds.playblast(activeEditor=True)
-            if cmds.modelEditor(panel, exists=True):
-                cmds.isolateSelect(panel, state=self.is_isolated)
-                if self.is_isolated:
-                    iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
-                    cmds.isolateSelect(panel, addDagObject=hp_node)
-                    cmds.isolateSelect(panel, addDagObject=lp_node)
-                    if iso_set:
-                        set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
-                        if cmds.objExists(set_name):
-                            cmds.sets(clear=set_name)
-                    nodes_to_add = [n for n in [hp_node, lp_node] if n and cmds.objExists(n)]
-                    for node in nodes_to_add:
-                        cmds.isolateSelect(panel, addDagObject=node)
-                cmds.isolateSelect(panel, update=True)
-            else:
-                cmds.warning("Active modelPanel not found for isolation.")
+        panel = 'modelPanel4'
+        if not cmds.modelEditor(panel, exists=True):
+            panel = cmds.playblast(activeEditor=True)
+        if cmds.modelEditor(panel, exists=True):
+            cmds.isolateSelect(panel, state=self.is_isolated)
+            if self.is_isolated:
+                iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
+                cmds.isolateSelect(panel, addDagObject=hp_node)
+                cmds.isolateSelect(panel, addDagObject=lp_node)
+                if iso_set:
+                    set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
+                    if cmds.objExists(set_name):
+                        cmds.sets(clear=set_name)
+                nodes_to_add = [n for n in [hp_node, lp_node] if n and cmds.objExists(n)]
+                for node in nodes_to_add:
+                    cmds.isolateSelect(panel, addDagObject=node)
+            cmds.isolateSelect(panel, update=True)
+        else:
+            cmds.warning("Active modelPanel not found for isolation.")
 
         self.sync_toggle_buttons(hp_node, lp_node)
         self.refresh_right_panel()
         self.refresh_left_panel()
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+            self.update_subgroup_colors()
 
     def select_meshes_in_group(self, hp_grp, lp_grp):
         to_select = []

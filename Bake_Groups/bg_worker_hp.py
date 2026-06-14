@@ -696,7 +696,7 @@ class HPGroupingWorker(QtCore.QThread):
         self.progress_value.emit(35)
         self.progress_text.emit("Step 2.5: Analyzing HP holes for floater/decal matching...")
 
-        # --- STEP 2.5: РџРћРРЎРљ Р¤Р›РћРђРўР•Р РћР’ Р Р”Р•РљРђР›Р•Р™ ---
+        # --- STEP 2.5 ---
         if self.detect_floaters and HAS_MATH_CORE:
             hp_owner_lp = {}
             for _lp_name, _owned_hps in lp_to_owned_hps.items():
@@ -1535,11 +1535,9 @@ class HPGroupingWorker(QtCore.QThread):
         # --- STEP 4: Threshold Calculations & OUTLIER VALIDATION ---
         all_meshes_list = list(self.hp_data.values())
         
-        # РџРѕР»СѓС‡Р°РµРј СЃС‹СЂС‹Рµ РґРёР°РіРѕРЅР°Р»Рё РґР»СЏ РІС‹С‡РёСЃР»РµРЅРёСЏ РјРµРґРёР°РЅС‹ СЃС†РµРЅС‹
         raw_diags = [m.get("diag", 0) for m in all_meshes_list if m.get("diag", 0) > 0.001 and m.get("bbox_vol", 0) > 1e-6]
         median_scene_diag = bg_core.StatsUtils.median(raw_diags) if raw_diags else 1.0
         
-        # Р¤РёР»СЊС‚СЂСѓРµРј Р°РЅРѕРјР°Р»СЊРЅС‹Рµ BBox (РІС‹Р±СЂРѕСЃС‹, РєРѕС‚РѕСЂС‹Рµ Р±РѕР»СЊС€Рµ РјРµРґРёР°РЅС‹ РІ 10+ СЂР°Р·)
         valid_diags = []
         for m in all_meshes_list:
             d = m.get("diag", 0)
@@ -1557,7 +1555,6 @@ class HPGroupingWorker(QtCore.QThread):
         vtx_dict = {}
         for m in all_meshes_list:
             d = m.get("diag", 0)
-            # РСЃРєР»СЋС‡Р°РµРј ZBrush РёР· СЂР°СЃС‡РµС‚Р° СЃСЂРµРґРЅРёС… СЂР°Р·РјРµСЂРѕРІ Р±РѕР»С‚РѕРІ
             if not m.get("is_zbrush", False) and 1e-6 < m.get("bbox_vol", 0) and d <= (median_scene_diag * 10):
                 vtx_dict.setdefault(m.get("vtx", 0), []).append(d)
         
@@ -1672,7 +1669,6 @@ class HPGroupingWorker(QtCore.QThread):
                     if current_cluster:
                         clusters.append(current_cluster)
 
-            # ZBrush РєР»Р°СЃС‚РµСЂС‹
             zb_indices = hash_buckets.get("__zbrush__", [])
             for idx_i in zb_indices:
                 if idx_i in processed:
@@ -1695,7 +1691,6 @@ class HPGroupingWorker(QtCore.QThread):
                 if current_cluster:
                     clusters.append(current_cluster)
 
-            # РџСѓСЃС‚С‹Рµ РЅРµвЂ‘ZBrush РєР»Р°СЃС‚РµСЂС‹ (СЃРІСЏР·РєР° РїРѕ РѕР±СЉС‘РјСѓ)
             empty_non_zb_indices = hash_buckets.get("__empty_non_zb__", [])
             for idx_i in empty_non_zb_indices:
                 if idx_i in processed:
@@ -1928,13 +1923,11 @@ class HPGroupingWorker(QtCore.QThread):
                 if verts:
                     metrics = bg_math_core.analyze_mesh_shape(verts)
                     
-                    # Р›РѕРіРёРєР° Р±РѕР»С‚РѕРІ СЃС‚СЂРѕРіРѕ РѕС‚РєР»СЋС‡РµРЅР° РґР»СЏ ZBrush
                     symmetry_ok = (not self.use_symmetry) or metrics.symmetry_score < self.bolt_symmetry
                     if not is_zb and not is_hard_custom and metrics.elongation < self.bolt_elongation and symmetry_ok:
                         if cluster_diag <= medium_threshold:
                             is_bolt_shape = True
                             
-                    # Р›РѕРіРёРєР° Wire/Pipe С‚СЂРµР±СѓРµС‚ РјР°Р»РѕРіРѕ РѕР±СЉРµРјР°
                     effective_wire_elongation = 8.0 if is_zb else self.wire_elongation
                     if metrics.elongation > effective_wire_elongation and true_vol < 0.05:
                         is_wire_shape = True
@@ -1961,9 +1954,7 @@ class HPGroupingWorker(QtCore.QThread):
                 and max_single_diag <= large_threshold
             )
             
-            # Р Р°СЃРїСЂРµРґРµР»РµРЅРёРµ РїРѕ РєР»Р°СЃС‚РµСЂР°Рј
             if not is_wire_shape and not is_hard_custom and (is_bolt_shape or is_mixed_bolt_item or (max_single_diag <= small_threshold and not is_zb)):
-                # ZBrush РґРµС‚Р°Р»Рё РЅРёРєРѕРіРґР° РЅРµ РїР°РґР°СЋС‚ РІ РѕР±С‰РёРµ РјРµР»РєРёРµ Р±РѕР»С‚С‹
                 if is_mixed_bolt_item:
                     bolt_mixed_reclass_count += 1
                     _debug("  BOLT_RECLASS: item_size={} | bolt_like_parts={} | cluster_diag={:.6f} | item={}".format(

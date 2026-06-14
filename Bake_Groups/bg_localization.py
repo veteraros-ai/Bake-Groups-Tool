@@ -45,7 +45,7 @@ def available_languages():
     result = []
     if os.path.exists(path):
         try:
-            with io.open(path, "r", encoding="utf-8") as stream:
+            with io.open(path, "r", encoding="utf-8-sig") as stream:
                 data = json.load(stream)
             for item in data.get("languages", []):
                 label = item.get("label") or item.get("name") or item.get("code")
@@ -72,7 +72,7 @@ def load_language(lang=None):
 
     if os.path.exists(path):
         try:
-            with io.open(path, "r", encoding="utf-8") as stream:
+            with io.open(path, "r", encoding="utf-8-sig") as stream:
                 loaded = json.load(stream)
             if isinstance(loaded, dict):
                 data["texts"] = loaded.get("texts", {}) or {}
@@ -140,8 +140,6 @@ def _source_key(obj, current):
 
 def _set_common_help(obj, key):
     tip = tooltip(key)
-    if not tip:
-        return
     if hasattr(obj, "setToolTip"):
         obj.setToolTip(tip)
     if hasattr(obj, "setStatusTip"):

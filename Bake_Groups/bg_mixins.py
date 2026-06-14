@@ -1446,12 +1446,17 @@ class FinalViewMixin:
             return
 
         self.final_selected_names = set()
+        sorted_subgroup_names = sorted(subgroup_names)
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked() and hasattr(self, 'ensure_subgroup_color_indices'):
+            self.ensure_subgroup_color_indices(sorted_subgroup_names)
 
-        for display_name in sorted(subgroup_names):
+        for display_name in sorted_subgroup_names:
             hp_nodes = (cmds.ls("*{}_high*".format(display_name), long=True) or [])
             full_prefix = base_name + "_" + display_name
 
             frame = QtWidgets.QFrame()
+            if hasattr(self, 'subgroup_row_style'):
+                frame.setStyleSheet(self.subgroup_row_style(display_name, False))
             row_layout = QtWidgets.QHBoxLayout(frame)
             row_layout.setContentsMargins(4, 4, 4, 4)
             row_layout.setSpacing(6)
@@ -1466,7 +1471,10 @@ class FinalViewMixin:
 
             btn_name = SubgroupButton(display_name)
             btn_name.setCheckable(True)
-            btn_name.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
+            if hasattr(self, 'subgroup_name_style'):
+                btn_name.setStyleSheet(self.subgroup_name_style(display_name, False))
+            else:
+                btn_name.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
             btn_name.clicked.connect(lambda checked=False, n=display_name: self.set_final_row_selected(n, checked))
             btn_name.doubleClicked.connect(lambda checked=False, n=display_name: self.select_final_hp_nodes(n))
             btn_name.rightClicked.connect(lambda checked=False, n=display_name: self.show_final_row_context_menu(n))
@@ -1531,9 +1539,18 @@ class FinalViewMixin:
             btn.setChecked(is_selected)
             btn.blockSignals(False)
             if is_selected:
-                btn.setStyleSheet("background-color: #3a5375; font-weight: bold; text-align: left; padding-left: 5px;")
+                if hasattr(self, 'subgroup_name_style'):
+                    btn.setStyleSheet(self.subgroup_name_style(widget_data.get('subgroup_name'), True))
+                else:
+                    btn.setStyleSheet("background-color: #3a5375; font-weight: bold; text-align: left; padding-left: 5px;")
             else:
-                btn.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
+                if hasattr(self, 'subgroup_name_style'):
+                    btn.setStyleSheet(self.subgroup_name_style(widget_data.get('subgroup_name'), False))
+                else:
+                    btn.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
+            frame = widget_data.get('frame')
+            if frame and hasattr(self, 'subgroup_row_style'):
+                frame.setStyleSheet(self.subgroup_row_style(widget_data.get('subgroup_name'), is_selected))
 
     def adjust_final_smooth_level(self, combo, delta):
         if not combo:
@@ -1692,26 +1709,27 @@ class ExportMixin:
         export_dir = export_dirs[0]
         self.disable_preview_smoothing_for_export()
 
-        with self.suspend_isolation():
-            self.log("Suspended viewport isolation for export...", "lightblue")
-            if mode == 'separate':
-                exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, widgets, parent_window=self, mode='hp', export_dir=export_dir,
-                    smooth_states=pair.get('final_smooth_states', {})
-                )
-                exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, widgets, parent_window=self, mode='lp', export_dir=export_dir,
-                    smooth_states=pair.get('final_smooth_states', {})
-                )
-                if exp_hp or exp_lp:
-                    cmds.inViewMessage(amg="Chapter exported: Separate HP and LP", pos='midCenter', fade=True)
-            else:
-                exported_name = bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, widgets, parent_window=self, mode=mode, export_dir=export_dir,
-                    smooth_states=pair.get('final_smooth_states', {})
-                )
-                if exported_name:
-                    cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
+        with self.suspend_subgroup_color_preview():
+            with self.suspend_isolation():
+                self.log("Suspended viewport isolation for export...", "lightblue")
+                if mode == 'separate':
+                    exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
+                        base_name, hp_main, lp_main, widgets, parent_window=self, mode='hp', export_dir=export_dir,
+                        smooth_states=pair.get('final_smooth_states', {})
+                    )
+                    exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
+                        base_name, hp_main, lp_main, widgets, parent_window=self, mode='lp', export_dir=export_dir,
+                        smooth_states=pair.get('final_smooth_states', {})
+                    )
+                    if exp_hp or exp_lp:
+                        cmds.inViewMessage(amg="Chapter exported: Separate HP and LP", pos='midCenter', fade=True)
+                else:
+                    exported_name = bg_final_export.FinalExportProcessor.export_chapter(
+                        base_name, hp_main, lp_main, widgets, parent_window=self, mode=mode, export_dir=export_dir,
+                        smooth_states=pair.get('final_smooth_states', {})
+                    )
+                    if exported_name:
+                        cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
 
     def batch_export_book(self, mode='separate'):
         if not self.active_root_id:
@@ -1734,29 +1752,30 @@ class ExportMixin:
         self.disable_preview_smoothing_for_export()
 
         success_count = 0
-        with self.suspend_isolation():
-            self.log("Batch Exporting Book (Isolation Disabled)...", "lightblue")
-            for pair in book_pairs:
-                hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-                base_name = pair.get('base', 'Chapter_Export')
-                if mode == 'separate':
-                    exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, [], parent_window=self, mode='hp', export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, [], parent_window=self, mode='lp', export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    if exp_hp or exp_lp:
-                        success_count += 1
-                else:
-                    exported = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, [], parent_window=self, mode=mode, export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    if exported:
-                        success_count += 1
+        with self.suspend_subgroup_color_preview():
+            with self.suspend_isolation():
+                self.log("Batch Exporting Book (Isolation Disabled)...", "lightblue")
+                for pair in book_pairs:
+                    hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+                    base_name = pair.get('base', 'Chapter_Export')
+                    if mode == 'separate':
+                        exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, [], parent_window=self, mode='hp', export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {})
+                        )
+                        exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, [], parent_window=self, mode='lp', export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {})
+                        )
+                        if exp_hp or exp_lp:
+                            success_count += 1
+                    else:
+                        exported = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, [], parent_window=self, mode=mode, export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {})
+                        )
+                        if exported:
+                            success_count += 1
         cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
 
     def export_active_lp_only(self):
@@ -1773,10 +1792,11 @@ class ExportMixin:
             return
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
-        if self._export_lp_for_pair(pair, export_dir):
-            cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
-        else:
-            cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
+        with self.suspend_subgroup_color_preview():
+            if self._export_lp_for_pair(pair, export_dir):
+                cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
+            else:
+                cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
         cmds.select(clear=True)
 
     def batch_export_all_lp_only(self):
@@ -1798,9 +1818,10 @@ class ExportMixin:
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
         success_count = 0
-        for pair in self.root_pairs:
-            if self._export_lp_for_pair(pair, export_dir):
-                success_count += 1
+        with self.suspend_subgroup_color_preview():
+            for pair in self.root_pairs:
+                if self._export_lp_for_pair(pair, export_dir):
+                    success_count += 1
         cmds.inViewMessage(amg="Batch LP export completed! Successful: {} chapters".format(success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
@@ -1822,9 +1843,10 @@ class ExportMixin:
         export_dir = export_dirs[0]
         self.disable_preview_smoothing_for_export()
         success_count = 0
-        for pair in book_pairs:
-            if self._export_lp_for_pair(pair, export_dir):
-                success_count += 1
+        with self.suspend_subgroup_color_preview():
+            for pair in book_pairs:
+                if self._export_lp_for_pair(pair, export_dir):
+                    success_count += 1
         cmds.inViewMessage(amg="LP Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
@@ -1930,15 +1952,24 @@ class GroupManagementMixin:
             if sel:
                 to_hp = [o for o in sel if cmds.objExists(o) and self.core.is_descendant_of(o, hp_main)]
                 to_lp = [o for o in sel if cmds.objExists(o) and self.core.is_descendant_of(o, lp_main)]
+                moved_nodes = []
                 if to_hp:
-                    cmds.parent(to_hp, hp_name, absolute=True)
+                    parented = cmds.parent(to_hp, hp_name, absolute=True)
+                    if parented:
+                        moved_nodes.extend(cmds.ls(parented, long=True) or parented)
                 if to_lp:
-                    cmds.parent(to_lp, lp_name, absolute=True)
+                    parented = cmds.parent(to_lp, lp_name, absolute=True)
+                    if parented:
+                        moved_nodes.extend(cmds.ls(parented, long=True) or parented)
                 cmds.select(clear=True)
+            else:
+                moved_nodes = []
 
             self.active_subgroup_name = suffix
             self.input_suffix.clear()
             self.refresh_left_panel()
+            if moved_nodes and hasattr(self, 'recolor_moved_subgroup_nodes'):
+                self.recolor_moved_subgroup_nodes(moved_nodes, suffix)
             if hasattr(self, 'record_user_action'):
                 self.record_user_action(
                     "Create Group",
@@ -1955,7 +1986,9 @@ class GroupManagementMixin:
         moved_count = 0
         skipped_count = 0
         moved_names = []
+        moved_nodes = []
         source_groups = set()
+        target_ui_name = None
         for obj in sel:
             if not cmds.objExists(obj):
                 continue
@@ -1975,14 +2008,25 @@ class GroupManagementMixin:
                 continue
             source_name = current_parent[0].split('|')[-1] if current_parent else "World"
             try:
-                cmds.parent(obj, target_node)
+                parented = cmds.parent(obj, target_node)
+                if parented:
+                    moved_nodes.extend(cmds.ls(parented, long=True) or parented)
                 moved_count += 1
                 moved_names.append(obj.split('|')[-1])
                 source_groups.add(source_name)
+                if not target_ui_name:
+                    target_short = target_node.split('|')[-1]
+                    target_ui_name = target_short
+                    for suffix in (bg_core.BakeConfig.SUFFIX_HP, bg_core.BakeConfig.SUFFIX_LP):
+                        if target_ui_name.endswith(suffix):
+                            target_ui_name = target_ui_name[:-len(suffix)]
+                            break
             except Exception as e:
                 self.log("Skip parenting for {}: {}".format(obj.split('|')[-1], e), "orange")
                 skipped_count += 1
         self.refresh_left_panel()
+        if moved_nodes and target_ui_name and hasattr(self, 'recolor_moved_subgroup_nodes'):
+            self.recolor_moved_subgroup_nodes(moved_nodes, target_ui_name)
         if hasattr(self, 'record_user_action') and (moved_count or skipped_count):
             target_name = hp_target.split('|')[-1] if hp_target else (lp_target.split('|')[-1] if lp_target else "Unknown")
             moved_preview = self._format_debug_names(moved_names, limit=20) if hasattr(self, '_format_debug_names') else ", ".join(moved_names[:20])
