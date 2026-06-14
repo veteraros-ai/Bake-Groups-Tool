@@ -1992,6 +1992,7 @@ class GroupManagementMixin:
         moved_names = []
         moved_nodes = []
         source_groups = set()
+        target_groups = set()
         target_ui_name = None
         for obj in sel:
             if not cmds.objExists(obj):
@@ -2018,6 +2019,7 @@ class GroupManagementMixin:
                 moved_count += 1
                 moved_names.append(obj.split('|')[-1])
                 source_groups.add(source_name)
+                target_groups.add(target_node.split('|')[-1])
                 if not target_ui_name:
                     target_short = target_node.split('|')[-1]
                     target_ui_name = target_short
@@ -2032,7 +2034,7 @@ class GroupManagementMixin:
         if moved_nodes and target_ui_name and hasattr(self, 'recolor_moved_subgroup_nodes'):
             self.recolor_moved_subgroup_nodes(moved_nodes, target_ui_name)
         if hasattr(self, 'record_user_action') and (moved_count or skipped_count):
-            target_name = hp_target.split('|')[-1] if hp_target else (lp_target.split('|')[-1] if lp_target else "Unknown")
+            target_name = self._format_debug_names(sorted(target_groups), limit=10) if target_groups and hasattr(self, '_format_debug_names') else (", ".join(sorted(target_groups)) if target_groups else "Unknown")
             moved_preview = self._format_debug_names(moved_names, limit=20) if hasattr(self, '_format_debug_names') else ", ".join(moved_names[:20])
             source_preview = self._format_debug_names(sorted(source_groups), limit=10) if hasattr(self, '_format_debug_names') else ", ".join(sorted(source_groups))
             self.record_user_action(
