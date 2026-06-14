@@ -206,6 +206,8 @@ class HPAnalysisMixin:
                 self.log("No existing HP subgroups found to keep.", "orange")
             else:
                 self.refresh_left_panel()
+                if hasattr(self, 'refresh_subgroup_color_preview'):
+                    self.refresh_subgroup_color_preview(reset_indices=True)
                 self.log("Kept existing HP subgroup structure.", "lightblue")
             return
 
@@ -804,6 +806,8 @@ class HPAnalysisMixin:
                     cmds.parent(m_move, new_grp, absolute=True)
 
         self.refresh_left_panel()
+        if hasattr(self, 'refresh_subgroup_color_preview'):
+            self.refresh_subgroup_color_preview(reset_indices=True)
         self.log("HP Auto-Grouping complete. Processed {} groups.".format(len(groups)), "lightblue")
         if hasattr(self, 'record_user_action'):
             self.record_user_action("Analyze HP finished", "groups={}".format(len(groups)))

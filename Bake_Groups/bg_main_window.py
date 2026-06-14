@@ -910,6 +910,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             if was_enabled and hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
                 self.update_subgroup_colors()
 
+    def refresh_subgroup_color_preview(self, reset_indices=False):
+        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
+            return
+        if reset_indices:
+            self.subgroup_color_index_map = {}
+        self.update_subgroup_colors()
+
     def update_subgroup_colors(self):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
