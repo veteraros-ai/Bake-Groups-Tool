@@ -1362,6 +1362,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.active_root_id = pair['id']
             self.active_subgroup_name = None
             self.is_isolated = True
+            self.subgroup_color_index_map = {}
 
         panel = 'modelPanel4'
         if not cmds.modelEditor(panel, exists=True):
