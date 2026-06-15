@@ -2615,12 +2615,16 @@ class SceneInteractionMixin:
             self.picked_hp, self.picked_lp = None, None
             self.le_picked_hp.clear()
             self.le_picked_lp.clear()
+            if not self.cb_keep_hp_structure.isChecked():
+                self._skip_color_update_once = True
             self.activate_root(np)
             self.refresh_right_panel()
 
             self.prepare_meshes(hp_node, flatten=not self.cb_keep_hp_structure.isChecked())
             self.prepare_meshes(lp_node, flatten=True)
             self.refresh_left_panel()
+            if self.cb_keep_hp_structure.isChecked() and hasattr(self, 'refresh_subgroup_color_preview'):
+                self.refresh_subgroup_color_preview(reset_indices=True)
             if hasattr(self, 'record_user_action'):
                 self.record_user_action(
                     "Create Pair",

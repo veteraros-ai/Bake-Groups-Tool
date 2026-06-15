@@ -472,7 +472,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if not pair:
             return ["No active chapter selected."]
 
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        hp_main, _, _ = self.core.resolve_main_nodes(pair)
         lines.append("Active chapter: {}".format(pair.get('base', 'Unknown')))
 
         def collect_group_snapshot(root_node, label):
@@ -933,12 +933,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     for color_node in self.iter_colorable_nodes(node):
                         if self.apply_override_color(color_node, color):
                             colored_count += 1
-                prefix = widget_data.get('full_prefix')
-                if prefix:
-                    for node in cmds.ls("{}_low".format(prefix), long=True) or []:
-                        for color_node in self.iter_colorable_nodes(node):
-                            if self.apply_override_color(color_node, color):
-                                colored_count += 1
             self.log("Color Groups: colored {} mesh shapes.".format(colored_count), "lightblue")
             return
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -946,7 +940,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             return
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         group_names = []
-        for root in (hp_main, lp_main):
+        for root in (hp_main,):
             if not root or not cmds.objExists(root):
                 continue
             for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
@@ -962,7 +956,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     group_names.append(ui_name)
         self.ensure_subgroup_color_indices(sorted(group_names))
         colored_count = 0
-        for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP), (lp_main, bg_core.BakeConfig.SUFFIX_LP)):
+        for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP),):
             if not root or not cmds.objExists(root):
                 continue
             children = cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []
@@ -975,8 +969,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     if cmds.objExists(attr):
                         group_type = cmds.getAttr(attr)
                         if suffix == bg_core.BakeConfig.SUFFIX_HP and group_type != "HP":
-                            continue
-                        if suffix == bg_core.BakeConfig.SUFFIX_LP and group_type != "LP":
                             continue
                     elif not short_name.endswith(suffix):
                         continue
@@ -992,11 +984,19 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def recolor_moved_subgroup_nodes(self, nodes, subgroup_name):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        hp_main, _, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not cmds.objExists(hp_main):
+            return
         self.ensure_subgroup_color_indices([subgroup_name])
         color = self.subgroup_color_for_name(subgroup_name)
         colored_count = 0
         for node in nodes or []:
             if not node or not cmds.objExists(node):
+                continue
+            if not self.core.is_descendant_of(node, hp_main):
                 continue
             for color_node in self.iter_colorable_nodes(node):
                 if self.apply_override_color(color_node, color):
@@ -1386,7 +1386,12 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.sync_toggle_buttons(hp_node, lp_node)
         self.refresh_right_panel()
         self.refresh_left_panel()
-        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+        skip_color_update = bool(getattr(self, '_skip_color_update_once', False))
+        self._skip_color_update_once = False
+        color_groups_enabled = hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked()
+        if skip_color_update and color_groups_enabled:
+            self.restore_subgroup_colors()
+        elif color_groups_enabled:
             self.update_subgroup_colors()
 
     def select_meshes_in_group(self, hp_grp, lp_grp):
