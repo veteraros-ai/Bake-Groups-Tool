@@ -27,7 +27,7 @@ class GTWidget(QtWidgets.QWidget):
         layout.setSpacing(6)
 
         header = QtWidgets.QLabel("Batch HP->LP Matcher (Active Pair)")
-        header.setStyleSheet("font-weight: bold; background-color: #333; padding: 4px; border-radius: 2px;")
+        header.setStyleSheet("font-weight: bold; color: white; background-color: #333; padding: 4px; border-radius: 2px;")
         header.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(header)
 

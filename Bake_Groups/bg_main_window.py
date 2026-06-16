@@ -1306,11 +1306,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             layout = QtWidgets.QHBoxLayout(frame)
             layout.setContentsMargins(4, 4, 4, 4)
 
-            is_vis = self.is_visible(hp_node) or self.is_visible(lp_node)
+            is_vis = self.subgroup_pair_is_visible(hp_node, lp_node)
             btn_vis = QtWidgets.QPushButton("Vis" if is_vis else "Hid")
             btn_vis.setFixedSize(30, 24)
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, b=btn_vis: self.toggle_subgroup_vis(h, l, b))
+            btn_vis.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            btn_vis.customContextMenuRequested.connect(lambda pos, h=hp_node, l=lp_node: self.isolate_subgroup_vis(h, l))
             layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(ui_name)
@@ -1322,6 +1324,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
             btn_plus = QtWidgets.QPushButton("Add")
             btn_plus.setFixedSize(56, 24)
+            btn_plus.setProperty("bg_no_tooltip", True)
             btn_plus.setStyleSheet(self.subgroup_add_button_style(is_active_subgroup))
             btn_plus.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, pm_hp=hp_main, pm_lp=lp_main: self.add_to_groups_ui(h, l, pm_hp, pm_lp))
             layout.addWidget(btn_plus)
@@ -1349,6 +1352,17 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
             self.subgroups_layout.addWidget(frame)
         bg_l10n.localize_widget_tree(self.subgroups_widget)
+        self.clear_disabled_tooltips(self.subgroups_widget)
+
+    def clear_disabled_tooltips(self, root):
+        if not root:
+            return
+        widgets = [root] + root.findChildren(QtWidgets.QWidget)
+        for widget in widgets:
+            if widget.property("bg_no_tooltip"):
+                widget.setToolTip("")
+                widget.setStatusTip("")
+                widget.setProperty("bg_status_tip", "")
 
     def activate_root(self, pair):
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
@@ -1422,29 +1436,48 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.btn_toggle_lp.setText(bg_l10n.text("LP Visible" if lp_vis else "LP Hidden"))
         self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
 
-        grp_vis = False
-        has_children = False
-        for p_node in [hp_node, lp_node]:
-            if p_node and cmds.objExists(p_node):
-                children = cmds.listRelatives(p_node, children=True, type='transform', fullPath=True) or []
-                if children:
-                    has_children = True
-                    for c in children:
-                        if cmds.getAttr("{}.visibility".format(c)):
-                            grp_vis = True
-                            break
-            if grp_vis:
-                break
-        if not has_children and (hp_vis or lp_vis):
-            grp_vis = True
-
-        self.btn_toggle_groups.setChecked(grp_vis)
-        self.btn_toggle_groups.setText(bg_l10n.text("Groups Vis" if grp_vis else "Groups Hidden"))
-        self.btn_toggle_groups.setStyleSheet("background-color: #4a5d4a;" if grp_vis else "background-color: #8c4242;")
+        group_state = self.get_active_subgroups_visibility_state(hp_node, lp_node, hp_vis, lp_vis)
+        if group_state == "all":
+            self.btn_toggle_groups.setChecked(True)
+            self.btn_toggle_groups.setText(bg_l10n.text("Groups Vis"))
+            self.btn_toggle_groups.setStyleSheet("background-color: #4a5d4a;")
+        elif group_state == "partial":
+            self.btn_toggle_groups.setChecked(False)
+            self.btn_toggle_groups.setText(bg_l10n.text("Groups Hid"))
+            self.btn_toggle_groups.setStyleSheet("background-color: #b79b2c; color: #1f1f1f; font-weight: bold;")
+        else:
+            self.btn_toggle_groups.setChecked(False)
+            self.btn_toggle_groups.setText(bg_l10n.text("Groups Hidden"))
+            self.btn_toggle_groups.setStyleSheet("background-color: #8c4242;")
 
         self.btn_toggle_hp.blockSignals(False)
         self.btn_toggle_lp.blockSignals(False)
         self.btn_toggle_groups.blockSignals(False)
+
+    def get_active_subgroup_nodes(self, hp_node, lp_node):
+        nodes = []
+        for p_node in [hp_node, lp_node]:
+            if not p_node or not cmds.objExists(p_node):
+                continue
+            for child in (cmds.listRelatives(p_node, children=True, type='transform', fullPath=True) or []):
+                if cmds.objExists(child):
+                    nodes.append(child)
+        return nodes
+
+    def get_active_subgroups_visibility_state(self, hp_node, lp_node, hp_vis=None, lp_vis=None):
+        child_nodes = self.get_active_subgroup_nodes(hp_node, lp_node)
+        if not child_nodes:
+            if hp_vis is None:
+                hp_vis = cmds.getAttr("{}.visibility".format(hp_node)) if hp_node and cmds.objExists(hp_node) else False
+            if lp_vis is None:
+                lp_vis = cmds.getAttr("{}.visibility".format(lp_node)) if lp_node and cmds.objExists(lp_node) else False
+            return "all" if (hp_vis or lp_vis) else "none"
+        visible_count = sum(1 for node in child_nodes if cmds.getAttr("{}.visibility".format(node)))
+        if visible_count == len(child_nodes):
+            return "all"
+        if visible_count == 0:
+            return "none"
+        return "partial"
 
     def toggle_root_vis(self, type_str, state):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -1479,13 +1512,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 for hp in widget_data.get('hp_nodes', []):
                     if cmds.objExists(hp):
                         cmds.setAttr(hp + ".visibility", state)
+        self.sync_toggle_buttons(hp_main, lp_main)
         self.refresh_left_panel()
 
     def is_visible(self, node):
         return cmds.getAttr("{}.visibility".format(node)) if node and cmds.objExists(node) else False
 
+    def subgroup_pair_is_visible(self, hp, lp):
+        nodes = [node for node in (hp, lp) if node and cmds.objExists(node)]
+        return bool(nodes) and all(self.is_visible(node) for node in nodes)
+
     def toggle_subgroup_vis(self, hp, lp, btn_widget):
-        new_state = not (self.is_visible(hp) or self.is_visible(lp))
+        new_state = not self.subgroup_pair_is_visible(hp, lp)
         if hp and cmds.objExists(hp):
             cmds.setAttr("{}.visibility".format(hp), new_state)
         if lp and cmds.objExists(lp):
@@ -1501,6 +1539,34 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     cmds.setAttr(hp_final + ".visibility", new_state)
                 if cmds.objExists(lp_final):
                     cmds.setAttr(lp_final + ".visibility", new_state)
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if pair:
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            self.sync_toggle_buttons(hp_main, lp_main)
+
+    def isolate_subgroup_vis(self, hp, lp):
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        subgroup_nodes = []
+        for root in (hp_main, lp_main):
+            if not root or not cmds.objExists(root):
+                continue
+            for child in (cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []):
+                if cmds.objExists(child) and not cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                    subgroup_nodes.append(child)
+        target_nodes = set(cmds.ls([node for node in (hp, lp) if node and cmds.objExists(node)], long=True) or [])
+        visible_nodes = set(node for node in subgroup_nodes if self.is_visible(node))
+        show_all = bool(target_nodes) and visible_nodes == target_nodes
+        for node in subgroup_nodes:
+            cmds.setAttr("{}.visibility".format(node), True if show_all else node in target_nodes)
+        self.sync_toggle_buttons(hp_main, lp_main)
+        self.refresh_left_panel()
+        if hasattr(self, 'record_user_action'):
+            target_names = [node.split('|')[-1] for node in (hp, lp) if node and cmds.objExists(node)]
+            action = "Show All Group Visibility" if show_all else "Isolate Group Visibility"
+            self.record_user_action(action, ", ".join(target_names))
 
     def show_subgroups_context_menu(self, pos):
         menu = QtWidgets.QMenu(self)

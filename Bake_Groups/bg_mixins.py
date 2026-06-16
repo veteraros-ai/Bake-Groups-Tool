@@ -2816,14 +2816,22 @@ class SceneInteractionMixin:
     def toggle_find_sim_mode(self, pos=None):
         if getattr(self, 'find_sim_mode', 'SIM') == 'SIM':
             self.find_sim_mode = 'ALL'
-            self.btn_fs.setText(bg_l10n.text("Find All"))
+            self.update_find_sim_button("Find All")
             self.btn_fs.setStyleSheet("background-color: #27ae60; font-weight: bold;")
             cmds.inViewMessage(amg="Mode: Find ALL (Ignores Layout)", pos='midCenter', fade=True)
         else:
             self.find_sim_mode = 'SIM'
-            self.btn_fs.setText(bg_l10n.text("Find Sim"))
+            self.update_find_sim_button("Find Sim")
             self.btn_fs.setStyleSheet("background-color: #3b5998; font-weight: bold;")
             cmds.inViewMessage(amg="Mode: Find SIM (Strict Layout Matching)", pos='midCenter', fade=True)
+
+    def update_find_sim_button(self, key):
+        self.btn_fs.setProperty("bg_i18n_key", key)
+        self.btn_fs.setText(bg_l10n.text(key))
+        tip = bg_l10n.tooltip(key)
+        self.btn_fs.setToolTip(tip)
+        self.btn_fs.setStatusTip(tip)
+        self.btn_fs.setProperty("bg_status_tip", tip)
 
 
 # ============================================================================
@@ -2837,8 +2845,6 @@ class TOCMixin:
         eye_btn.setFixedSize(17, 17)
         eye_btn.setFlat(True)
         eye_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        eye_btn.setToolTip(bg_l10n.tooltip("Toggle visibility"))
-        eye_btn.setStatusTip(bg_l10n.tooltip("Toggle visibility"))
         eye_btn.setStyleSheet("background: transparent; border: none;")
         icon_path = os.path.join(os.path.dirname(__file__), 'open_eye.png' if is_vis else 'close_eye.png')
         if os.path.exists(icon_path):
@@ -2982,8 +2988,7 @@ class TOCMixin:
                 if not hp_node or not lp_node:
                     pair_item.setForeground(0, QtGui.QColor("#ff5555"))
                 elif self.active_root_id == p['id']:
-                    color = "#ffe555" if self.is_isolated else "#ffffff"
-                    pair_item.setForeground(0, QtGui.QColor(color))
+                    pair_item.setForeground(0, QtGui.QColor("#ffffff"))
                     font = pair_item.font(0)
                     font.setBold(True)
                     pair_item.setFont(0, font)
