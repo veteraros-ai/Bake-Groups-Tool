@@ -211,6 +211,16 @@ def _download_with_powershell(url, target_path, timeout=60):
         target_path,
     ]
     kwargs = {"stderr": subprocess.STDOUT}
+    if os.name == "nt":
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+        except Exception:
+            pass
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     if sys.version_info[0] >= 3:
         kwargs["timeout"] = max(30, int(timeout or 60))
     try:

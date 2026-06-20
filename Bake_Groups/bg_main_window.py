@@ -5,6 +5,7 @@ import sys
 import os
 import uuid
 import contextlib
+import re
 from datetime import datetime
 
 import maya.cmds as cmds
@@ -32,6 +33,31 @@ from bg_ui_widgets import CollapsibleSection, FinalMeshLineEdit, SubgroupButton,
 from bg_mixins import (HPAnalysisMixin, LPMatchingMixin, FinalViewMixin,
                        ExportMixin, GroupManagementMixin, SceneInteractionMixin, TOCMixin)
 
+try:
+    import maya.api.OpenMaya as om
+except Exception:
+    om = None
+
+
+class TOCNameDelegate(QtWidgets.QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        editor = super(TOCNameDelegate, self).createEditor(parent, option, index)
+        if isinstance(editor, QtWidgets.QLineEdit):
+            editor.setMinimumWidth(0)
+            editor.setStyleSheet("QLineEdit { padding: 2px 4px; }")
+        return editor
+
+    def updateEditorGeometry(self, editor, option, index):
+        tree = self.parent()
+        if tree and index.column() == 0:
+            rect = QtCore.QRect(option.rect)
+            right = tree.viewport().width() - tree.columnWidth(1) - 4
+            rect.setRight(max(rect.left() + 160, right))
+            rect.adjust(0, 1, 0, -1)
+            editor.setGeometry(rect)
+            return
+        super(TOCNameDelegate, self).updateEditorGeometry(editor, option, index)
+
 
 class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     HPAnalysisMixin, LPMatchingMixin, FinalViewMixin,
@@ -40,7 +66,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         super(BakeManagerUI, self).__init__(parent=parent)
         self.setWindowTitle("Bake Group Manager Pro")
         self.setObjectName("BakeManagerUI")
-        self.setMinimumSize(400, 400)
+        self.setMinimumSize(320, 400)
         self.resize(800, 800)
         self.setAcceptDrops(False)
 
@@ -64,13 +90,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.user_action_lines = []
         self.subgroup_color_override_cache = {}
         self.subgroup_color_index_map = {}
+        self.active_material_visibility_filter = None
         self._is_closing = False
         self.update_worker = None
         self.update_dialog = None
         self.update_check_timer = None
+        self._dock_relayout_pending = False
 
         self.init_ui()
         self.apply_stylesheet()
+        self.relax_dock_width_constraints()
         self.refresh_right_panel()
         self.setup_script_jobs()
         self.update_check_timer = QtCore.QTimer(self)
@@ -85,13 +114,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
         layout = QtWidgets.QHBoxLayout(main_widget)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(6, 6, 6, 6)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.splitter.setChildrenCollapsible(True)
         layout.addWidget(self.splitter)
 
         # Left panel
         self.left_panel = QtWidgets.QWidget()
-        self.left_panel.setMinimumWidth(150)
+        self.left_panel.setMinimumWidth(120)
         left_layout = QtWidgets.QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(0, 0, 5, 0)
         left_layout.setSpacing(8)
@@ -189,6 +219,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.btn_toggle_groups = QtWidgets.QPushButton("Groups Vis")
         self.btn_toggle_groups.setCheckable(True)
         self.btn_toggle_groups.toggled.connect(self.set_all_subgroups_vis)
+        self.btn_toggle_groups.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.btn_toggle_groups.customContextMenuRequested.connect(self.show_groups_visibility_context_menu)
         v_layout.addWidget(self.btn_toggle_hp)
         v_layout.addWidget(self.btn_toggle_lp)
         v_layout.addWidget(self.btn_toggle_groups)
@@ -197,7 +229,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         # ---- Groups list (scroll area) ----
         self.subgroups_scroll = QtWidgets.QScrollArea()
         self.subgroups_scroll.setWidgetResizable(True)
+        self.subgroups_scroll.setMinimumWidth(0)
+        try:
+            self.subgroups_scroll.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustIgnored)
+        except Exception:
+            pass
         self.subgroups_widget = QtWidgets.QWidget()
+        self.subgroups_widget.setMinimumWidth(0)
         self.subgroups_widget.setStyleSheet("background-color: transparent;")
         self.subgroups_layout = QtWidgets.QVBoxLayout(self.subgroups_widget)
         self.subgroups_layout.setAlignment(QtCore.Qt.AlignTop)
@@ -265,11 +303,12 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         # Right panel (TOC)
         self.right_panel = QtWidgets.QWidget()
-        self.right_panel.setMinimumWidth(150)
+        self.right_panel.setMinimumWidth(120)
         right_layout = QtWidgets.QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(5, 0, 0, 0)
 
         self.right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.right_splitter.setChildrenCollapsible(True)
         right_layout.addWidget(self.right_splitter)
 
         self.gt_widget = bg_gt_matcher.GTWidget(self)
@@ -291,8 +330,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
-        header.resizeSection(1, 24)
-        self.toc_tree.setIndentation(15)
+        header.resizeSection(1, 22)
+        self.toc_tree.setItemDelegate(TOCNameDelegate(self.toc_tree))
+        self.toc_tree.setIndentation(10)
         self.toc_tree.setDragEnabled(False)
         self.toc_tree.setAcceptDrops(False)
         self.toc_tree.setDragDropMode(QtWidgets.QAbstractItemView.NoDragDrop)
@@ -340,9 +380,76 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.right_panel)
-        self.splitter.setSizes([350, 250])
+        self.splitter.setSizes([300, 180])
         bg_l10n.localize_widget_tree(self)
         self.chk_ignore_floaters.setChecked(True)
+        self.chk_material_slots.setChecked(False)
+
+    def relax_dock_width_constraints(self):
+        policy_ignored = QtWidgets.QSizePolicy.Ignored
+        policy_preferred = QtWidgets.QSizePolicy.Preferred
+        targets = [
+            (self, 320, policy_preferred),
+            (getattr(self, 'left_panel', None), 120, policy_preferred),
+            (getattr(self, 'right_panel', None), 120, policy_preferred),
+            (getattr(self, 'subgroups_scroll', None), 0, policy_ignored),
+            (getattr(self, 'subgroups_widget', None), 0, policy_ignored),
+            (getattr(self, 'toc_tree', None), 0, policy_ignored),
+            (getattr(self, 'gt_widget', None), 0, policy_ignored),
+        ]
+        for widget, min_width, horizontal_policy in targets:
+            if not widget:
+                continue
+            try:
+                widget.setMinimumWidth(min_width)
+                sp = widget.sizePolicy()
+                sp.setHorizontalPolicy(horizontal_policy)
+                widget.setSizePolicy(sp)
+                widget.updateGeometry()
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+        if hasattr(self, 'splitter'):
+            try:
+                self.splitter.setChildrenCollapsible(True)
+                self.splitter.updateGeometry()
+            except Exception:
+                pass
+        central = self.centralWidget()
+        for widget in (central, getattr(self, 'left_panel', None), getattr(self, 'right_panel', None)):
+            if not widget:
+                continue
+            try:
+                layout = widget.layout()
+                if layout:
+                    layout.invalidate()
+                    layout.activate()
+                widget.updateGeometry()
+            except Exception:
+                pass
+
+    def schedule_dock_relayout(self):
+        if getattr(self, '_dock_relayout_pending', False):
+            return
+        self._dock_relayout_pending = True
+        QtCore.QTimer.singleShot(0, self.run_dock_relayout)
+
+    def run_dock_relayout(self):
+        self._dock_relayout_pending = False
+        if getattr(self, '_is_closing', False):
+            return
+        try:
+            self.objectName()
+        except RuntimeError:
+            return
+        self.relax_dock_width_constraints()
+        try:
+            if self.layout():
+                self.layout().activate()
+            self.updateGeometry()
+        except Exception:
+            pass
 
     def rebuild_algorithm_settings_ui(self, layout):
         self.algo_group = CollapsibleSection("Algorithm")
@@ -377,7 +484,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.hp_group_limit = 12
         self.chk_ignore_floaters = QtWidgets.QCheckBox("Ignore Floaters")
         self.chk_ignore_floaters.setChecked(True)
-        grid.addWidget(self.chk_ignore_floaters, 0, 2, 1, 2)
+        grid.addWidget(self.chk_ignore_floaters, 0, 2)
+
+        self.chk_material_slots = QtWidgets.QCheckBox("N_Mat")
+        self.chk_material_slots.setChecked(False)
+        grid.addWidget(self.chk_material_slots, 0, 3)
 
         grid.addWidget(QtWidgets.QLabel("HP Link Vtx:"), 1, 0)
         self.spin_compound_link_verts = QtWidgets.QSpinBox()
@@ -472,7 +583,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if not pair:
             return ["No active chapter selected."]
 
-        hp_main, _, _ = self.core.resolve_main_nodes(pair)
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         lines.append("Active chapter: {}".format(pair.get('base', 'Unknown')))
 
         def collect_group_snapshot(root_node, label):
@@ -613,7 +724,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.subgroup_color_index_map = {}
             self.update_subgroup_colors()
         else:
-            self.restore_subgroup_colors()
+            self.restore_subgroup_colors(clean_history=True)
+            pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+            if pair:
+                hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+                removed = self.cleanup_subgroup_preview_color_sets([hp_main, lp_main], clean_history=True)
+                if removed:
+                    self.log("Color Groups: removed {} old preview color set(s).".format(removed), "lightblue")
             self.subgroup_color_index_map = {}
         self.refresh_left_panel()
 
@@ -783,6 +900,45 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 pass
         self.subgroup_color_override_cache[node] = attrs
 
+    def remove_subgroup_preview_color_set(self, target, clean_history=False):
+        if not target or not cmds.objExists(target):
+            return False
+        try:
+            color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+            if "BG_Subgroup_Color" in color_sets:
+                cmds.polyColorSet(target, delete=True, colorSet="BG_Subgroup_Color")
+                if clean_history:
+                    try:
+                        cmds.delete(target, constructionHistory=True)
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
+        return False
+
+    def cleanup_subgroup_preview_color_sets(self, roots=None, clean_history=False):
+        roots = roots or []
+        targets = set()
+        for root in roots:
+            if not root or not cmds.objExists(root):
+                continue
+            mesh_shapes = cmds.listRelatives(root, allDescendents=True, fullPath=True, type='mesh', noIntermediate=True) or []
+            for shape in mesh_shapes:
+                parent = cmds.listRelatives(shape, parent=True, fullPath=True) or []
+                if parent:
+                    targets.add(parent[0])
+        removed = 0
+        for target in targets:
+            try:
+                color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+                if "BG_Subgroup_Color" in color_sets:
+                    if self.remove_subgroup_preview_color_set(target, clean_history=clean_history):
+                        removed += 1
+            except Exception:
+                pass
+        return removed
+
     def color_target_for_shape(self, node):
         if not node or not cmds.objExists(node):
             return None
@@ -814,7 +970,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.store_override_state(node)
         target = self.color_target_for_shape(node)
         shape = self.mesh_shape_for_color_node(node)
-        if not target:
+        if not target or not shape:
             return
         try:
             self.ensure_subgroup_color_set(target)
@@ -822,7 +978,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             if shape and cmds.objExists("{}.displayColors".format(shape)):
                 cmds.setAttr("{}.displayColors".format(shape), True)
             if shape and cmds.objExists("{}.displayColorChannel".format(shape)):
-                cmds.setAttr("{}.displayColorChannel".format(shape), "color", type="string")
+                try:
+                    cmds.setAttr("{}.displayColorChannel".format(shape), "color", type="string")
+                except Exception:
+                    pass
             try:
                 cmds.polyOptions(target, colorShadedDisplay=True, colorMaterialChannel="ambientDiffuse")
             except Exception:
@@ -854,7 +1013,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             except Exception:
                 pass
 
-    def restore_subgroup_colors(self):
+    def restore_subgroup_colors(self, clean_history=False):
         cache = getattr(self, 'subgroup_color_override_cache', {})
         for node, attrs in list(cache.items()):
             if not cmds.objExists(node):
@@ -880,7 +1039,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                     try:
                         color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
                         if "BG_Subgroup_Color" in color_sets:
-                            cmds.polyColorSet(target, delete=True, colorSet="BG_Subgroup_Color")
+                            self.remove_subgroup_preview_color_set(target, clean_history=clean_history)
                             color_sets = [name for name in color_sets if name != "BG_Subgroup_Color"]
                         has_external_color_set = bool(color_sets)
                     except Exception:
@@ -920,7 +1079,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def update_subgroup_colors(self):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
-        self.restore_subgroup_colors()
+        self.restore_subgroup_colors(clean_history=True)
         if not self.active_root_id:
             return
         if getattr(self, 'is_final_view', False):
@@ -939,6 +1098,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if not pair:
             return
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        self.cleanup_subgroup_preview_color_sets([hp_main])
         group_names = []
         for root in (hp_main,):
             if not root or not cmds.objExists(root):
@@ -1130,6 +1290,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.refresh_right_panel()
         self.refresh_left_panel()
 
+    def set_localized_button_state(self, button, key):
+        if not button:
+            return
+        button.setProperty("bg_i18n_key", key)
+        button.setText(bg_l10n.text(key))
+        tip = bg_l10n.tooltip(key)
+        button.setToolTip(tip)
+        button.setStatusTip(tip)
+        button.setProperty("bg_status_tip", tip)
+
     def show_language_menu(self):
         menu = QtWidgets.QMenu(self)
         current = bg_l10n.current_language()
@@ -1230,15 +1400,19 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if getattr(self, 'is_final_view', False):
             self.render_final_view()
             bg_l10n.localize_widget_tree(self.subgroups_widget)
+            self.schedule_dock_relayout()
             return
 
         if not self.active_root_id:
+            self.schedule_dock_relayout()
             return
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
+            self.schedule_dock_relayout()
             return
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         if not hp_main or not lp_main:
+            self.schedule_dock_relayout()
             return
 
         hp_c = cmds.listRelatives(hp_main, children=True, type='transform', fullPath=True) or []
@@ -1353,6 +1527,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.subgroups_layout.addWidget(frame)
         bg_l10n.localize_widget_tree(self.subgroups_widget)
         self.clear_disabled_tooltips(self.subgroups_widget)
+        self.schedule_dock_relayout()
 
     def clear_disabled_tooltips(self, root):
         if not root:
@@ -1429,25 +1604,45 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         lp_vis = cmds.getAttr("{}.visibility".format(lp_node)) if lp_node and cmds.objExists(lp_node) else False
 
         self.btn_toggle_hp.setChecked(hp_vis)
-        self.btn_toggle_hp.setText(bg_l10n.text("HP Visible" if hp_vis else "HP Hidden"))
+        self.set_localized_button_state(self.btn_toggle_hp, "HP Visible" if hp_vis else "HP Hidden")
         self.btn_toggle_hp.setStyleSheet("background-color: #4a5d4a;" if hp_vis else "background-color: #8c4242;")
 
         self.btn_toggle_lp.setChecked(lp_vis)
-        self.btn_toggle_lp.setText(bg_l10n.text("LP Visible" if lp_vis else "LP Hidden"))
+        self.set_localized_button_state(self.btn_toggle_lp, "LP Visible" if lp_vis else "LP Hidden")
         self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
 
+        material_filter = getattr(self, 'active_material_visibility_filter', None)
         group_state = self.get_active_subgroups_visibility_state(hp_node, lp_node, hp_vis, lp_vis)
+        if material_filter:
+            material_nodes = [
+                node for node in self.get_active_subgroup_nodes(hp_node, lp_node)
+                if self.material_slot_from_subgroup_name(node) == material_filter
+            ]
+            material_visible = sum(1 for node in material_nodes if cmds.objExists(node) and self.is_visible(node))
+            material_state = "all" if material_nodes and material_visible == len(material_nodes) else "partial"
+            self.btn_toggle_groups.setChecked(False)
+            if material_state == "all":
+                self.set_localized_button_state(self.btn_toggle_groups, "Groups Vis/M")
+                self.btn_toggle_groups.setStyleSheet("background-color: #b79b2c; color: #1f1f1f; font-weight: bold;")
+            else:
+                self.set_localized_button_state(self.btn_toggle_groups, "Groups Hid/M")
+                self.btn_toggle_groups.setStyleSheet("background-color: #b79b2c; color: #1f1f1f; font-weight: bold;")
+            self.btn_toggle_hp.blockSignals(False)
+            self.btn_toggle_lp.blockSignals(False)
+            self.btn_toggle_groups.blockSignals(False)
+            return
+
         if group_state == "all":
             self.btn_toggle_groups.setChecked(True)
-            self.btn_toggle_groups.setText(bg_l10n.text("Groups Vis"))
+            self.set_localized_button_state(self.btn_toggle_groups, "Groups Vis")
             self.btn_toggle_groups.setStyleSheet("background-color: #4a5d4a;")
         elif group_state == "partial":
             self.btn_toggle_groups.setChecked(False)
-            self.btn_toggle_groups.setText(bg_l10n.text("Groups Hid"))
+            self.set_localized_button_state(self.btn_toggle_groups, "Groups Hid")
             self.btn_toggle_groups.setStyleSheet("background-color: #b79b2c; color: #1f1f1f; font-weight: bold;")
         else:
             self.btn_toggle_groups.setChecked(False)
-            self.btn_toggle_groups.setText(bg_l10n.text("Groups Hidden"))
+            self.set_localized_button_state(self.btn_toggle_groups, "Groups Hidden")
             self.btn_toggle_groups.setStyleSheet("background-color: #8c4242;")
 
         self.btn_toggle_hp.blockSignals(False)
@@ -1463,6 +1658,249 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 if cmds.objExists(child):
                     nodes.append(child)
         return nodes
+
+    def material_slot_from_subgroup_name(self, node_or_name):
+        name = str(node_or_name or "").split('|')[-1]
+        match = re.match(r"^(M\d{2,})(?:_|\.)", name)
+        return match.group(1) if match else None
+
+    def get_active_material_slots(self, hp_node, lp_node):
+        slots = set()
+        for node in self.get_active_subgroup_nodes(hp_node, lp_node):
+            slot = self.material_slot_from_subgroup_name(node)
+            if slot:
+                slots.add(slot)
+        return sorted(slots)
+
+    def mesh_transform_nodes_under(self, node):
+        if not node or not cmds.objExists(node):
+            return []
+        shapes = cmds.listRelatives(node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+        if shapes:
+            return [node]
+        mesh_shapes = cmds.listRelatives(node, allDescendents=True, fullPath=True, type='mesh', noIntermediate=True) or []
+        transforms = []
+        seen = set()
+        for shape in mesh_shapes:
+            parents = cmds.listRelatives(shape, parent=True, fullPath=True) or []
+            if parents and parents[0] not in seen:
+                seen.add(parents[0])
+                transforms.append(parents[0])
+        return transforms
+
+    def lp_material_records_for_node(self, lp_node, include_faces=True):
+        if not om or not lp_node or not cmds.objExists(lp_node):
+            return []
+        shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+        if not shapes:
+            return []
+        try:
+            sel = om.MSelectionList()
+            sel.add(lp_node)
+            dag = sel.getDagPath(0)
+            if dag.hasFn(om.MFn.kTransform):
+                dag.extendToShape()
+            mesh_fn = om.MFnMesh(dag)
+            shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
+        except Exception:
+            return []
+
+        records = []
+        for shader_index, shader_obj in enumerate(shaders):
+            try:
+                sg = om.MFnDependencyNode(shader_obj).name()
+            except Exception:
+                continue
+            material = self.material_from_shading_engine(sg)
+            key = material or sg
+            faces = [
+                face_id for face_id, assigned_index in enumerate(face_shader_indices)
+                if int(assigned_index) == shader_index
+            ] if include_faces else []
+            if faces or not include_faces:
+                records.append({
+                    "key": key,
+                    "material": material,
+                    "faces": faces
+                })
+        return records
+
+    def lp_material_slot_map_for_nodes(self, lp_nodes):
+        records_by_key = {}
+        for node in lp_nodes or []:
+            for mesh_node in self.mesh_transform_nodes_under(node):
+                for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+                    key = rec.get("key")
+                    if key:
+                        records_by_key.setdefault(key, rec)
+        if len(records_by_key) <= 1:
+            return {}
+        ordered = sorted(records_by_key.values(), key=lambda rec: ((rec.get("material") or rec.get("key") or "").split('|')[-1].lower(), (rec.get("key") or "").split('|')[-1].lower()))
+        return {rec.get("key"): "M{:02d}".format(index) for index, rec in enumerate(ordered, 1) if rec.get("key")}
+
+    def lp_material_slots_for_node(self, lp_node, slot_by_key=None):
+        slot_by_key = slot_by_key or {}
+        records = self.lp_material_records_for_node(lp_node, include_faces=True)
+        if len(records) <= 1:
+            return {}
+        if not slot_by_key:
+            ordered = sorted(records, key=lambda rec: ((rec.get("material") or rec.get("key") or "").split('|')[-1].lower(), (rec.get("key") or "").split('|')[-1].lower()))
+            slot_by_key = {rec.get("key"): "M{:02d}".format(index) for index, rec in enumerate(ordered, 1) if rec.get("key")}
+        slots = {}
+        for rec in records:
+            slot = slot_by_key.get(rec.get("key"))
+            if slot:
+                slots.setdefault(slot, [])
+                slots[slot].extend(rec.get("faces") or [])
+        return slots
+
+    def material_from_shading_engine(self, shading_engine):
+        try:
+            materials = cmds.listConnections("{}.surfaceShader".format(shading_engine), source=True, destination=False) or []
+            return materials[0] if materials else None
+        except Exception:
+            return None
+
+    def face_components_for_indices(self, node, faces):
+        if not faces:
+            return []
+        faces = sorted(set(int(face) for face in faces))
+        components = []
+        start = faces[0]
+        prev = faces[0]
+        for face in faces[1:]:
+            if face == prev + 1:
+                prev = face
+                continue
+            components.append("{}.f[{}]".format(node, start) if start == prev else "{}.f[{}:{}]".format(node, start, prev))
+            start = prev = face
+        components.append("{}.f[{}]".format(node, start) if start == prev else "{}.f[{}:{}]".format(node, start, prev))
+        return components
+
+    def show_all_lp_material_faces(self, lp_nodes):
+        for node in lp_nodes or []:
+            if node and cmds.objExists(node):
+                try:
+                    cmds.showHidden(node)
+                except Exception:
+                    pass
+
+    def isolate_lp_material_faces(self, lp_node, slot, slot_by_key=None):
+        slots = self.lp_material_slots_for_node(lp_node, slot_by_key=slot_by_key)
+        if not slots:
+            return False
+        self.show_all_lp_material_faces([lp_node])
+        hide_faces = []
+        for other_slot, faces in slots.items():
+            if other_slot != slot:
+                hide_faces.extend(faces)
+        if not hide_faces:
+            return True
+        saved_selection = cmds.ls(selection=True, long=True) or []
+        try:
+            components = self.face_components_for_indices(lp_node, hide_faces)
+            if components:
+                cmds.select(components, replace=True)
+                cmds.hide()
+        finally:
+            if saved_selection:
+                cmds.select(saved_selection, replace=True)
+            else:
+                cmds.select(clear=True)
+        return True
+
+    def apply_lp_material_slot_visibility(self, lp_node, slot, slot_by_key=None):
+        if not lp_node or not cmds.objExists(lp_node):
+            return False
+        mesh_nodes = self.mesh_transform_nodes_under(lp_node)
+        if mesh_nodes and not (len(mesh_nodes) == 1 and mesh_nodes[0] == lp_node):
+            any_visible = False
+            for mesh_node in mesh_nodes:
+                if self.apply_lp_material_slot_visibility(mesh_node, slot, slot_by_key=slot_by_key):
+                    any_visible = True
+            cmds.setAttr("{}.visibility".format(lp_node), any_visible)
+            return any_visible
+
+        records = self.lp_material_records_for_node(lp_node, include_faces=True)
+        if not records:
+            cmds.setAttr("{}.visibility".format(lp_node), False)
+            return False
+
+        if len(records) == 1:
+            rec_slot = (slot_by_key or {}).get(records[0].get("key"))
+            visible = rec_slot == slot or (not slot_by_key and slot == "M01")
+            if visible:
+                self.show_all_lp_material_faces([lp_node])
+            cmds.setAttr("{}.visibility".format(lp_node), visible)
+            return visible
+
+        visible = self.isolate_lp_material_faces(lp_node, slot, slot_by_key=slot_by_key)
+        cmds.setAttr("{}.visibility".format(lp_node), visible)
+        return visible
+
+    def show_groups_visibility_context_menu(self, pos):
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        menu = QtWidgets.QMenu(self)
+        slots = self.get_active_material_slots(hp_main, lp_main)
+        if slots:
+            for slot in slots:
+                action = menu.addAction(bg_l10n.text("Only Show {slot}").format(slot=slot))
+                action.triggered.connect(lambda checked=False, s=slot: self.only_show_material_slot(s))
+            menu.addSeparator()
+        else:
+            action = menu.addAction(bg_l10n.text("No material sections found"))
+            action.setEnabled(False)
+        show_all_action = menu.addAction(bg_l10n.text("Groups Vis"))
+        show_all_action.triggered.connect(lambda checked=False: self.set_all_subgroups_vis(True))
+        menu.exec_(self.btn_toggle_groups.mapToGlobal(pos)) if hasattr(menu, 'exec_') else menu.exec(self.btn_toggle_groups.mapToGlobal(pos))
+
+    def only_show_material_slot(self, slot):
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        self.active_material_visibility_filter = slot
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if hp_main and cmds.objExists(hp_main):
+            cmds.setAttr("{}.visibility".format(hp_main), True)
+        if lp_main and cmds.objExists(lp_main):
+            cmds.setAttr("{}.visibility".format(lp_main), True)
+
+        hp_children = cmds.listRelatives(hp_main, children=True, type='transform', fullPath=True) if hp_main and cmds.objExists(hp_main) else []
+        lp_children = cmds.listRelatives(lp_main, children=True, type='transform', fullPath=True) if lp_main and cmds.objExists(lp_main) else []
+        hp_children = hp_children or []
+        lp_children = lp_children or []
+        lp_has_slot_children = any(self.material_slot_from_subgroup_name(child) for child in lp_children)
+        lp_slot_by_key = self.lp_material_slot_map_for_nodes(lp_children) if not lp_has_slot_children else {}
+        self.show_all_lp_material_faces(lp_children)
+
+        for child in hp_children:
+            if cmds.objExists(child):
+                cmds.setAttr("{}.visibility".format(child), self.material_slot_from_subgroup_name(child) == slot)
+
+        for child in lp_children:
+            if not cmds.objExists(child):
+                continue
+            child_slot = self.material_slot_from_subgroup_name(child)
+            if lp_has_slot_children:
+                cmds.setAttr("{}.visibility".format(child), child_slot == slot)
+            else:
+                self.apply_lp_material_slot_visibility(child, slot, slot_by_key=lp_slot_by_key)
+
+        if getattr(self, 'is_final_view', False):
+            for widget_data in getattr(self, 'final_mesh_widgets', []):
+                subgroup_name = widget_data.get('subgroup_name') or ''
+                state = self.material_slot_from_subgroup_name(subgroup_name) == slot
+                for hp in widget_data.get('hp_nodes', []):
+                    if cmds.objExists(hp):
+                        cmds.setAttr(hp + ".visibility", state)
+
+        self.sync_toggle_buttons(hp_main, lp_main)
+        self.refresh_left_panel()
+        if hasattr(self, 'record_user_action'):
+            self.record_user_action("Only Show Material Section", slot)
 
     def get_active_subgroups_visibility_state(self, hp_node, lp_node, hp_vis=None, lp_vis=None):
         child_nodes = self.get_active_subgroup_nodes(hp_node, lp_node)
@@ -1491,7 +1929,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
         parent_node = hp_node if type_str == "HP" else lp_node
         btn = self.btn_toggle_hp if type_str == "HP" else self.btn_toggle_lp
-        btn.setText(bg_l10n.text("{} Visible".format(type_str) if state else "{} Hidden".format(type_str)))
+        self.set_localized_button_state(btn, "{} Visible".format(type_str) if state else "{} Hidden".format(type_str))
         btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
         if parent_node and cmds.objExists(parent_node):
             cmds.setAttr("{}.visibility".format(parent_node), state)
@@ -1500,12 +1938,17 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
+        if getattr(self, 'active_material_visibility_filter', None):
+            self.active_material_visibility_filter = None
+            state = True
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         for p_node in [hp_main, lp_main]:
             if p_node and cmds.objExists(p_node):
                 for child in (cmds.listRelatives(p_node, children=True, type='transform', fullPath=True) or []):
                     cmds.setAttr("{}.visibility".format(child), state)
-        self.btn_toggle_groups.setText(bg_l10n.text("Groups Vis" if state else "Groups Hidden"))
+                    if state and p_node == lp_main:
+                        self.show_all_lp_material_faces([child])
+        self.set_localized_button_state(self.btn_toggle_groups, "Groups Vis" if state else "Groups Hidden")
         self.btn_toggle_groups.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
         if getattr(self, 'is_final_view', False):
             for widget_data in getattr(self, 'final_mesh_widgets', []):
@@ -1549,6 +1992,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if not pair:
             return
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        material_filter = getattr(self, 'active_material_visibility_filter', None)
         subgroup_nodes = []
         for root in (hp_main, lp_main):
             if not root or not cmds.objExists(root):
@@ -1557,10 +2001,19 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 if cmds.objExists(child) and not cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
                     subgroup_nodes.append(child)
         target_nodes = set(cmds.ls([node for node in (hp, lp) if node and cmds.objExists(node)], long=True) or [])
+        if material_filter:
+            material_nodes = set(node for node in subgroup_nodes if self.material_slot_from_subgroup_name(node) == material_filter)
+            target_nodes = target_nodes.intersection(material_nodes)
+            if not target_nodes:
+                return
+            subgroup_nodes = [node for node in subgroup_nodes if node in material_nodes]
         visible_nodes = set(node for node in subgroup_nodes if self.is_visible(node))
         show_all = bool(target_nodes) and visible_nodes == target_nodes
         for node in subgroup_nodes:
             cmds.setAttr("{}.visibility".format(node), True if show_all else node in target_nodes)
+        if material_filter and show_all:
+            self.only_show_material_slot(material_filter)
+            return
         self.sync_toggle_buttons(hp_main, lp_main)
         self.refresh_left_panel()
         if hasattr(self, 'record_user_action'):

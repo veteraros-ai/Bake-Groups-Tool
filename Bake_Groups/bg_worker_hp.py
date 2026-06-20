@@ -93,9 +93,61 @@ class HPGroupingWorker(QtCore.QThread):
 
         def _lp_base_name(lp_name):
             try:
-                return str(lp_name).split("::shell_")[0]
+                value = str(lp_name)
+                value = re.sub(r"::M\d{2,}$", "", value)
+                base = value.split("::shell_")[0]
+                slot = _lp_material_slot(lp_name)
+                return "{}::{}".format(base, slot) if slot else base
             except Exception:
                 return str(lp_name)
+
+        def _lp_material_slot(lp_name):
+            try:
+                info = self.lp_data.get(lp_name, {})
+                slot = info.get("material_slot")
+                if slot:
+                    return str(slot)
+                match = re.search(r"::(M\d{2,})$", str(lp_name))
+                if match:
+                    return match.group(1)
+            except Exception:
+                pass
+            return None
+
+        lp_name_lookup = {}
+        for _lp_name in self.lp_data.keys():
+            _raw_lp = str(_lp_name)
+            _base_lp = re.sub(r"::M\d{2,}$", "", _raw_lp).split("::shell_")[0]
+            for _key in (_raw_lp, _short_name(_raw_lp), _base_lp, _short_name(_base_lp), _lp_base_name(_lp_name), _short_name(_lp_base_name(_lp_name))):
+                if _key:
+                    lp_name_lookup.setdefault(str(_key).lower(), _lp_name)
+
+        def _cluster_owner_lp(cluster_name):
+            raw = str(cluster_name or "").split("::")[0]
+            candidates = [
+                raw,
+                _short_name(raw),
+                re.sub(r"_(HP|LP)$", "", raw, flags=re.IGNORECASE),
+                re.sub(r"_(HP|LP)$", "", _short_name(raw), flags=re.IGNORECASE),
+            ]
+            for candidate in candidates:
+                found = lp_name_lookup.get(str(candidate).lower())
+                if found:
+                    return found
+            return None
+
+        def _lp_material_compatible(lp_a, lp_b):
+            slot_a = _lp_material_slot(lp_a)
+            slot_b = _lp_material_slot(lp_b)
+            return not (slot_a and slot_b and slot_a != slot_b)
+
+        def _claim_material_slot(hp_name):
+            claim = hp_claims.get(hp_name, {}) if hp_name else {}
+            slot = claim.get("material_slot")
+            if slot:
+                return str(slot)
+            owner_lp = claim.get("owner_lp")
+            return _lp_material_slot(owner_lp) if owner_lp else None
 
         def _debug(line):
             self.debug_lines.append(str(line))
@@ -116,6 +168,16 @@ class HPGroupingWorker(QtCore.QThread):
             self.group_limit
         ))
         _debug("Input: {} HP mesh(es), {} LP mesh(es).".format(len(self.hp_data), len(self.lp_data)))
+        lp_material_slots = sorted(set([
+            info.get("material_slot") for info in self.lp_data.values()
+            if info.get("material_slot")
+        ]))
+        if lp_material_slots:
+            logs.append("LP material-aware grouping: {} slot(s) detected ({}).".format(
+                len(lp_material_slots),
+                ", ".join(lp_material_slots)
+            ))
+            _debug("LP material slots: {}.".format(", ".join(lp_material_slots)))
         _debug("")
         
         self.progress_value.emit(2)
@@ -516,7 +578,22 @@ class HPGroupingWorker(QtCore.QThread):
             if len(candidates) == 1:
                 best_lp = candidates[0]
             else:
-                if self.strategy == 0:
+                material_candidates = [c for c in candidates if _lp_material_slot(c)]
+                if material_candidates and HAS_MATH_CORE and hp_verts:
+                    def material_distance_score(lp_name):
+                        lp_verts = self.lp_verts_cache.get(lp_name, [])
+                        if not lp_verts:
+                            return float('inf')
+                        try:
+                            return bg_math_core.calculate_avg_distance(hp_verts, lp_verts)
+                        except Exception:
+                            return float('inf')
+
+                    best_lp = min(material_candidates, key=material_distance_score)
+                    if material_distance_score(best_lp) == float('inf'):
+                        best_lp = None
+                    method = "material distance"
+                if best_lp is None and self.strategy == 0:
                     hp_info = self.hp_data[hp_name]
                     hp_diag = max(hp_info.get("diag", hp_info.get("radius", 1.0) * 2.0), 0.001)
                     hp_vol = max(hp_info.get("bbox_vol", hp_info.get("volume", 0.0)), 0.0001)
@@ -530,7 +607,7 @@ class HPGroupingWorker(QtCore.QThread):
 
                     best_lp = min(candidates, key=spatial_score)
                     method = "spatial score"
-                elif self.strategy == 2:
+                elif best_lp is None and self.strategy == 2:
                     hp_info = self.hp_data[hp_name]
                     hp_vtx = max(hp_info.get("vtx", 0), 1)
                     hp_edges = max(hp_info.get("edges", 0), 1)
@@ -543,12 +620,12 @@ class HPGroupingWorker(QtCore.QThread):
 
                     best_lp = min(candidates, key=topology_score)
                     method = "topology score"
-                elif HAS_MATH_CORE and hp_verts:
+                elif best_lp is None and HAS_MATH_CORE and hp_verts:
                     lp_candidates_verts = [self.lp_verts_cache.get(c, []) for c in candidates]
                     best_idx = bg_math_core.resolve_hp_collision(hp_verts, lp_candidates_verts)
                     best_lp = candidates[best_idx]
                     method = "C++ vertex collision resolve"
-                else:
+                elif best_lp is None:
                     best_lp = candidates[0]
                     method = "fallback first candidate"
 
@@ -615,12 +692,19 @@ class HPGroupingWorker(QtCore.QThread):
 
         processing_units = []
         used_compound_members = set()
-        for component in compound_components:
-            processing_units.append(list(component))
-            used_compound_members.update(component)
-        for hp_name in hp_candidates.keys():
-            if hp_name not in used_compound_members:
+        material_first_pass = bool(lp_material_slots)
+        if material_first_pass:
+            for hp_name in hp_candidates.keys():
                 processing_units.append([hp_name])
+            logs.append("LP material-aware pass: resolving HP material ownership before compound grouping.")
+            _debug("Step 2.3: material-aware mode keeps HP resolve units separate before packing.")
+        else:
+            for component in compound_components:
+                processing_units.append(list(component))
+                used_compound_members.update(component)
+            for hp_name in hp_candidates.keys():
+                if hp_name not in used_compound_members:
+                    processing_units.append([hp_name])
 
         total_units = len(processing_units)
         for idx, hp_unit in enumerate(processing_units):
@@ -670,6 +754,8 @@ class HPGroupingWorker(QtCore.QThread):
                 unassigned_hps.remove(hp_name)
                 hp_claims[hp_name] = {
                     "owner_lp": best_lp,
+                    "material_slot": _lp_material_slot(best_lp),
+                    "material_name": self.lp_data.get(best_lp, {}).get("material_name"),
                     "candidate_lps": list(hp_candidates.get(hp_name, [])),
                     "candidate_count": len(hp_candidates.get(hp_name, [])),
                     "driver_hp": driver_hp,
@@ -1347,6 +1433,8 @@ class HPGroupingWorker(QtCore.QThread):
             return lp_parent[lp_name]
 
         def _lp_union(a, b):
+            if not _lp_material_compatible(a, b):
+                return False
             root_a = _lp_find(a)
             root_b = _lp_find(b)
             if root_a == root_b:
@@ -1457,6 +1545,27 @@ class HPGroupingWorker(QtCore.QThread):
         def _get_item_meta(item):
             return item_meta_by_key.get(_item_key(item), {})
 
+        def _item_material_slots(item):
+            slots = set()
+            meta = _get_item_meta(item)
+            if meta.get('material_slot'):
+                slots.add(str(meta.get('material_slot')))
+            for hp_info in item or []:
+                slot = _claim_material_slot(hp_info.get('name'))
+                if slot:
+                    slots.add(str(slot))
+            return slots
+
+        def _item_primary_material_slot(item):
+            slots = sorted(_item_material_slots(item))
+            return slots[0] if len(slots) == 1 else None
+
+        def _item_group_prefix(prefix, item):
+            slot = _item_primary_material_slot(item)
+            if slot and not str(prefix).startswith(slot + "_"):
+                return "{}_{}".format(slot, prefix)
+            return prefix
+
         named_clusters = []
         unlinked_meshes = [self.hp_data[hp] for hp in unassigned_hps]
 
@@ -1499,6 +1608,8 @@ class HPGroupingWorker(QtCore.QThread):
                 owner_lp_short=_short_name(_owner_lp),
                 owner_lp_base=lp_base,
                 owner_lp_base_short=_short_name(lp_base),
+                material_slot=_lp_material_slot(_owner_lp),
+                material_name=self.lp_data.get(_owner_lp, {}).get("material_name"),
                 lp_cluster_id=_lp_cluster_id,
                 lp_cluster_size=len(base_lps)
             )
@@ -1745,11 +1856,84 @@ class HPGroupingWorker(QtCore.QThread):
                     owner_lp_short=_short_name(_dominant_lp),
                     owner_lp_base=_lp_base_name(_dominant_lp),
                     owner_lp_base_short=_short_name(_lp_base_name(_dominant_lp)),
+                    material_slot=_lp_material_slot(_dominant_lp),
+                    material_name=self.lp_data.get(_dominant_lp, {}).get("material_name"),
                     lp_cluster_id=_lp_cluster_id,
                     lp_cluster_size=lp_cluster_size_by_id.get(_lp_cluster_id, 0)
                 )
             else:
                 _set_item_meta(item, source='shape', owner_lp=None, owner_lp_base=None, lp_cluster_id=None, lp_cluster_size=0)
+
+        def _set_material_custom_meta(item, cluster_name):
+            lp_counts = {}
+            slot_counts = {}
+            cluster_lp = _cluster_owner_lp(cluster_name)
+            for _mesh_info in item:
+                _hp_name = _mesh_info.get('name')
+                _claim = hp_claims.get(_hp_name, {})
+                _owner_lp = _claim.get('owner_lp')
+                if _owner_lp:
+                    lp_counts[_owner_lp] = lp_counts.get(_owner_lp, 0) + 1
+                _slot = _claim_material_slot(_hp_name)
+                if _slot:
+                    slot_counts[_slot] = slot_counts.get(_slot, 0) + 1
+
+            _dominant_lp = None
+            if lp_counts:
+                _dominant_lp = max(lp_counts.keys(), key=lambda lp: (lp_counts[lp], -len(str(lp))))
+            elif cluster_lp:
+                _dominant_lp = cluster_lp
+
+            _slot = _lp_material_slot(_dominant_lp) if _dominant_lp else None
+            if not _slot and slot_counts:
+                _slot = max(slot_counts.keys(), key=lambda slot: (slot_counts[slot], str(slot)))
+
+            if _dominant_lp:
+                _lp_cluster_id = lp_cluster_id_by_lp.get(_dominant_lp)
+                _set_item_meta(
+                    item,
+                    source='custom',
+                    custom_cluster=cluster_name,
+                    owner_lp=_dominant_lp,
+                    owner_lp_short=_short_name(_dominant_lp),
+                    owner_lp_base=_lp_base_name(_dominant_lp),
+                    owner_lp_base_short=_short_name(_lp_base_name(_dominant_lp)),
+                    material_slot=_slot,
+                    material_name=self.lp_data.get(_dominant_lp, {}).get("material_name"),
+                    lp_cluster_id=_lp_cluster_id,
+                    lp_cluster_size=lp_cluster_size_by_id.get(_lp_cluster_id, 0)
+                )
+            else:
+                _set_item_meta(
+                    item,
+                    source='custom',
+                    custom_cluster=cluster_name,
+                    owner_lp=None,
+                    owner_lp_base=None,
+                    material_slot=_slot,
+                    lp_cluster_id=None,
+                    lp_cluster_size=0
+                )
+
+        def _split_custom_item_by_material(item, cluster_name):
+            material_parts = {}
+            unknown_part = []
+            cluster_lp = _cluster_owner_lp(cluster_name)
+            cluster_slot = _lp_material_slot(cluster_lp) if cluster_lp else None
+            for _mesh_info in item:
+                _slot = _claim_material_slot(_mesh_info.get('name')) or cluster_slot
+                if _slot:
+                    material_parts.setdefault(_slot, []).append(_mesh_info)
+                else:
+                    unknown_part.append(_mesh_info)
+            if not material_parts:
+                return None
+            result = []
+            for _slot in sorted(material_parts.keys()):
+                result.append((material_parts[_slot], "{}::{}".format(cluster_name, _slot), 'custom_material'))
+            if unknown_part:
+                result.append((unknown_part, cluster_name, 'custom_hard'))
+            return result
 
         if effective_custom_clusters:
             uuid_to_hp_info = {}
@@ -1779,7 +1963,14 @@ class HPGroupingWorker(QtCore.QThread):
                     normal_part = [m for m in _item if not m.get("is_zbrush", False)]
                     split_parts = []
                     protected_local_uuids = set()
-                    if _is_hard_cluster:
+                    material_split_parts = _split_custom_item_by_material(_item, _cluster_name) if lp_material_slots else None
+                    if _is_hard_cluster and material_split_parts:
+                        split_parts = material_split_parts
+                        protected_local_uuids.update(_local_seen)
+                        for _split_item, _split_name, _split_source in split_parts:
+                            if _split_source == 'custom_hard':
+                                gt_hard_uuids.update([m.get('uuid') for m in _split_item if m.get('uuid')])
+                    elif _is_hard_cluster:
                         split_parts = [(_item, _cluster_name, 'custom_hard')]
                         protected_local_uuids.update(_local_seen)
                         gt_hard_uuids.update([u for u in _local_seen if u])
@@ -1806,6 +1997,8 @@ class HPGroupingWorker(QtCore.QThread):
                         gt_cluster_items.append(_split_item)
                         if _split_source == 'shape' and _split_name is None:
                             _set_normal_split_meta(_split_item)
+                        elif _split_source == 'custom_material':
+                            _set_material_custom_meta(_split_item, _split_name)
                         elif _split_source == 'custom_hard':
                             _set_item_meta(_split_item, source='custom', custom_cluster=_split_name, hard_custom=True, owner_lp_base=None, lp_cluster_id=None, lp_cluster_size=0)
                         else:
@@ -2178,6 +2371,7 @@ class HPGroupingWorker(QtCore.QThread):
                 'lp_clusters': set([lp_cluster_id]) if lp_cluster_id else set(),
                 'small_lp_clusters': set([lp_cluster_id]) if lp_cluster_id and lp_cluster_size <= 12 else set(),
                 'custom_clusters': set([meta.get('custom_cluster')]) if meta.get('custom_cluster') else set(),
+                'material_slots': set([meta.get('material_slot')]) if meta.get('material_slot') else set(_item_material_slots(item)),
                 'sources': set([meta.get('source')]) if meta.get('source') else set(),
                 'hard_custom': bool(meta.get('hard_custom')),
             }
@@ -2196,6 +2390,10 @@ class HPGroupingWorker(QtCore.QThread):
                     bucket_meta['small_lp_clusters'].add(lp_cluster_id)
             if meta.get('custom_cluster'):
                 bucket_meta['custom_clusters'].add(meta.get('custom_cluster'))
+            if meta.get('material_slot'):
+                bucket_meta.setdefault('material_slots', set()).add(meta.get('material_slot'))
+            for slot in _item_material_slots(item):
+                bucket_meta.setdefault('material_slots', set()).add(slot)
             if meta.get('source'):
                 bucket_meta['sources'].add(meta.get('source'))
             if meta.get('hard_custom'):
@@ -2212,6 +2410,10 @@ class HPGroupingWorker(QtCore.QThread):
             meta = _get_item_meta(item)
             if meta.get('hard_custom') or bucket_meta.get('hard_custom'):
                 return -999999.0, False, "hard_custom"
+            item_material_slots = _item_material_slots(item)
+            bucket_material_slots = bucket_meta.get('material_slots') or set()
+            if item_material_slots and bucket_material_slots and not item_material_slots.intersection(bucket_material_slots):
+                return -999999.0, False, "material"
             same_owner = bool(meta.get('owner_lp') and meta.get('owner_lp') in bucket_meta['owner_lps'])
             same_owner_base = bool(meta.get('owner_lp_base') and meta.get('owner_lp_base') in bucket_meta['owner_lp_bases'])
             same_custom = bool(meta.get('custom_cluster') and meta.get('custom_cluster') in bucket_meta['custom_clusters'])
@@ -2266,6 +2468,7 @@ class HPGroupingWorker(QtCore.QThread):
                 if pack_done[0] % max(1, pack_total // 25) == 0:
                     self.progress_value.emit(70 + int((pack_done[0] / float(max(pack_total, 1))) * 25))
                 placed = False
+                item_prefix = _item_group_prefix(prefix, item)
                 
                 potential_bucket_idx = set()
                 for m in item:
@@ -2276,14 +2479,14 @@ class HPGroupingWorker(QtCore.QThread):
                 if _get_item_meta(item).get('hard_custom'):
                     new_idx = len(buckets)
                     buckets.append(list(item))
-                    b_name = generate_name(prefix)
+                    b_name = generate_name(item_prefix)
                     bucket_names.append(b_name)
-                    bucket_metas.append(_new_bucket_meta(item, prefix))
+                    bucket_metas.append(_new_bucket_meta(item, item_prefix))
                     for m in item:
                         for cell in get_cells(m["bbox"]):
                             grid.setdefault(cell, set()).add(new_idx)
                     _debug("  PACK_CUSTOM_HARD: prefix={} | item_size={} | placed=new '{}' | cluster={} | item={}".format(
-                        prefix,
+                        item_prefix,
                         len(item),
                         b_name,
                         _get_item_meta(item).get('custom_cluster'),
@@ -2293,7 +2496,7 @@ class HPGroupingWorker(QtCore.QThread):
                 
                 candidates = []
                 for i, bucket in enumerate(buckets):
-                    if not bucket_names[i].startswith(prefix + "."):
+                    if not bucket_names[i].startswith(item_prefix + "."):
                         continue
                     if _has_collision_with_bucket(item, bucket):
                         continue
@@ -2315,14 +2518,14 @@ class HPGroupingWorker(QtCore.QThread):
                             grid.setdefault(cell, set()).add(i)
                     placed = True
                     _debug("  PACK: prefix={} | item_size={} | placed=existing '{}' | candidates={} | reason={} | item={}".format(
-                        prefix, len(item), bucket_names[i], len(candidates), reason, _item_label(item)
+                        item_prefix, len(item), bucket_names[i], len(candidates), reason, _item_label(item)
                     ))
                     
                 if not placed:
                     if prefix == "Medium":
                         existing_medium_indices = [
                             idx for idx, b_name in enumerate(bucket_names)
-                            if b_name.startswith(prefix + ".")
+                            if b_name.startswith(item_prefix + ".")
                         ]
                         if existing_medium_indices:
                             item_center = bbox_center(item_bbox(item))
@@ -2340,13 +2543,13 @@ class HPGroupingWorker(QtCore.QThread):
                                     grid.setdefault(cell, set()).add(relaxed_idx)
                             placed = True
                             _debug("  PACK_MEDIUM_SINGLE: prefix={} | item_size={} | placed=existing '{}' | targets={} | item={}".format(
-                                prefix, len(item), bucket_names[relaxed_idx], len(existing_medium_indices), _item_label(item)
+                                item_prefix, len(item), bucket_names[relaxed_idx], len(existing_medium_indices), _item_label(item)
                             ))
 
                     if not placed and prefix == "Medium":
                         medium_indices = [
                             idx for idx, b_name in enumerate(bucket_names)
-                            if b_name.startswith(prefix + ".") and not _has_collision_with_bucket(item, buckets[idx])
+                            if b_name.startswith(item_prefix + ".") and not _has_collision_with_bucket(item, buckets[idx])
                         ]
                         # Let the first far-away medium item create a second bucket,
                         # then fold later loose medium items into the smaller existing
@@ -2363,14 +2566,14 @@ class HPGroupingWorker(QtCore.QThread):
                                     grid.setdefault(cell, set()).add(smallest_idx)
                             placed = True
                             _debug("  PACK_MEDIUM_BALANCE: prefix={} | item_size={} | placed=existing '{}' | candidates={} | item={}".format(
-                                prefix, len(item), bucket_names[smallest_idx], len(medium_indices), _item_label(item)
+                                item_prefix, len(item), bucket_names[smallest_idx], len(medium_indices), _item_label(item)
                             ))
 
                 if not placed:
                     if prefix == "Medium":
                         all_medium_indices = [
                             idx for idx, b_name in enumerate(bucket_names)
-                            if b_name.startswith(prefix + ".")
+                            if b_name.startswith(item_prefix + ".")
                         ]
                         # Medium groups are helper buckets, not strict collision cages.
                         # After two buckets exist, avoid spawning Medium.003+ and fold
@@ -2391,14 +2594,14 @@ class HPGroupingWorker(QtCore.QThread):
                                     grid.setdefault(cell, set()).add(relaxed_idx)
                             placed = True
                             _debug("  PACK_MEDIUM_RELAXED: prefix={} | item_size={} | placed=existing '{}' | targets={} | item={}".format(
-                                prefix, len(item), bucket_names[relaxed_idx], len(all_medium_indices), _item_label(item)
+                                item_prefix, len(item), bucket_names[relaxed_idx], len(all_medium_indices), _item_label(item)
                             ))
 
                 if not placed:
                     if len(buckets) >= self.group_limit:
                         valid_indices = []
                         for idx, b_name in enumerate(bucket_names):
-                            if ("ZBrush" in b_name) == is_zb and b_name.startswith(prefix + "."):
+                            if ("ZBrush" in b_name) == is_zb and b_name.startswith(item_prefix + "."):
                                 if not _has_collision_with_bucket(item, buckets[idx]):
                                     score, meaningful, reason = _pack_candidate_score(
                                         item, buckets[idx], bucket_metas[idx], idx, potential_bucket_idx
@@ -2417,20 +2620,20 @@ class HPGroupingWorker(QtCore.QThread):
                                     grid.setdefault(cell, set()).add(smallest_idx)
                             placed = True
                             _debug("  PACK_LIMIT: prefix={} | item_size={} | placed=existing '{}' | valid_targets={} | reason={} | item={}".format(
-                                prefix, len(item), bucket_names[smallest_idx], len(valid_indices), reason, _item_label(item)
+                                item_prefix, len(item), bucket_names[smallest_idx], len(valid_indices), reason, _item_label(item)
                             ))
 
                     if not placed:
                         new_idx = len(buckets)
                         buckets.append(list(item))
-                        b_name = generate_name(prefix)
+                        b_name = generate_name(item_prefix)
                         bucket_names.append(b_name)
-                        bucket_metas.append(_new_bucket_meta(item, prefix))
+                        bucket_metas.append(_new_bucket_meta(item, item_prefix))
                         for m in item:
                             for cell in get_cells(m["bbox"]):
                                 grid.setdefault(cell, set()).add(new_idx)
                         _debug("  PACK: prefix={} | item_size={} | placed=new '{}' | bucket_counts_after={} | item={}".format(
-                            prefix, len(item), b_name, _bucket_prefix_counts(), _item_label(item)
+                            item_prefix, len(item), b_name, _bucket_prefix_counts(), _item_label(item)
                         ))
 
         pack_queue(huge_zb, "ZBrush_Huge", True)
@@ -2456,11 +2659,18 @@ class HPGroupingWorker(QtCore.QThread):
         for name, b_items in zip(bucket_names, buckets):
             groups[_unique_group_name(name)] = b_items
 
+        def _add_bolt_groups(items, prefix):
+            by_prefix = {}
+            for item in items:
+                by_prefix.setdefault(_item_group_prefix(prefix, item), []).extend(item)
+            for item_prefix in sorted(by_prefix.keys()):
+                groups[_unique_group_name("{}.001".format(item_prefix))] = by_prefix[item_prefix]
+
         if bolt_items:
-            groups[_unique_group_name("Bolts.001")] = [m for item in bolt_items for m in item]
+            _add_bolt_groups(bolt_items, "Bolts")
             
         if bolt_zb:
-            groups[_unique_group_name("ZBrush_Bolts.001")] = [m for item in bolt_zb for m in item]
+            _add_bolt_groups(bolt_zb, "ZBrush_Bolts")
 
         # Keep separate ZBrush semantic/custom clusters. Tandem-style chapters can
         # have several distinct ZBrush islands that should not be flattened into
@@ -2609,9 +2819,12 @@ class HPGroupingWorker(QtCore.QThread):
         # GT/manual/custom links are already baked into cluster items, so normal
         # subgroup merging can run without creating protected one-cluster groups.
         def _is_limit_exempt_group(group_name):
+            name = re.sub(r"^M\d{2,}_", "", str(group_name))
             return (
-                group_name.startswith("Bolts.")
-                or group_name.startswith("ZBrush_Bolts.")
+                name.startswith("Bolts.")
+                or name.startswith("Bolts_")
+                or name.startswith("ZBrush_Bolts.")
+                or name.startswith("ZBrush_Bolts_")
             )
 
         def _group_is_zbrush_like(group_name):
@@ -2636,7 +2849,19 @@ class HPGroupingWorker(QtCore.QThread):
                     bases.add(_lp_base_name(owner_lp))
             return bases
 
+        def _group_material_slots(group_name):
+            slots = set()
+            for hp_info in groups.get(group_name, []):
+                slot = _claim_material_slot(hp_info.get("name"))
+                if slot:
+                    slots.add(slot)
+            return slots
+
         def _groups_share_bake_context(group_a, group_b):
+            slots_a = _group_material_slots(group_a)
+            slots_b = _group_material_slots(group_b)
+            if slots_a and slots_b and not slots_a.intersection(slots_b):
+                return False
             bases_a = _group_owner_lp_bases(group_a)
             bases_b = _group_owner_lp_bases(group_b)
             if bases_a and bases_b:
@@ -2660,6 +2885,9 @@ class HPGroupingWorker(QtCore.QThread):
 
         def _group_prefix(group_name):
             name = str(group_name)
+            material_match = re.match(r"^(M\d{2,})_(.+)$", name)
+            if material_match:
+                name = material_match.group(2)
             if name.startswith("ZBrush_"):
                 name = name[len("ZBrush_"):]
             return name.split(".")[0].split("_Auto_")[0]
@@ -2717,6 +2945,10 @@ class HPGroupingWorker(QtCore.QThread):
             source_is_zb = _group_is_zbrush_like(source_group)
             target_is_zb = _group_is_zbrush_like(target_group)
             if source_is_zb != target_is_zb:
+                return None
+            source_slots = _group_material_slots(source_group)
+            target_slots = _group_material_slots(target_group)
+            if source_slots and target_slots and not source_slots.intersection(target_slots):
                 return None
 
             relaxed = mode in ("relaxed", "macro", "polish")

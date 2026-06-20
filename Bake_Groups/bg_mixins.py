@@ -73,7 +73,8 @@ class HPAnalysisMixin:
             'use_symmetry': self.chk_use_symmetry.isChecked(),
             'compound_link_verts': self.spin_compound_link_verts.value(),
             'compound_link_dist_pct': self.spin_compound_link_dist.value(),
-            'ignore_floaters': self.chk_ignore_floaters.isChecked()
+            'ignore_floaters': self.chk_ignore_floaters.isChecked(),
+            'material_slots': bool(getattr(self, 'chk_material_slots', None) and self.chk_material_slots.isChecked())
         }
 
     def _is_in_zbrush_display_layer(self, mesh_transform):
@@ -335,6 +336,242 @@ class HPAnalysisMixin:
 
         self.lp_data_cache.clear()
         lp_prebuilt_verts_cache = {}
+        enable_lp_material_slots = bool(worker_params.get('material_slots', False))
+        material_progress_dlg = None
+        material_progress_step = [0]
+
+        def _make_material_progress(total):
+            if not enable_lp_material_slots:
+                return None
+            dlg = QtWidgets.QProgressDialog(bg_l10n.text("Analyzing LP materials..."), bg_l10n.text("Cancel"), 0, max(int(total), 1), self)
+            dlg.setWindowModality(QtCore.Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            dlg.setValue(0)
+            dlg.show()
+            QtWidgets.QApplication.processEvents()
+            return dlg
+
+        def _update_material_progress(label):
+            if not material_progress_dlg:
+                return False
+            material_progress_step[0] += 1
+            material_progress_dlg.setLabelText(label)
+            material_progress_dlg.setValue(min(material_progress_step[0], material_progress_dlg.maximum()))
+            QtWidgets.QApplication.processEvents()
+            return material_progress_dlg.wasCanceled()
+
+        def _close_material_progress():
+            if material_progress_dlg:
+                material_progress_dlg.close()
+                QtWidgets.QApplication.processEvents()
+
+        def _sg_material_node(sg):
+            try:
+                nodes = cmds.listConnections("{}.surfaceShader".format(sg), source=True, destination=False) or []
+                if nodes:
+                    return nodes[0]
+            except Exception:
+                pass
+            return sg
+
+        def _short_node(name):
+            return str(name).split('|')[-1].split(':')[-1]
+
+        def _lp_material_cache_key(lp_meshes):
+            entries = []
+            for mesh in lp_meshes:
+                shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+                shape = shapes[0] if shapes else mesh
+                try:
+                    shape_uuid = (cmds.ls(shape, uuid=True) or [""])[0]
+                except Exception:
+                    shape_uuid = ""
+                try:
+                    face_count = cmds.polyEvaluate(mesh, face=True)
+                except Exception:
+                    face_count = 0
+                sgs = []
+                for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
+                    sgs.append((sg, _sg_material_node(sg)))
+                entries.append((shape_uuid, int(face_count or 0), tuple(sgs)))
+            return tuple(entries)
+
+        def _connected_shader_records(lp_node, mesh_fn, dag, total_faces, include_faces):
+            try:
+                shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
+            except Exception:
+                return []
+            records = []
+            for shader_index, shader_obj in enumerate(shaders):
+                try:
+                    sg = om.MFnDependencyNode(shader_obj).name()
+                except Exception:
+                    continue
+                material = _sg_material_node(sg)
+                rec = {
+                    "key": material or sg,
+                    "slot": None,
+                    "material": material,
+                    "shading_engines": [sg],
+                    "faces": []
+                }
+                if include_faces:
+                    rec["faces"] = [
+                        face_id for face_id, assigned_index in enumerate(face_shader_indices)
+                        if int(assigned_index) == shader_index and face_id < total_faces
+                    ]
+                    if not rec["faces"]:
+                        continue
+                records.append(rec)
+            return records
+
+        def _material_faces_for_sg(mesh_transform, shape, sg, total_faces):
+            members = cmds.sets(sg, q=True) or []
+            mesh_components = []
+            mesh_long = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
+            shape_long = (cmds.ls(shape, long=True) or [shape])[0]
+            for member in members:
+                for item in (cmds.ls(member, long=True) or []):
+                    if item == mesh_long or item == shape_long:
+                        return list(range(total_faces))
+                    if item.startswith(mesh_long + ".") or item.startswith(shape_long + "."):
+                        mesh_components.append(item)
+            if not mesh_components:
+                return []
+            try:
+                faces = cmds.polyListComponentConversion(mesh_components, toFace=True)
+                faces_flat = cmds.ls(faces, flatten=True, long=True) or []
+            except Exception:
+                return []
+            result = set()
+            for item in faces_flat:
+                match = re.search(r'\.f\[(\d+)\]', item)
+                if match:
+                    result.add(int(match.group(1)))
+            return sorted(result)
+
+        def _collect_lp_material_context(lp_meshes):
+            material_by_key = {}
+            sg_to_key = {}
+            for mesh in lp_meshes:
+                if _update_material_progress("Scanning LP materials: {}".format(mesh.split('|')[-1])):
+                    return None, None, None
+                shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+                if not shapes:
+                    continue
+                records = []
+                try:
+                    sel = om.MSelectionList()
+                    sel.add(mesh)
+                    dag = sel.getDagPath(0)
+                    if dag.hasFn(om.MFn.kTransform):
+                        dag.extendToShape()
+                    mesh_fn = om.MFnMesh(dag)
+                    records = _connected_shader_records(mesh, mesh_fn, dag, mesh_fn.numPolygons, False)
+                except Exception:
+                    records = []
+                if records:
+                    for rec in records:
+                        material = rec.get("material")
+                        key = rec.get("key") or material
+                        for sg in rec.get("shading_engines") or []:
+                            sg_to_key[sg] = key
+                        material_by_key.setdefault(key, {
+                            "material": material,
+                            "shading_engines": set()
+                        })
+                        for sg in rec.get("shading_engines") or []:
+                            material_by_key[key]["shading_engines"].add(sg)
+                    continue
+                for sg in sorted(set(cmds.listConnections(shapes[0], type='shadingEngine') or []), key=_short_node):
+                    material = _sg_material_node(sg)
+                    key = material or sg
+                    sg_to_key[sg] = key
+                    material_by_key.setdefault(key, {
+                        "material": material,
+                        "shading_engines": set()
+                    })
+                    material_by_key[key]["shading_engines"].add(sg)
+            ordered_keys = sorted(material_by_key.keys(), key=lambda k: (_short_node(material_by_key[k].get("material") or k).lower(), _short_node(k).lower()))
+            slots_by_key = {}
+            if len(ordered_keys) > 1:
+                for index, key in enumerate(ordered_keys, 1):
+                    slots_by_key[key] = "M{:02d}".format(index)
+            return material_by_key, sg_to_key, slots_by_key
+
+        lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = {}, {}, {}
+        use_lp_material_slots = False
+        material_cache_key = None
+        material_cached_records = None
+        material_cache = getattr(self, '_lp_material_analysis_cache', None)
+        if material_cache is None:
+            material_cache = {}
+            self._lp_material_analysis_cache = material_cache
+
+        if enable_lp_material_slots:
+            material_cache_key = _lp_material_cache_key(final_lp_meshes)
+            material_cached_records = material_cache.get(material_cache_key)
+            if material_cached_records:
+                use_lp_material_slots = True
+                for slot in material_cached_records.get("slots", []):
+                    lp_material_slots_by_key[slot] = slot
+            else:
+                material_progress_dlg = _make_material_progress((len(final_lp_meshes) * 2) + 2)
+                lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = _collect_lp_material_context(final_lp_meshes)
+                if material_progress_dlg and material_progress_dlg.wasCanceled():
+                    _close_material_progress()
+                    return self.log("Analyze HP material scan canceled.", "orange")
+                use_lp_material_slots = bool(lp_material_slots_by_key)
+
+        def _lp_material_records(lp_node, total_faces, mesh_fn=None, dag=None):
+            shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+            if not shapes:
+                return []
+            shape = shapes[0]
+            records_by_key = {}
+            fast_records = _connected_shader_records(lp_node, mesh_fn, dag, total_faces, True) if mesh_fn and dag else []
+            if fast_records:
+                for rec in fast_records:
+                    key = rec.get("key")
+                    if key not in lp_material_slots_by_key:
+                        continue
+                    rec["slot"] = lp_material_slots_by_key.get(key)
+                    records_by_key.setdefault(key, {
+                        "key": key,
+                        "slot": rec.get("slot"),
+                        "material": rec.get("material"),
+                        "shading_engines": set(),
+                        "faces": set()
+                    })
+                    records_by_key[key]["shading_engines"].update(rec.get("shading_engines") or [])
+                    records_by_key[key]["faces"].update(rec.get("faces") or [])
+                records = []
+                for key, rec in records_by_key.items():
+                    rec["faces"] = sorted(rec["faces"])
+                    rec["shading_engines"] = sorted(rec["shading_engines"], key=_short_node)
+                    records.append(rec)
+                return sorted(records, key=lambda r: (r.get("slot") or "M00", _short_node(r.get("material") or r.get("key")).lower()))
+            for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
+                key = lp_sg_to_material_key.get(sg) or _sg_material_node(sg) or sg
+                faces = _material_faces_for_sg(lp_node, shape, sg, total_faces)
+                if not faces:
+                    continue
+                info = lp_materials_by_key.get(key, {})
+                rec = records_by_key.setdefault(key, {
+                    "key": key,
+                    "slot": lp_material_slots_by_key.get(key),
+                    "material": info.get("material") or _sg_material_node(sg),
+                    "shading_engines": set(),
+                    "faces": set()
+                })
+                rec["shading_engines"].add(sg)
+                rec["faces"].update(faces)
+            records = []
+            for key, rec in records_by_key.items():
+                rec["faces"] = sorted(rec["faces"])
+                rec["shading_engines"] = sorted(rec["shading_engines"], key=_short_node)
+                records.append(rec)
+            return sorted(records, key=lambda r: (r.get("slot") or "M00", _short_node(r.get("material") or r.get("key")).lower()))
 
         def build_virtual_lp_shells_for_hp_worker(lp_node):
             """Create analysis-only LP shell records for combined LP meshes.
@@ -350,6 +587,12 @@ class HPAnalysisMixin:
                 mesh_fn = om.MFnMesh(dag)
                 points = mesh_fn.getPoints(om.MSpace.kWorld)
                 counts, connects = mesh_fn.getVertices()
+                material_records = _lp_material_records(lp_node, len(counts), mesh_fn, dag) if use_lp_material_slots else []
+                face_material = {}
+                if material_records:
+                    for rec in material_records:
+                        for face_id in rec.get("faces", []):
+                            face_material.setdefault(face_id, rec)
 
                 face_vertices = []
                 vertex_to_faces = {}
@@ -369,6 +612,8 @@ class HPAnalysisMixin:
                     if start_face in visited_faces:
                         continue
 
+                    material_rec = face_material.get(start_face)
+                    material_key = material_rec.get("key") if material_rec else None
                     stack = [start_face]
                     visited_faces.add(start_face)
                     shell_faces = []
@@ -380,7 +625,9 @@ class HPAnalysisMixin:
                         for v in face_vertices[f]:
                             shell_verts.add(v)
                             for nf in vertex_to_faces.get(v, []):
-                                if nf not in visited_faces:
+                                next_rec = face_material.get(nf)
+                                next_key = next_rec.get("key") if next_rec else None
+                                if nf not in visited_faces and (not use_lp_material_slots or next_key == material_key):
                                     visited_faces.add(nf)
                                     stack.append(nf)
 
@@ -398,12 +645,30 @@ class HPAnalysisMixin:
                     diag = math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2])
 
                     shell_key = "{}::shell_{:03d}".format(lp_node, shell_index)
+                    material_slot = material_rec.get("slot") if material_rec else None
+                    if material_slot:
+                        shell_key = "{}::{}".format(shell_key, material_slot)
                     verts_flat = []
                     for v in shell_verts:
                         pnt = points[v]
                         verts_flat.extend([pnt.x, pnt.y, pnt.z])
+                    if material_slot and shell_faces:
+                        max_face_samples = 1500
+                        face_step = max(1, int(len(shell_faces) / float(max_face_samples)))
+                        for face_id in shell_faces[::face_step]:
+                            verts = face_vertices[face_id]
+                            if not verts:
+                                continue
+                            acc_x = acc_y = acc_z = 0.0
+                            for v in verts:
+                                pnt = points[v]
+                                acc_x += pnt.x
+                                acc_y += pnt.y
+                                acc_z += pnt.z
+                            inv = 1.0 / float(len(verts))
+                            verts_flat.extend([acc_x * inv, acc_y * inv, acc_z * inv])
 
-                    shells.append((shell_key, {
+                    shell_data = {
                         "name": shell_key,
                         "node": shell_key,
                         "real_node": lp_node,
@@ -424,7 +689,13 @@ class HPAnalysisMixin:
                         "uv_shell_count": 0,
                         "uv_signature": "empty",
                         "variance": 999.0,
-                    }, verts_flat))
+                    }
+                    if material_slot:
+                        shell_data["material_slot"] = material_slot
+                        shell_data["material_key"] = material_rec.get("key")
+                        shell_data["material_name"] = _short_node(material_rec.get("material") or material_rec.get("key"))
+                        shell_data["material_shading_engines"] = list(material_rec.get("shading_engines") or [])
+                    shells.append((shell_key, shell_data, verts_flat))
                     shell_index += 1
 
                 return shells
@@ -432,19 +703,41 @@ class HPAnalysisMixin:
                 self.log("LP shell cache failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
                 return []
 
-        for m in final_lp_meshes:
-            shell_records = build_virtual_lp_shells_for_hp_worker(m)
-            if len(shell_records) > 1:
-                for shell_key, shell_data, shell_verts in shell_records:
-                    self.lp_data_cache[shell_key] = shell_data
-                    lp_prebuilt_verts_cache[shell_key] = shell_verts
-                continue
+        computed_material_records = []
+        if material_cached_records:
+            for shell_key, shell_data, shell_verts in material_cached_records.get("records", []):
+                self.lp_data_cache[shell_key] = dict(shell_data)
+                lp_prebuilt_verts_cache[shell_key] = list(shell_verts)
+            self.log("Analyze HP: reused cached LP material slots.", "lightblue")
+        else:
+            for m in final_lp_meshes:
+                if use_lp_material_slots and _update_material_progress("Building LP material cache: {}".format(m.split('|')[-1])):
+                    _close_material_progress()
+                    return self.log("Analyze HP material scan canceled.", "orange")
+                shell_records = build_virtual_lp_shells_for_hp_worker(m)
+                if shell_records and (len(shell_records) > 1 or use_lp_material_slots):
+                    for shell_key, shell_data, shell_verts in shell_records:
+                        self.lp_data_cache[shell_key] = shell_data
+                        lp_prebuilt_verts_cache[shell_key] = shell_verts
+                        if use_lp_material_slots:
+                            computed_material_records.append((shell_key, dict(shell_data), list(shell_verts)))
+                    continue
 
-            data = bg_core.MeshDataManager.get_mesh_data(m)
-            if data:
-                if cmds.objExists(m):
-                    data["bbox"] = cmds.xform(m, q=True, ws=True, bb=True)
-                self.lp_data_cache[m] = data
+                data = bg_core.MeshDataManager.get_mesh_data(m)
+                if data:
+                    if cmds.objExists(m):
+                        data["bbox"] = cmds.xform(m, q=True, ws=True, bb=True)
+                    self.lp_data_cache[m] = data
+
+        if use_lp_material_slots and computed_material_records and material_cache_key:
+            material_cache[material_cache_key] = {
+                "records": computed_material_records,
+                "slots": sorted(set([data.get("material_slot") for _key, data, _verts in computed_material_records if data.get("material_slot")]))
+            }
+
+        if use_lp_material_slots:
+            self.log("Analyze HP: detected {} LP material slot(s) for grouping.".format(len(lp_material_slots_by_key)), "lightblue")
+        _close_material_progress()
 
         # Progress dialog
         self.progress_dlg = QtWidgets.QProgressDialog(bg_l10n.text("Extracting Data & Fingerprinting..."), bg_l10n.text("Cancel"), 0, 100, self)
@@ -820,6 +1113,148 @@ class HPAnalysisMixin:
 class LPMatchingMixin:
     """Methods for low-poly matching to HP groups."""
 
+    def _material_slot_from_group_name(self, name):
+        match = re.match(r"^(M\d{2,})(?:_|\.)", str(name or "").split('|')[-1])
+        return match.group(1) if match else None
+
+    def _lp_material_records_for_match_repair(self, lp_node, include_faces=False):
+        if not lp_node or not cmds.objExists(lp_node):
+            return []
+        shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+        if not shapes:
+            return []
+        try:
+            sel = om.MSelectionList()
+            sel.add(lp_node)
+            dag = sel.getDagPath(0)
+            if dag.hasFn(om.MFn.kTransform):
+                dag.extendToShape()
+            mesh_fn = om.MFnMesh(dag)
+            shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
+        except Exception:
+            return []
+
+        records = []
+        for shader_index, shader_obj in enumerate(shaders):
+            try:
+                sg = om.MFnDependencyNode(shader_obj).name()
+            except Exception:
+                continue
+            try:
+                materials = cmds.listConnections("{}.surfaceShader".format(sg), source=True, destination=False) or []
+                material = materials[0] if materials else None
+            except Exception:
+                material = None
+            key = material or sg
+            faces = [
+                face_id for face_id, assigned_index in enumerate(face_shader_indices)
+                if int(assigned_index) == shader_index
+            ] if include_faces else []
+            if faces or not include_faces:
+                records.append({
+                    "key": key,
+                    "material": material,
+                    "faces": faces
+                })
+        return records
+
+    def _lp_material_slot_map_for_match_repair(self, lp_paths):
+        records_by_key = {}
+        for lp_path in lp_paths or []:
+            for rec in self._lp_material_records_for_match_repair(lp_path, include_faces=False):
+                key = rec.get("key")
+                if key:
+                    records_by_key.setdefault(key, rec)
+        if len(records_by_key) <= 1:
+            return {}
+        ordered = sorted(
+            records_by_key.values(),
+            key=lambda rec: ((rec.get("material") or rec.get("key") or "").split('|')[-1].lower(), (rec.get("key") or "").split('|')[-1].lower())
+        )
+        return {rec.get("key"): "M{:02d}".format(index) for index, rec in enumerate(ordered, 1) if rec.get("key")}
+
+    def _dominant_lp_material_slot_for_match_repair(self, lp_path, slot_by_key):
+        records = self._lp_material_records_for_match_repair(lp_path, include_faces=True)
+        if not records:
+            return None
+        counts = {}
+        for rec in records:
+            slot = slot_by_key.get(rec.get("key"))
+            if slot:
+                counts[slot] = counts.get(slot, 0) + len(rec.get("faces") or [])
+        if not counts:
+            return None
+        return max(counts.keys(), key=lambda slot: (counts[slot], slot))
+
+    def _repair_lp_matches_by_material_slot(self, matches, hp_groups, hp_verts_cache=None, lp_verts_cache_fast=None, lp_verts_cache_full=None):
+        all_lp_paths = sorted({lp_path for paths in (matches or {}).values() for lp_path in (paths or [])})
+        slot_by_key = self._lp_material_slot_map_for_match_repair(all_lp_paths)
+        if not slot_by_key:
+            return matches, 0
+
+        compatible_groups = {}
+        for grp_name in sorted((hp_groups or {}).keys()):
+            slot = self._material_slot_from_group_name(grp_name)
+            if slot:
+                compatible_groups.setdefault(slot, []).append(grp_name)
+        if not compatible_groups:
+            return matches, 0
+
+        repaired = {grp_name: set(paths or []) for grp_name, paths in (matches or {}).items()}
+        move_count = 0
+
+        for grp_name, lp_paths in list(repaired.items()):
+            group_slot = self._material_slot_from_group_name(grp_name)
+            if not group_slot:
+                continue
+            for lp_path in list(lp_paths):
+                lp_slot = self._dominant_lp_material_slot_for_match_repair(lp_path, slot_by_key)
+                if not lp_slot or lp_slot == group_slot:
+                    continue
+                target_candidates = compatible_groups.get(lp_slot) or []
+                if not target_candidates:
+                    continue
+
+                target_group = None
+                lp_verts = (lp_verts_cache_full or {}).get(lp_path) or (lp_verts_cache_fast or {}).get(lp_path)
+                if lp_verts:
+                    try:
+                        constrained_groups = {name: hp_groups.get(name, []) for name in target_candidates}
+                        repair_worker = LPMatchingWorker(
+                            hp_groups=constrained_groups,
+                            hp_data_cache=self.hp_data_cache,
+                            lp_data_cache={lp_path: self.lp_data_cache.get(lp_path, {})},
+                            hp_verts_cache=hp_verts_cache or {},
+                            lp_verts_cache_fast={lp_path: (lp_verts_cache_fast or {}).get(lp_path, [])},
+                            lp_verts_cache_full={lp_path: (lp_verts_cache_full or {}).get(lp_path, [])},
+                            lp_threshold_coef=1.5
+                        )
+                        target_group = repair_worker.get_best_match(self.lp_data_cache.get(lp_path, {}), lp_verts)
+                    except Exception:
+                        target_group = None
+
+                if not target_group:
+                    lp_data = self.lp_data_cache.get(lp_path, {})
+                    lp_center = lp_data.get("center") or [0.0, 0.0, 0.0]
+
+                    def candidate_score(candidate_group):
+                        best_dist = float('inf')
+                        for hp_path in hp_groups.get(candidate_group, []):
+                            hp_data = self.hp_data_cache.get(hp_path, {})
+                            hp_center = hp_data.get("center") or [0.0, 0.0, 0.0]
+                            dx = lp_center[0] - hp_center[0]
+                            dy = lp_center[1] - hp_center[1]
+                            dz = lp_center[2] - hp_center[2]
+                            best_dist = min(best_dist, (dx * dx + dy * dy + dz * dz) ** 0.5)
+                        return best_dist
+
+                    target_group = min(target_candidates, key=candidate_score)
+                repaired.setdefault(target_group, set()).add(lp_path)
+                repaired[grp_name].discard(lp_path)
+                move_count += 1
+
+        return repaired, move_count
+
     def run_lp_matching(self):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
@@ -1106,17 +1541,24 @@ class LPMatchingMixin:
 
         self.lp_worker.progress_value.connect(self.progress_dlg_lp.setValue)
         self.lp_worker.progress_text.connect(self.progress_dlg_lp.setLabelText)
-        self.lp_worker.finished.connect(lambda matches: self.on_lp_finished(matches, lp_main))
+        self.lp_worker.finished.connect(lambda matches, groups=hp_groups, hvc=hp_verts_cache, lf=lp_verts_cache_fast, lfull=lp_verts_cache_full: self.on_lp_finished(matches, lp_main, groups, hvc, lf, lfull))
         self.progress_dlg_lp.canceled.connect(self.lp_worker.stop)
 
         self.lp_worker.start()
 
-    def on_lp_finished(self, matches, lp_main):
+    def on_lp_finished(self, matches, lp_main, hp_groups=None, hp_verts_cache=None, lp_verts_cache_fast=None, lp_verts_cache_full=None):
         # ... (Код завершения остается абсолютно без изменений) ...
         self.progress_dlg_lp.close()
         total_matched = 0
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         locked_subgroups = pair.get('locked', []) if pair else []
+        matches, material_repair_count = self._repair_lp_matches_by_material_slot(
+            matches,
+            hp_groups or {},
+            hp_verts_cache=hp_verts_cache,
+            lp_verts_cache_fast=lp_verts_cache_fast,
+            lp_verts_cache_full=lp_verts_cache_full
+        )
 
         with bg_core.undo_chunk("ApplyLPMatching"):
             for child in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []):
@@ -1150,8 +1592,10 @@ class LPMatchingMixin:
 
         self.refresh_left_panel()
         self.log("LP Matched: {} out of {} objects.".format(total_matched, len(self.lp_data_cache)), "lightgreen")
+        if material_repair_count:
+            self.log("Assign LP material check: repaired {} LP mesh(es).".format(material_repair_count), "lightblue")
         if hasattr(self, 'record_user_action'):
-            self.record_user_action("Assign LP finished", "matched={}/{}".format(total_matched, len(self.lp_data_cache)))
+            self.record_user_action("Assign LP finished", "matched={}/{} material_repairs={}".format(total_matched, len(self.lp_data_cache), material_repair_count))
 
 
 # ============================================================================
@@ -1479,7 +1923,7 @@ class FinalViewMixin:
                 btn_name.setStyleSheet(self.subgroup_name_style(display_name, False))
             else:
                 btn_name.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
-            btn_name.clicked.connect(lambda checked=False, n=display_name: self.set_final_row_selected(n, checked))
+            btn_name.clicked.connect(lambda checked=False, n=display_name: self.set_final_row_selected(n, checked, from_click=True))
             btn_name.doubleClicked.connect(lambda checked=False, n=display_name: self.select_final_hp_nodes(n))
             btn_name.rightClicked.connect(lambda checked=False, n=display_name: self.show_final_row_context_menu(n))
             row_layout.addWidget(btn_name, stretch=1)
@@ -1525,14 +1969,23 @@ class FinalViewMixin:
             })
         bg_l10n.localize_widget_tree(self.subgroups_widget)
 
-    def set_final_row_selected(self, name, checked=True):
+    def set_final_row_selected(self, name, checked=True, from_click=False):
         if not hasattr(self, 'final_selected_names'):
             self.final_selected_names = set()
 
-        if checked:
-            self.final_selected_names.add(name)
+        if from_click:
+            modifiers = QtWidgets.QApplication.keyboardModifiers()
+            if modifiers & QtCore.Qt.ControlModifier:
+                self.final_selected_names.discard(name)
+            elif modifiers & QtCore.Qt.ShiftModifier:
+                self.final_selected_names.add(name)
+            else:
+                self.final_selected_names = set([name])
         else:
-            self.final_selected_names.discard(name)
+            if checked:
+                self.final_selected_names.add(name)
+            else:
+                self.final_selected_names.discard(name)
 
         for widget_data in getattr(self, 'final_mesh_widgets', []):
             btn = widget_data.get('name_button')
@@ -1980,8 +2433,27 @@ class GroupManagementMixin:
                     "name={} | hp_moved={} | lp_moved={}".format(suffix, len(to_hp) if sel else 0, len(to_lp) if sel else 0)
                 )
 
+    def selected_transform_nodes(self):
+        raw_selection = cmds.ls(sl=True, long=True, flatten=True) or []
+        result = []
+        seen = set()
+        for item in raw_selection:
+            node = item.split('.', 1)[0]
+            if not node or not cmds.objExists(node):
+                continue
+            if cmds.nodeType(node) == 'mesh':
+                parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                node = parents[0] if parents else node
+            if not cmds.objExists(node) or cmds.nodeType(node) != 'transform':
+                continue
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            if long_node not in seen:
+                seen.add(long_node)
+                result.append(long_node)
+        return result
+
     def add_to_groups_ui(self, hp_node, lp_node, hp_main, lp_main):
-        sel = cmds.ls(sl=True, long=True)
+        sel = self.selected_transform_nodes()
         if not sel:
             return
         hp_target = cmds.ls(hp_node, l=True)[0] if hp_node and cmds.objExists(hp_node) else None
@@ -2044,6 +2516,36 @@ class GroupManagementMixin:
                 )
             )
 
+    def find_subgroup_nodes_by_ui_name(self, hp_main, lp_main, ui_name):
+        result = {'hp': None, 'lp': None}
+        keep_hp = bool(hasattr(self, 'cb_keep_hp_structure') and self.cb_keep_hp_structure.isChecked())
+        for root, side, suffix in (
+            (hp_main, 'hp', bg_core.BakeConfig.SUFFIX_HP),
+            (lp_main, 'lp', bg_core.BakeConfig.SUFFIX_LP),
+        ):
+            if not root or not cmds.objExists(root):
+                continue
+            for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
+                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True):
+                    continue
+                short_name = child.split('|')[-1]
+                is_side = keep_hp
+                if not is_side:
+                    attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                    is_side = cmds.objExists(attr) and cmds.getAttr(attr) == side.upper()
+                    if not is_side and short_name.endswith(suffix):
+                        is_side = True
+                if not is_side:
+                    continue
+                child_ui_name = short_name
+                pattern = r'(_HP|_hp|HP|hp)(\d*)$' if side == 'hp' else r'(_LP|_lp|LP|lp)(\d*)$'
+                match = re.search(pattern, short_name)
+                if match:
+                    child_ui_name = short_name[:match.start()] + match.group(2)
+                if child_ui_name == ui_name:
+                    result[side] = child
+        return result['hp'], result['lp']
+
     def add_to_selected_subgroup_ui(self):
         if not self.active_subgroup_name:
             cmds.warning("First, select a subgroup from the list on the left.")
@@ -2052,10 +2554,11 @@ class GroupManagementMixin:
         if not pair:
             return
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        hp_grp = "|".join([hp_main, self.active_subgroup_name + bg_core.BakeConfig.SUFFIX_HP])
-        lp_grp = "|".join([lp_main, self.active_subgroup_name + bg_core.BakeConfig.SUFFIX_LP])
-        if cmds.objExists(hp_grp) and cmds.objExists(lp_grp):
+        hp_grp, lp_grp = self.find_subgroup_nodes_by_ui_name(hp_main, lp_main, self.active_subgroup_name)
+        if hp_grp or lp_grp:
             self.add_to_groups_ui(hp_grp, lp_grp, hp_main, lp_main)
+        else:
+            cmds.warning("Active subgroup target was not found: {}".format(self.active_subgroup_name))
 
     def safe_delete_subgroup_ui(self, hp_node, lp_node, root_hp, root_lp):
         if not self.confirm_action("Delete subgroup? Children will be unparented to Root."):
@@ -2704,7 +3207,7 @@ class SceneInteractionMixin:
                 for obj in sel:
                     base_name = obj.split('|')[-1]
                     target_parent = self.get_parent_tool(obj)
-                    cmds.polySeparate(obj, ch=True)
+                    cmds.polySeparate(obj, ch=False)
                     cmds.delete(obj, ch=True)
                     parts = cmds.listRelatives(obj, children=True, fullPath=True, type='transform') or []
                     if parts:
@@ -3021,6 +3524,8 @@ class TOCMixin:
             bg_core.BakeSessionModel.save(self.root_pairs)
         if hasattr(self, 'gt_widget'):
             self.gt_widget.refresh_labels()
+        if hasattr(self, 'schedule_dock_relayout'):
+            self.schedule_dock_relayout()
 
     def on_toc_clicked(self, item, col):
         if col == 1:

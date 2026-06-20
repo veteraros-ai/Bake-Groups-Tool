@@ -2,6 +2,7 @@
 from __future__ import print_function, division, absolute_import
 
 import math
+import bisect
 
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
@@ -56,8 +57,20 @@ class GTWidget(QtWidgets.QWidget):
         set_layout.addWidget(QtWidgets.QLabel("Min HP/LP:"), 1, 0)
         self.min_hp_spin = QtWidgets.QSpinBox()
         self.min_hp_spin.setRange(1, 100)
-        self.min_hp_spin.setValue(1)
+        self.min_hp_spin.setValue(2)
         set_layout.addWidget(self.min_hp_spin, 1, 1)
+
+        set_layout.addWidget(QtWidgets.QLabel("Match Mode:"), 2, 0)
+        self.match_mode_combo = QtWidgets.QComboBox()
+        self.match_mode_combo.addItem("Balanced", "BALANCED")
+        self.match_mode_combo.addItem("Fast", "FAST")
+        self.match_mode_combo.addItem("Accurate", "ACCURATE")
+        self.match_mode_combo.setToolTip(
+            "Fast: legacy bbox matcher.\n"
+            "Balanced: bbox prefilter with surface coverage scoring.\n"
+            "Accurate: more surface samples and stricter ambiguous matches."
+        )
+        set_layout.addWidget(self.match_mode_combo, 2, 1)
 
         self.geo_check_cb = QtWidgets.QCheckBox("Strict Geo Check (Resolve Overlaps)")
         self.geo_check_cb.setChecked(True)
@@ -65,7 +78,7 @@ class GTWidget(QtWidgets.QWidget):
             "ON: prefer bbox overlap, but still allows near ZBrush shells.\n"
             "OFF: also allows nearest-neighbour bbox gap matching for all HP meshes."
         )
-        set_layout.addWidget(self.geo_check_cb, 2, 0, 1, 2)
+        set_layout.addWidget(self.geo_check_cb, 3, 0, 1, 2)
         layout.addLayout(set_layout)
 
         match_btns_layout = QtWidgets.QHBoxLayout()
@@ -366,6 +379,280 @@ class GTWidget(QtWidgets.QWidget):
         mx = d.get('max', [0, 0, 0])
         return math.sqrt(sum((mx[i] - mn[i]) ** 2 for i in range(3)))
 
+    def current_match_mode(self):
+        combo = getattr(self, 'match_mode_combo', None)
+        if not combo:
+            return "BALANCED"
+        try:
+            data = combo.currentData()
+            if data:
+                return str(data)
+        except Exception:
+            pass
+        return str(combo.currentText()).upper()
+
+    def _create_match_progress(self, mode):
+        if mode == "FAST":
+            return None
+        label = "Balanced HP->LP matching..." if mode == "BALANCED" else "Accurate HP->LP matching..."
+        dlg = QtWidgets.QProgressDialog(label, "Cancel", 0, 100, self)
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        dlg.show()
+        QtWidgets.QApplication.processEvents()
+        return dlg
+
+    def _update_match_progress(self, dlg, value, text=None):
+        if not dlg:
+            return False
+        if text:
+            dlg.setLabelText(text)
+        dlg.setValue(max(0, min(100, int(value))))
+        QtWidgets.QApplication.processEvents()
+        return dlg.wasCanceled()
+
+    def _close_match_progress(self, dlg):
+        if dlg:
+            dlg.close()
+            QtWidgets.QApplication.processEvents()
+
+    def _surface_sample_count(self, role):
+        mode = self.current_match_mode()
+        if mode == "ACCURATE":
+            return 220 if role == "lp" else 160
+        return 120 if role == "lp" else 90
+
+    def _surface_tolerance(self, hp, lp):
+        hp_diag = max(float(hp.get('diag') or self._diag_from_data(hp)), 0.000001)
+        lp_diag = max(float(lp.get('diag') or self._diag_from_data(lp)), 0.000001)
+        tol_pct = max(float(self.tol_spin.value()) / 100.0, 0.01)
+        if self.current_match_mode() == "ACCURATE":
+            tol_pct = max(tol_pct * 0.75, 0.0125)
+        else:
+            tol_pct = max(tol_pct, 0.02)
+        return max(min(hp_diag, lp_diag) * tol_pct, 0.0001)
+
+    def _point_distance(self, a, b):
+        dx = a.x - b.x
+        dy = a.y - b.y
+        dz = a.z - b.z
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def _triangle_area(self, a, b, c):
+        ab = om.MVector(b.x - a.x, b.y - a.y, b.z - a.z)
+        ac = om.MVector(c.x - a.x, c.y - a.y, c.z - a.z)
+        return max((ab ^ ac).length() * 0.5, 0.0)
+
+    def _sample_points_evenly(self, points, max_count):
+        if not points:
+            return []
+        points = list(points)
+        max_count = max(1, int(max_count))
+        if len(points) <= max_count:
+            return [om.MPoint(p) for p in points]
+        step = len(points) / float(max_count)
+        return [om.MPoint(points[min(int(i * step), len(points) - 1)]) for i in range(max_count)]
+
+    def _sample_triangles(self, triangles, sample_count):
+        if not triangles:
+            return []
+        cumulative = []
+        weighted = []
+        total_area = 0.0
+        for a, b, c in triangles:
+            area = self._triangle_area(a, b, c)
+            if area <= 1e-10:
+                continue
+            total_area += area
+            cumulative.append(total_area)
+            weighted.append((a, b, c))
+        if not weighted or total_area <= 1e-10:
+            return []
+        samples = []
+        count = max(1, int(sample_count))
+        for idx in range(count):
+            area_pos = ((idx + 0.5) / float(count)) * total_area
+            tri_idx = min(bisect.bisect_left(cumulative, area_pos), len(weighted) - 1)
+            a, b, c = weighted[tri_idx]
+            r1 = (idx * 0.7548776662466927 + 0.5) % 1.0
+            r2 = (idx * 0.5698402909980532 + 0.25) % 1.0
+            sqrt_r1 = math.sqrt(r1)
+            wa = 1.0 - sqrt_r1
+            wb = sqrt_r1 * (1.0 - r2)
+            wc = sqrt_r1 * r2
+            samples.append(om.MPoint(
+                (a.x * wa) + (b.x * wb) + (c.x * wc),
+                (a.y * wa) + (b.y * wb) + (c.y * wc),
+                (a.z * wa) + (b.z * wb) + (c.z * wc)
+            ))
+        return samples
+
+    def _mesh_dag_path(self, node):
+        sel = om.MSelectionList()
+        sel.add(node)
+        dag = sel.getDagPath(0)
+        if dag.hasFn(om.MFn.kTransform):
+            dag.extendToShape()
+        return dag
+
+    def _mesh_surface_samples(self, node, sample_count):
+        cache_key = (node, int(sample_count))
+        cache = getattr(self, '_gt_surface_sample_cache', {})
+        if cache_key in cache:
+            return cache[cache_key]
+        try:
+            dag = self._mesh_dag_path(node)
+            poly_iter = om.MItMeshPolygon(dag)
+            triangles = []
+            while not poly_iter.isDone():
+                try:
+                    tri_points, _tri_ids = poly_iter.getTriangles(om.MSpace.kWorld)
+                except Exception:
+                    tri_points = []
+                for i in range(0, len(tri_points), 3):
+                    if i + 2 < len(tri_points):
+                        triangles.append((tri_points[i], tri_points[i + 1], tri_points[i + 2]))
+                poly_iter.next()
+            samples = self._sample_triangles(triangles, sample_count)
+        except Exception:
+            samples = []
+        cache[cache_key] = samples
+        self._gt_surface_sample_cache = cache
+        return samples
+
+    def _mesh_intersector(self, node):
+        cache = getattr(self, '_gt_intersector_cache', {})
+        if node in cache:
+            return cache[node]
+        try:
+            dag = self._mesh_dag_path(node)
+            intersector = om.MMeshIntersector()
+            intersector.create(dag.node(), dag.inclusiveMatrix())
+        except Exception:
+            intersector = None
+        cache[node] = intersector
+        self._gt_intersector_cache = cache
+        return intersector
+
+    def _closest_distance_to_data(self, point, target_data):
+        intersector = target_data.get('intersector')
+        if intersector:
+            try:
+                point_info = intersector.getClosestPoint(point)
+                return self._point_distance(point, om.MPoint(point_info.point))
+            except Exception:
+                pass
+        points = target_data.get('sample_points') or []
+        if not points:
+            return float('inf')
+        best = float('inf')
+        for candidate in points:
+            dist = self._point_distance(point, candidate)
+            if dist < best:
+                best = dist
+        return best
+
+    def _coverage_and_distance(self, source_points, target_data, tolerance):
+        if not source_points:
+            return 0.0, float('inf')
+        hits = 0
+        total = 0.0
+        checked = 0
+        for point in source_points:
+            dist = self._closest_distance_to_data(point, target_data)
+            if dist == float('inf'):
+                continue
+            checked += 1
+            total += dist
+            if dist <= tolerance:
+                hits += 1
+        if checked <= 0:
+            return 0.0, float('inf')
+        return hits / float(checked), total / float(checked)
+
+    def _bbox_overlap_ratio(self, hp, lp):
+        hp_vol = max(hp['size'][0] * hp['size'][1] * hp['size'][2], 0.000001)
+        lp_vol = max(lp.get('vol', 0.000001), 0.000001)
+        min_x = max(hp['min'][0], lp['min'][0])
+        min_y = max(hp['min'][1], lp['min'][1])
+        min_z = max(hp['min'][2], lp['min'][2])
+        max_x = min(hp['max'][0], lp['max'][0])
+        max_y = min(hp['max'][1], lp['max'][1])
+        max_z = min(hp['max'][2], lp['max'][2])
+        if min_x < max_x and min_y < max_y and min_z < max_z:
+            intersect_vol = (max_x - min_x) * (max_y - min_y) * (max_z - min_z)
+            return intersect_vol / max(min(hp_vol, lp_vol), 0.000001)
+        return 0.0
+
+    def _size_similarity(self, hp, lp):
+        hp_diag = max(float(hp.get('diag') or self._diag_from_data(hp)), 0.000001)
+        lp_diag = max(float(lp.get('diag') or self._diag_from_data(lp)), 0.000001)
+        hp_vol = max(hp['size'][0] * hp['size'][1] * hp['size'][2], 0.000001)
+        lp_vol = max(lp.get('vol', 0.000001), 0.000001)
+        diag_sim = min(hp_diag, lp_diag) / max(hp_diag, lp_diag)
+        vol_sim = min(hp_vol, lp_vol) / max(hp_vol, lp_vol)
+        return (diag_sim * 0.65) + (vol_sim * 0.35)
+
+    def _surface_prefilter_pass(self, hp, lp):
+        overlap_ratio = self._bbox_overlap_ratio(hp, lp)
+        if overlap_ratio > 0.0:
+            return True
+        gap = self._bbox_gap(hp, lp)
+        hp_diag = max(float(hp.get('diag') or self._diag_from_data(hp)), 0.000001)
+        lp_diag = max(float(lp.get('diag') or self._diag_from_data(lp)), 0.000001)
+        mode = self.current_match_mode()
+        multiplier = 0.9 if mode == "BALANCED" else 0.65
+        if self._is_zbrush_hp(hp):
+            multiplier *= 1.75
+        allowed_gap = max(min(hp_diag, lp_diag) * multiplier, hp_diag * 0.35, 0.001)
+        if self.geo_check_cb.isChecked() and not self._is_zbrush_hp(hp):
+            allowed_gap = min(allowed_gap, min(hp_diag, lp_diag) * 0.75)
+        return gap <= allowed_gap
+
+    def _surface_match_score_hp_to_lp(self, hp, lp):
+        if not self._surface_prefilter_pass(hp, lp):
+            return None
+        hp_points = hp.get('sample_points') or []
+        lp_points = lp.get('sample_points') or []
+        if not hp_points or not lp_points:
+            return self._match_score_hp_to_lp(hp, lp)
+
+        tolerance = self._surface_tolerance(hp, lp)
+        lp_coverage, lp_avg_dist = self._coverage_and_distance(lp_points, hp, tolerance)
+        hp_coverage, hp_avg_dist = self._coverage_and_distance(hp_points, lp, tolerance)
+
+        mode = self.current_match_mode()
+        min_lp_coverage = 0.16 if mode == "BALANCED" else 0.24
+        min_hp_coverage = 0.28 if mode == "BALANCED" else 0.38
+        if lp_coverage < min_lp_coverage and hp_coverage < min_hp_coverage:
+            return None
+
+        avg_dist = min(lp_avg_dist, hp_avg_dist)
+        dist_score = 0.0 if avg_dist == float('inf') else max(0.0, 1.0 - min(avg_dist / max(tolerance * 3.0, 0.000001), 1.0))
+        overlap_ratio = self._bbox_overlap_ratio(hp, lp)
+        bbox_score = min(overlap_ratio * 2.0, 1.0) if overlap_ratio > 0.0 else max(0.0, 1.0 - min(self._bbox_gap(hp, lp) / max(tolerance * 6.0, 0.000001), 1.0))
+        size_score = self._size_similarity(hp, lp)
+
+        score = (
+            (lp_coverage * 0.46) +
+            (hp_coverage * 0.24) +
+            (dist_score * 0.15) +
+            (size_score * 0.10) +
+            (bbox_score * 0.05)
+        ) * 1000.0
+
+        hp_diag = max(float(hp.get('diag') or self._diag_from_data(hp)), 0.000001)
+        lp_diag = max(float(lp.get('diag') or self._diag_from_data(lp)), 0.000001)
+        diag_ratio = min(hp_diag, lp_diag) / max(hp_diag, lp_diag)
+        if overlap_ratio > 0.5 and diag_ratio < 0.35 and lp_coverage < 0.2:
+            score -= 220.0
+        if mode == "ACCURATE" and lp_coverage < 0.35 and hp_coverage < 0.55:
+            score -= 120.0
+        if score <= 0.0:
+            return None
+        return score
+
     def _match_score_hp_to_lp(self, hp, lp):
         hp_vol = max(hp['size'][0] * hp['size'][1] * hp['size'][2], 0.000001)
         lp_vol = max(lp.get('vol', 0.000001), 0.000001)
@@ -468,6 +755,19 @@ class GTWidget(QtWidgets.QWidget):
                 size = [mx[i] - mn[i] for i in range(3)]
                 center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
                 vol = max(size[0] * size[1] * size[2], 0.000001)
+                sample_points = []
+                if self.current_match_mode() != "FAST":
+                    triangles = []
+                    for face_id in shell_faces:
+                        verts = face_vertices[face_id]
+                        if len(verts) < 3:
+                            continue
+                        p0 = points[verts[0]]
+                        for i in range(1, len(verts) - 1):
+                            triangles.append((p0, points[verts[i]], points[verts[i + 1]]))
+                    sample_points = self._sample_triangles(triangles, self._surface_sample_count("lp"))
+                    if not sample_points:
+                        sample_points = self._sample_points_evenly([points[v] for v in sorted(shell_verts)], self._surface_sample_count("lp"))
 
                 shell_datas.append({
                     'node': '{}::shell_{:03d}'.format(lp_node, shell_index),
@@ -482,6 +782,7 @@ class GTWidget(QtWidgets.QWidget):
                     'verts': len(shell_verts),
                     'faces': len(shell_faces),
                     'vol': vol,
+                    'sample_points': sample_points,
                 })
                 shell_index += 1
 
@@ -490,16 +791,23 @@ class GTWidget(QtWidgets.QWidget):
             self.bg.log("LP shell extraction failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
             return []
 
-    def _build_lp_data_list(self, lp_meshes):
+    def _build_lp_data_list(self, lp_meshes, progress_cb=None):
         lp_data_list = []
-        for lp in lp_meshes:
+        total = max(len(lp_meshes), 1)
+        for index, lp in enumerate(lp_meshes):
+            if progress_cb and progress_cb(index, total, lp):
+                return None
             shell_datas = self.get_lp_shell_bbox_data(lp)
             if len(shell_datas) > 1:
                 lp_data_list.extend(shell_datas)
+                if progress_cb and progress_cb(index + 1, total, lp):
+                    return None
                 continue
 
             data = bg_core.MeshDataManager.get_bbox_data_gt(lp)
             if not data:
+                if progress_cb and progress_cb(index + 1, total, lp):
+                    return None
                 continue
             try:
                 verts = cmds.polyEvaluate(lp, vertex=True)
@@ -511,6 +819,9 @@ class GTWidget(QtWidgets.QWidget):
                 data['is_virtual_shell'] = False
                 data['diag'] = self._diag_from_data(data)
                 data['bbox'] = [data['min'][0], data['min'][1], data['min'][2], data['max'][0], data['max'][1], data['max'][2]]
+                if self.current_match_mode() != "FAST":
+                    data['sample_points'] = self._mesh_surface_samples(lp, self._surface_sample_count("lp"))
+                    data['intersector'] = self._mesh_intersector(lp)
             except Exception:
                 data['verts'] = 0
                 data['faces'] = 0
@@ -519,6 +830,8 @@ class GTWidget(QtWidgets.QWidget):
                 data['is_virtual_shell'] = False
                 data['diag'] = self._diag_from_data(data)
             lp_data_list.append(data)
+            if progress_cb and progress_cb(index + 1, total, lp):
+                return None
         return lp_data_list
 
     def process_batch_match(self):
@@ -535,16 +848,38 @@ class GTWidget(QtWidgets.QWidget):
         if not hp_meshes or not lp_meshes:
             return self.bg.log("Error: HP or LP meshes missing in active pair.", "red")
 
+        match_mode = self.current_match_mode()
+        progress_dlg = self._create_match_progress(match_mode)
+        if self._update_match_progress(progress_dlg, 1, "Collecting HP meshes..."):
+            self._close_match_progress(progress_dlg)
+            return self.bg.log("GT matching canceled.", "orange")
+        self._gt_surface_sample_cache = {}
+        self._gt_intersector_cache = {}
         self.cached_hp_data = []
-        for hp in hp_meshes:
+        hp_total = max(len(hp_meshes), 1)
+        for hp_index, hp in enumerate(hp_meshes):
+            if self._update_match_progress(progress_dlg, 2 + int((hp_index / float(hp_total)) * 24), "Sampling HP: {}".format(hp.split('|')[-1])):
+                self._close_match_progress(progress_dlg)
+                return self.bg.log("GT matching canceled.", "orange")
             data = bg_core.MeshDataManager.get_bbox_data_gt(hp)
             if data:
                 data['diag'] = self._diag_from_data(data)
                 data['is_zbrush'] = self._is_zbrush_hp(data)
+                if match_mode != "FAST":
+                    data['sample_points'] = self._mesh_surface_samples(hp, self._surface_sample_count("hp"))
+                    data['intersector'] = self._mesh_intersector(hp)
                 self.cached_hp_data.append(data)
 
-        lp_data_list = self._build_lp_data_list(lp_meshes)
+        def lp_progress(done, total, lp_node):
+            value = 28 + int((done / float(max(total, 1))) * 24)
+            return self._update_match_progress(progress_dlg, value, "Preparing LP: {}".format(lp_node.split('|')[-1]))
+
+        lp_data_list = self._build_lp_data_list(lp_meshes, lp_progress if match_mode != "FAST" else None)
+        if lp_data_list is None:
+            self._close_match_progress(progress_dlg)
+            return self.bg.log("GT matching canceled.", "orange")
         if not lp_data_list:
+            self._close_match_progress(progress_dlg)
             return self.bg.log("GT: No valid LP data.", "red")
 
         tolerance_pct = self.tol_spin.value() / 100.0
@@ -552,18 +887,43 @@ class GTWidget(QtWidgets.QWidget):
 
         # Step 1: HP -> virtual LP shell/LP object.
         lp_clusters = {lp['node']: [] for lp in lp_data_list}
-        for hp in self.cached_hp_data:
+        ambiguous_count = 0
+        match_total = max(len(self.cached_hp_data) * len(lp_data_list), 1)
+        match_done = 0
+        match_stride = max(1, match_total // 120)
+        for hp_index, hp in enumerate(self.cached_hp_data):
             best_lp = None
             best_score = None
+            second_score = None
             for lp in lp_data_list:
-                score = self._match_score_hp_to_lp(hp, lp)
+                match_done += 1
+                if match_done % match_stride == 0:
+                    value = 54 + int((match_done / float(match_total)) * 34)
+                    if self._update_match_progress(progress_dlg, value, "Matching HP to LP: {} / {}".format(hp_index + 1, len(self.cached_hp_data))):
+                        self._close_match_progress(progress_dlg)
+                        return self.bg.log("GT matching canceled.", "orange")
+                if match_mode == "FAST":
+                    score = self._match_score_hp_to_lp(hp, lp)
+                else:
+                    score = self._surface_match_score_hp_to_lp(hp, lp)
                 if score is None:
                     continue
                 if best_score is None or score > best_score:
+                    second_score = best_score
                     best_score = score
                     best_lp = lp
+                elif second_score is None or score > second_score:
+                    second_score = score
+            if match_mode == "ACCURATE" and best_score is not None and second_score is not None:
+                if second_score > 0.0 and (best_score / second_score) < 1.08:
+                    ambiguous_count += 1
+                    continue
             if best_lp:
                 lp_clusters[best_lp['node']].append(hp)
+
+        if self._update_match_progress(progress_dlg, 90, "Building LP group proposals..."):
+            self._close_match_progress(progress_dlg)
+            return self.bg.log("GT matching canceled.", "orange")
 
         # Step 2: aggregate virtual shells back to real combined LP transforms.
         by_real_lp = {}
@@ -625,7 +985,12 @@ class GTWidget(QtWidgets.QWidget):
             grouped_results.append(current)
 
         if not grouped_results and not (pair.get('custom_grouping') or {}):
+            self._close_match_progress(progress_dlg)
             return self.bg.log("GT: No matches found.", "orange")
+
+        if self._update_match_progress(progress_dlg, 94, "Updating matcher results..."):
+            self._close_match_progress(progress_dlg)
+            return self.bg.log("GT matching canceled.", "orange")
 
         sorted_groups = sorted(grouped_results, key=lambda x: x['vol'], reverse=True)
         displayed_custom_names = set()
@@ -700,10 +1065,21 @@ class GTWidget(QtWidgets.QWidget):
             self.result_list.addItem(item)
             saved_only_count += 1
 
+        self._update_match_progress(progress_dlg, 100, "Matching complete.")
+        self._close_match_progress(progress_dlg)
+
         if saved_only_count:
             self.bg.log("GT: Found {} LP group proposal(s) and {} saved link(s).".format(len(grouped_results), saved_only_count), "lightgreen")
         else:
             self.bg.log("GT: Found {} LP group proposal(s).".format(len(grouped_results)), "lightgreen")
+        if match_mode != "FAST":
+            sample_label = "Balanced" if match_mode == "BALANCED" else "Accurate"
+            self.bg.log("GT {} surface matching: HP={} LP shells={} ambiguous skipped={}.".format(
+                sample_label,
+                len(self.cached_hp_data),
+                len(lp_data_list),
+                ambiguous_count
+            ), "lightblue")
 
     # -------------------------------------------------------------------------
     # Relocate and linking
