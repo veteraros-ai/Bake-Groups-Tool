@@ -12,6 +12,7 @@ _Documentation/
   Установка RU.md
   Bake Groups User Manual EN.md
   Руководство пользователя Bake Groups RU.md
+  Analyze_HP_Flow_RU.drawio
 
 Bake_Groups/
   Python tool files
