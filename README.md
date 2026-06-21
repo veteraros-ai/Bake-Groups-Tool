@@ -8,10 +8,12 @@ The package is intended for artists working with bake groups, ZBrush HP meshes, 
 
 ```text
 _Documentation/
-  Installation EN.md
-  Установка RU.md
   Bake Groups User Manual EN.md
-  Руководство пользователя Bake Groups RU.md
+  Bake Groups User Manual JA.md
+  Bake Groups User Manual RU.md
+  Bake Groups User Manual ZH-CN.md
+  User_Manual_Bake_Groups_EN.md
+  User_Manual_Bake_Groups_RU.md
   Analyze_HP_Flow_RU.drawio
 
 Bake_Groups/
@@ -41,10 +43,12 @@ Copy the `Bake_Groups` folder into:
 C:\Users\<USER>\Documents\maya\scripts\Bake_Groups
 ```
 
-Then follow the shelf installation steps in:
+Then open the user manual for your preferred language:
 
-- `_Documentation/Installation EN.md`
-- `_Documentation/Установка RU.md`
+- `_Documentation/Bake Groups User Manual EN.md`
+- `_Documentation/Bake Groups User Manual RU.md`
+- `_Documentation/Bake Groups User Manual JA.md`
+- `_Documentation/Bake Groups User Manual ZH-CN.md`
 
 ## Building bg_math_core
 
