@@ -200,7 +200,18 @@
                   "Groups Hid/M":  "Groups Hid/M",
                   "Groups Hid":  "Groups Hid",
                   "Groups Vis/M":  "Groups Vis/M",
-                  "Only Show {slot}":  "Only Show {slot}"
+                  "Only Show {slot}":  "Only Show {slot}",
+                  "Check for Updates":  "Check for Updates",
+                  "Release notes are not available for this build.":  "Release notes are not available for this build.",
+                  "Failed to save support package: {error}":  "Failed to save support package: {error}",
+                  "Update check failed: {error}":  "Update check failed: {error}",
+                  "Support package saved: {path}":  "Support package saved: {path}",
+                  "No update available. Installed: {current}. Latest: {latest}.":  "No update available. Installed: {current}. Latest: {latest}.",
+                  "Checking for updates...":  "Checking for updates...",
+                  "What\u0027s New in {version}":  "What\u0027s New in {version}",
+                  "Update check is already running.":  "Update check is already running.",
+                  "Zip Files (*.zip);;All Files (*)":  "Zip Files (*.zip);;All Files (*)",
+                  "Save Support Package":  "Save Support Package"
               },
     "tooltips":  {
                      "Lock subgroup":  "Lock this subgroup so Analyze HP and Assign LP Meshes do not rebuild it.",

@@ -1,6 +1,7 @@
 {
-  "latest_version": "1.3.2",
+  "latest_version": "1.3.3",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main"
+  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main",
+  "release_notes": "Added Support Package export from the log context menu.\nAdded manual update check from the log context menu.\nAdded release notes preview inside the update window.\nImproved cleanup of old Bake Groups UI instances before reload inside Maya.\nAdjusted resize relayout behavior for docked UI."
 }

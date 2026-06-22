@@ -200,7 +200,18 @@
                   "Groups Hid/M":  "Скрыты/M",
                   "Groups Hid":  "Группы скрыты",
                   "Groups Vis/M":  "Группы/M",
-                  "Only Show {slot}":  "Показать только {slot}"
+                  "Only Show {slot}":  "Показать только {slot}",
+                  "Check for Updates":  "Проверить обновления",
+                  "Release notes are not available for this build.":  "Описание изменений для этой сборки пока недоступно.",
+                  "Failed to save support package: {error}":  "Не удалось сохранить Support Package: {error}",
+                  "Update check failed: {error}":  "Проверка обновлений не удалась: {error}",
+                  "Support package saved: {path}":  "Support Package сохранён: {path}",
+                  "No update available. Installed: {current}. Latest: {latest}.":  "Обновлений нет. Установлена: {current}. Последняя: {latest}.",
+                  "Checking for updates...":  "Проверка обновлений...",
+                  "What\u0027s New in {version}":  "Что нового в {version}",
+                  "Update check is already running.":  "Проверка обновлений уже выполняется.",
+                  "Zip Files (*.zip);;All Files (*)":  "ZIP файлы (*.zip);;Все файлы (*)",
+                  "Save Support Package":  "Сохранить Support Package"
               },
     "tooltips":  {
                      "Lock subgroup":  "Заблокировать сабгруппу, чтобы Analyze HP и Assign LP Meshes не пересобирали ее.",

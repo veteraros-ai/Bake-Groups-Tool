@@ -3,9 +3,11 @@ from __future__ import print_function, division, absolute_import
 
 import sys
 import os
+import json
 import uuid
 import contextlib
 import re
+import zipfile
 from datetime import datetime
 
 import maya.cmds as cmds
@@ -66,6 +68,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         super(BakeManagerUI, self).__init__(parent=parent)
         self.setWindowTitle("Bake Group Manager Pro")
         self.setObjectName("BakeManagerUI")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setMinimumSize(320, 400)
         self.resize(800, 800)
         self.setAcceptDrops(False)
@@ -95,7 +98,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.update_worker = None
         self.update_dialog = None
         self.update_check_timer = None
+        self.manual_update_check_requested = False
         self._dock_relayout_pending = False
+        self._resize_relayout_pending = False
+        self._shutdown_for_reload_done = False
 
         self.init_ui()
         self.apply_stylesheet()
@@ -392,10 +398,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             (self, 320, policy_preferred),
             (getattr(self, 'left_panel', None), 120, policy_preferred),
             (getattr(self, 'right_panel', None), 120, policy_preferred),
+            (getattr(self, 'splitter', None), 0, policy_ignored),
+            (getattr(self, 'right_splitter', None), 0, policy_ignored),
             (getattr(self, 'subgroups_scroll', None), 0, policy_ignored),
             (getattr(self, 'subgroups_widget', None), 0, policy_ignored),
             (getattr(self, 'toc_tree', None), 0, policy_ignored),
             (getattr(self, 'gt_widget', None), 0, policy_ignored),
+            (getattr(self, 'log_output', None), 0, policy_ignored),
         ]
         for widget, min_width, horizontal_policy in targets:
             if not widget:
@@ -410,10 +419,59 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 continue
             except Exception:
                 continue
+        for widget in self.findChildren(QtWidgets.QWidget):
+            try:
+                if widget.isWindow():
+                    continue
+                if isinstance(widget, QtWidgets.QLabel):
+                    widget.setWordWrap(False)
+                    widget.setMinimumWidth(0)
+                    sp = widget.sizePolicy()
+                    sp.setHorizontalPolicy(policy_ignored)
+                    widget.setSizePolicy(sp)
+                elif isinstance(widget, QtWidgets.QComboBox):
+                    min_size = widget.minimumSize()
+                    max_size = widget.maximumSize()
+                    fixed_combo = (
+                        min_size.width() > 0 and
+                        min_size.width() == max_size.width() and
+                        max_size.width() < 16777215
+                    )
+                    if not fixed_combo:
+                        widget.setMinimumWidth(72)
+                        sp = widget.sizePolicy()
+                        sp.setHorizontalPolicy(policy_preferred)
+                        widget.setSizePolicy(sp)
+                elif isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+                                         QtWidgets.QAbstractItemView, QtWidgets.QScrollArea)):
+                    widget.setMinimumWidth(0)
+                    sp = widget.sizePolicy()
+                    sp.setHorizontalPolicy(policy_ignored)
+                    widget.setSizePolicy(sp)
+                elif isinstance(widget, QtWidgets.QPushButton):
+                    min_size = widget.minimumSize()
+                    max_size = widget.maximumSize()
+                    fixed_small = (
+                        min_size.width() > 0 and
+                        min_size.width() == max_size.width() and
+                        max_size.width() <= 80
+                    )
+                    if not fixed_small:
+                        widget.setMinimumWidth(0)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
         if hasattr(self, 'splitter'):
             try:
                 self.splitter.setChildrenCollapsible(True)
                 self.splitter.updateGeometry()
+            except Exception:
+                pass
+        if hasattr(self, 'right_splitter'):
+            try:
+                self.right_splitter.setChildrenCollapsible(True)
+                self.right_splitter.updateGeometry()
             except Exception:
                 pass
         central = self.centralWidget()
@@ -448,6 +506,23 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             if self.layout():
                 self.layout().activate()
             self.updateGeometry()
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super(BakeManagerUI, self).resizeEvent(event)
+        if getattr(self, '_is_closing', False):
+            return
+        if getattr(self, '_resize_relayout_pending', False):
+            return
+        self._resize_relayout_pending = True
+        QtCore.QTimer.singleShot(60, self.run_resize_relayout)
+
+    def run_resize_relayout(self):
+        self._resize_relayout_pending = False
+        self.run_dock_relayout()
+        try:
+            self.repaint()
         except Exception:
             pass
 
@@ -629,6 +704,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def show_log_context_menu(self, pos):
         menu = self.log_output.createStandardContextMenu()
         menu.addSeparator()
+        action_support_package = menu.addAction(bg_l10n.text("Save Support Package"))
+        action_support_package.triggered.connect(self.save_support_package)
+        action_check_updates = menu.addAction(bg_l10n.text("Check for Updates"))
+        action_check_updates.triggered.connect(self.check_updates_from_log_menu)
+        menu.addSeparator()
         action_save_debug = menu.addAction(bg_l10n.text("Save Debug Log"))
         action_save_debug.setEnabled(bool(getattr(self, 'last_debug_lines', []) or getattr(self, 'user_action_lines', [])))
         action_save_debug.triggered.connect(self.save_debug_log)
@@ -684,6 +764,120 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         except Exception as exc:
             self.log(bg_l10n.text("Failed to save debug log: {error}").format(error=exc), "red")
 
+    def build_support_environment_snapshot(self):
+        pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+        try:
+            maya_version = cmds.about(version=True)
+        except Exception:
+            maya_version = "Unknown"
+        try:
+            maya_api = cmds.about(apiVersion=True)
+        except Exception:
+            maya_api = "Unknown"
+        data = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "plugin_version": getattr(bg_update.bg_version, "__version__", "Unknown"),
+            "plugin_name": getattr(bg_update.bg_version, "PLUGIN_NAME", "Bake Groups Tool"),
+            "language": bg_l10n.current_language(),
+            "maya_version": maya_version,
+            "maya_api": maya_api,
+            "scene": cmds.file(q=True, sn=True) or "Untitled",
+            "active_chapter": pair.get("base") if pair else None,
+            "is_final_view": bool(getattr(self, "is_final_view", False)),
+            "is_preview_active": bool(getattr(self, "is_preview_active", False)),
+            "active_material_visibility_filter": getattr(self, "active_material_visibility_filter", None),
+            "settings": {
+                "hp_strategy": self.combo_hp_strategy.currentText() if hasattr(self, "combo_hp_strategy") else None,
+                "hp_collision_pct": self.spin_threshold.value() if hasattr(self, "spin_threshold") else None,
+                "ignore_floaters": self.chk_ignore_floaters.isChecked() if hasattr(self, "chk_ignore_floaters") else None,
+                "material_slots": self.chk_material_slots.isChecked() if hasattr(self, "chk_material_slots") else None,
+                "hp_link_vtx": self.spin_compound_link_verts.value() if hasattr(self, "spin_compound_link_verts") else None,
+                "hp_link_dist_pct": self.spin_compound_link_dist.value() if hasattr(self, "spin_compound_link_dist") else None,
+                "color_groups": self.cb_color_subgroups.isChecked() if hasattr(self, "cb_color_subgroups") else None,
+                "keep_hp": self.cb_keep_hp_structure.isChecked() if hasattr(self, "cb_keep_hp_structure") else None,
+            },
+        }
+        return data
+
+    def build_display_layer_snapshot(self):
+        lines = []
+        layers = cmds.ls(type="displayLayer") or []
+        for layer in sorted(layers):
+            if layer == "defaultLayer":
+                continue
+            try:
+                visible = cmds.getAttr("{}.visibility".format(layer))
+            except Exception:
+                visible = "Unknown"
+            members = cmds.editDisplayLayerMembers(layer, q=True, fullNames=True) or []
+            lines.append("{} | visible={} | members={}".format(layer, visible, len(members)))
+            if members:
+                lines.append("  {}".format(self._format_debug_names([m.split('|')[-1] for m in members], limit=40)))
+        return lines or ["(no custom display layers)"]
+
+    def save_support_package(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = os.path.join(os.path.expanduser("~"), "Desktop", "BakeGroups_Support_{}.zip".format(timestamp))
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            bg_l10n.text("Save Support Package"),
+            default_path,
+            bg_l10n.text("Zip Files (*.zip);;All Files (*)")
+        )
+        if not file_path:
+            return
+        if not os.path.splitext(file_path)[1]:
+            file_path += ".zip"
+
+        debug_lines = list(getattr(self, 'last_debug_lines', []) or [])
+        action_lines = list(getattr(self, 'user_action_lines', []) or [])
+        visible_log = self.log_output.toPlainText()
+        scene_snapshot = self.build_current_scene_snapshot()
+        display_layers = self.build_display_layer_snapshot()
+        environment = self.build_support_environment_snapshot()
+
+        report = []
+        report.append("Bake Groups Support Package")
+        report.append("Saved: {}".format(environment.get("saved_at")))
+        report.append("Scene: {}".format(environment.get("scene")))
+        report.append("Plugin: {} {}".format(environment.get("plugin_name"), environment.get("plugin_version")))
+        report.append("Maya: {} | API: {}".format(environment.get("maya_version"), environment.get("maya_api")))
+        report.append("Language: {}".format(environment.get("language")))
+        report.append("")
+        report.append("=== Visible Log ===")
+        report.append(visible_log if visible_log else "(empty)")
+        report.append("")
+        report.append("=== User Actions ===")
+        report.extend(action_lines if action_lines else ["(no recorded user actions)"])
+        report.append("")
+        report.append("=== Current Scene Snapshot ===")
+        report.extend(scene_snapshot)
+        report.append("")
+        report.append("=== Display Layers ===")
+        report.extend(display_layers)
+        report.append("")
+        report.append("=== Analyze HP Debug ===")
+        report.extend(debug_lines if debug_lines else ["(Analyze HP debug is not available for this session.)"])
+
+        try:
+            with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("support_report.txt", "\n".join(report))
+                archive.writestr("visible_log.txt", visible_log or "")
+                archive.writestr("user_actions.txt", "\n".join(action_lines))
+                archive.writestr("scene_snapshot.txt", "\n".join(scene_snapshot))
+                archive.writestr("display_layers.txt", "\n".join(display_layers))
+                archive.writestr("analyze_hp_debug.txt", "\n".join(debug_lines))
+                archive.writestr("environment.json", json.dumps(environment, indent=2, ensure_ascii=False, default=str))
+                archive.writestr("session_pairs.json", json.dumps(self.root_pairs, indent=2, ensure_ascii=False, default=str))
+                manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_manifest.json")
+                if os.path.exists(manifest_path):
+                    archive.write(manifest_path, "update_manifest.json")
+        except Exception as exc:
+            self.log(bg_l10n.text("Failed to save support package: {error}").format(error=exc), "red")
+            return
+
+        self.log(bg_l10n.text("Support package saved: {path}").format(path=file_path), "lightgreen")
+
     def setup_script_jobs(self):
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
 
@@ -699,6 +893,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         worker.finished.connect(self.clear_update_worker)
         worker.start()
 
+    def check_updates_from_log_menu(self):
+        if self.update_worker and self.update_worker.isRunning():
+            self.log(bg_l10n.text("Update check is already running."), "orange")
+            return
+        self.manual_update_check_requested = True
+        self.log(bg_l10n.text("Checking for updates..."), "lightblue")
+        self.start_update_check()
+
     def handle_update_check_result(self, result):
         if self._is_closing:
             return
@@ -706,7 +908,21 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             self.objectName()
         except RuntimeError:
             return
-        if not result or not result.get("is_update_available"):
+        manual_check = bool(getattr(self, "manual_update_check_requested", False))
+        self.manual_update_check_requested = False
+        if not result:
+            if manual_check:
+                self.log(bg_l10n.text("Update check failed: {error}").format(error="No result"), "red")
+            return
+        if result.get("error"):
+            if manual_check:
+                self.log(bg_l10n.text("Update check failed: {error}").format(error=result.get("error")), "red")
+            return
+        if not result.get("is_update_available"):
+            if manual_check:
+                current = result.get("current_version") or getattr(bg_update.bg_version, "__version__", "")
+                latest = result.get("remote_version") or current
+                self.log(bg_l10n.text("No update available. Installed: {current}. Latest: {latest}.").format(current=current, latest=latest), "lightgreen")
             return
         self.update_dialog = bg_update.show_update_dialog(result, self)
         self.update_dialog.destroyed.connect(self.clear_update_dialog)
@@ -1236,33 +1452,43 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 if state:
                     cmds.isolateSelect(panel, state=True)
 
-    def closeEvent(self, event):
+    def shutdown_for_reload(self):
+        if getattr(self, '_shutdown_for_reload_done', False):
+            return True
         self._is_closing = True
         if self.update_check_timer:
-            self.update_check_timer.stop()
+            try:
+                self.update_check_timer.stop()
+            except RuntimeError:
+                pass
         dialog = self.update_dialog
         install_worker = getattr(dialog, "install_worker", None) if dialog else None
         if install_worker and install_worker.isRunning():
-            event.ignore()
             self._is_closing = False
-            dialog.raise_()
-            dialog.activateWindow()
-            return
+            try:
+                dialog.raise_()
+                dialog.activateWindow()
+            except RuntimeError:
+                pass
+            return False
         if not self._stop_worker_for_close('hp_worker'):
-            event.ignore()
             self._is_closing = False
-            return
+            return False
         if not self._stop_worker_for_close('lp_worker'):
-            event.ignore()
             self._is_closing = False
-            return
+            return False
         if not self._stop_update_worker_for_close():
-            event.ignore()
             self._is_closing = False
-            return
+            return False
         if dialog:
-            dialog.close()
-        self.restore_subgroup_colors()
+            try:
+                dialog.close()
+            except RuntimeError:
+                pass
+        try:
+            self.restore_subgroup_colors()
+        except Exception:
+            pass
         for job_id in self.script_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):
@@ -1270,6 +1496,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             except:
                 pass
         self.script_jobs = []
+        self.update_worker = None
+        self.update_dialog = None
+        self.update_check_timer = None
+        self._shutdown_for_reload_done = True
+        return True
+
+    def closeEvent(self, event):
+        if not self.shutdown_for_reload():
+            event.ignore()
+            return
         super(BakeManagerUI, self).closeEvent(event)
 
     def reload_data_from_scene(self):
@@ -2153,7 +2389,56 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             cmds.select(clear=True)
 
 
+def cleanup_stale_bake_manager_ui():
+    app = QtWidgets.QApplication.instance()
+    if app:
+        for widget in list(app.allWidgets()):
+            try:
+                object_name = widget.objectName()
+            except RuntimeError:
+                continue
+            if object_name not in ("BakeManagerUI", bg_core.BakeConfig.WORKSPACE_NAME):
+                continue
+            try:
+                if hasattr(widget, "shutdown_for_reload"):
+                    widget.shutdown_for_reload()
+            except Exception:
+                pass
+            try:
+                widget.close()
+            except RuntimeError:
+                pass
+            try:
+                widget.setParent(None)
+            except RuntimeError:
+                pass
+            try:
+                widget.deleteLater()
+            except RuntimeError:
+                pass
+        for _ in range(3):
+            try:
+                app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            except Exception:
+                try:
+                    app.processEvents()
+                except Exception:
+                    break
+
+    if cmds.workspaceControl(bg_core.BakeConfig.WORKSPACE_NAME, exists=True):
+        try:
+            cmds.deleteUI(bg_core.BakeConfig.WORKSPACE_NAME, control=True)
+        except RuntimeError:
+            pass
+    try:
+        if cmds.workspaceControlState(bg_core.BakeConfig.WORKSPACE_NAME, exists=True):
+            cmds.workspaceControlState(bg_core.BakeConfig.WORKSPACE_NAME, remove=True)
+    except Exception:
+        pass
+
+
 def main():
+    cleanup_stale_bake_manager_ui()
     if cmds.workspaceControl(bg_core.BakeConfig.WORKSPACE_NAME, exists=True):
         cmds.deleteUI(bg_core.BakeConfig.WORKSPACE_NAME, control=True)
 

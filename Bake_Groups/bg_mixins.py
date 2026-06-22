@@ -1929,6 +1929,7 @@ class FinalViewMixin:
             row_layout.addWidget(btn_name, stretch=1)
 
             combo = QtWidgets.QComboBox()
+            combo.setObjectName("FinalSmoothCombo")
             combo.addItems(["Smooth 0", "Smooth 1", "Smooth 2", "Smooth 3"])
             combo.setFixedWidth(85)
             combo.setStyleSheet("background-color: #444; color: white;")

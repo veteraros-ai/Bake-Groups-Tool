@@ -4,6 +4,18 @@ import re
 import json
 import maya.cmds as cmds
 
+try:
+    from PySide6 import QtWidgets, QtCore
+except ImportError:
+    try:
+        from PySide2 import QtWidgets, QtCore
+    except ImportError:
+        QtWidgets = None
+        QtCore = None
+
+
+WORKSPACE_CONTROL_NAME = "BakeManagerUIWorkspaceControl"
+
 
 def _active_runtime_dir(script_dir):
     active_path = os.path.join(script_dir, "active_version.json")
@@ -39,8 +51,97 @@ def _prepare_versioned_math_core_path():
     return runtime_dir
 
 
+def _process_qt_events(cycles=3):
+    if not QtWidgets:
+        return
+    app = QtWidgets.QApplication.instance()
+    if not app:
+        return
+    for _ in range(max(1, int(cycles or 1))):
+        try:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        except Exception:
+            try:
+                app.processEvents()
+            except Exception:
+                break
+
+
+def _delete_workspace_control():
+    try:
+        if cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True):
+            cmds.deleteUI(WORKSPACE_CONTROL_NAME, control=True)
+    except Exception as exc:
+        print("Bake Groups workspace control delete failed: {}".format(exc))
+    try:
+        if cmds.workspaceControlState(WORKSPACE_CONTROL_NAME, exists=True):
+            cmds.workspaceControlState(WORKSPACE_CONTROL_NAME, remove=True)
+    except Exception:
+        pass
+
+
+def _delete_old_qt_widgets():
+    if not QtWidgets:
+        return
+    app = QtWidgets.QApplication.instance()
+    if not app:
+        return
+    for widget in list(app.allWidgets()):
+        try:
+            object_name = widget.objectName()
+        except RuntimeError:
+            continue
+        if object_name not in ("BakeManagerUI", WORKSPACE_CONTROL_NAME):
+            continue
+        try:
+            widget.close()
+        except RuntimeError:
+            pass
+        try:
+            widget.setParent(None)
+        except RuntimeError:
+            pass
+        try:
+            widget.deleteLater()
+        except RuntimeError:
+            pass
+
+
+def _shutdown_existing_bake_groups_ui():
+    old_mod = sys.modules.get("bg_main_window")
+    old_ui = getattr(old_mod, "bake_manager_ui", None) if old_mod else None
+    if old_ui:
+        try:
+            if hasattr(old_ui, "shutdown_for_reload"):
+                old_ui.shutdown_for_reload()
+        except Exception as exc:
+            print("Bake Groups UI shutdown failed: {}".format(exc))
+        try:
+            old_ui.close()
+        except RuntimeError:
+            pass
+        try:
+            old_ui.setParent(None)
+        except RuntimeError:
+            pass
+        try:
+            old_ui.deleteLater()
+        except RuntimeError:
+            pass
+        try:
+            setattr(old_mod, "bake_manager_ui", None)
+        except Exception:
+            pass
+    _delete_old_qt_widgets()
+    _process_qt_events(4)
+    _delete_workspace_control()
+    _process_qt_events(2)
+
+
 runtime_dir = _prepare_versioned_math_core_path()
 print("Bake Groups runtime: {}".format(runtime_dir))
+
+_shutdown_existing_bake_groups_ui()
 
 modules_to_reload = [
     'bg_version',

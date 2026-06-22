@@ -200,7 +200,18 @@
                   "Groups Hid/M":  "隐藏/M",
                   "Groups Hid":  "组部分隐藏",
                   "Groups Vis/M":  "组/M",
-                  "Only Show {slot}":  "仅显示 {slot}"
+                  "Only Show {slot}":  "仅显示 {slot}",
+                  "Check for Updates":  "检查更新",
+                  "Release notes are not available for this build.":  "此版本暂无发行说明。",
+                  "Failed to save support package: {error}":  "保存支持包失败: {error}",
+                  "Update check failed: {error}":  "更新检查失败: {error}",
+                  "Support package saved: {path}":  "支持包已保存: {path}",
+                  "No update available. Installed: {current}. Latest: {latest}.":  "没有可用更新。已安装: {current}。最新: {latest}。",
+                  "Checking for updates...":  "正在检查更新...",
+                  "What\u0027s New in {version}":  "{version} 更新内容",
+                  "Update check is already running.":  "更新检查已在运行。",
+                  "Zip Files (*.zip);;All Files (*)":  "ZIP 文件 (*.zip);;所有文件 (*)",
+                  "Save Support Package":  "保存支持包"
               },
     "tooltips":  {
                      "Lock subgroup":  "锁定此子组，使分析 HP 和分配 LP 网格不会重建它。",

@@ -2,7 +2,7 @@ from __future__ import print_function, division, absolute_import
 
 PLUGIN_NAME = "Bake Groups Tool"
 AUTHOR_NAME = "Veteraros AI"
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 GITHUB_REPOSITORY = "veteraros-ai/Bake-Groups-Tool"
 GITHUB_URL = "https://github.com/{}".format(GITHUB_REPOSITORY)
 RELEASES_URL = "{}/releases".format(GITHUB_URL)

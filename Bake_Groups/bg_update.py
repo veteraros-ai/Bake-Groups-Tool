@@ -82,11 +82,15 @@ def _manifest_info_from_text(data):
     remote_version = str(manifest.get("latest_version") or manifest.get("version") or "").strip()
     if not remote_version:
         raise ValueError("Remote manifest version not found")
+    release_notes = manifest.get("release_notes") or manifest.get("notes") or ""
+    if isinstance(release_notes, (list, tuple)):
+        release_notes = "\n".join([str(item) for item in release_notes])
     return {
         "remote_version": remote_version,
         "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
         "package_url": manifest.get("package_url") or DEFAULT_PACKAGE_URL,
+        "release_notes": release_notes,
     }
 
 
@@ -131,6 +135,7 @@ def check_for_update():
         "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
         "package_url": update_info.get("package_url") or DEFAULT_PACKAGE_URL,
+        "release_notes": update_info.get("release_notes") or "",
     }
 
 
@@ -471,6 +476,18 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         versions_layout.setColumnStretch(1, 1)
         layout.addWidget(versions)
 
+        notes_title = QtWidgets.QLabel(bg_l10n.text("What's New in {version}").format(version=str(self.update_info.get("remote_version") or "")))
+        notes_title.setObjectName("ReleaseNotesTitle")
+        layout.addWidget(notes_title)
+
+        notes_text = self.update_info.get("release_notes") or bg_l10n.text("Release notes are not available for this build.")
+        self.release_notes_box = QtWidgets.QTextEdit()
+        self.release_notes_box.setObjectName("ReleaseNotesBox")
+        self.release_notes_box.setReadOnly(True)
+        self.release_notes_box.setPlainText(str(notes_text))
+        self.release_notes_box.setMaximumHeight(110)
+        layout.addWidget(self.release_notes_box)
+
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addStretch(1)
@@ -618,6 +635,19 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             QLabel#VersionValueAccent {
                 color: #83ddd6;
                 font-weight: 700;
+            }
+            QLabel#ReleaseNotesTitle {
+                color: #f2f2f2;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QTextEdit#ReleaseNotesBox {
+                background-color: #1f1f1f;
+                border: 1px solid #353535;
+                border-radius: 5px;
+                color: #cfcfcf;
+                padding: 8px;
+                selection-background-color: #2c7775;
             }
             QPushButton {
                 background-color: #333333;

@@ -200,7 +200,18 @@
                   "Groups Hid/M":  "非表示/M",
                   "Groups Hid":  "グループ一部非表示",
                   "Groups Vis/M":  "グループ/M",
-                  "Only Show {slot}":  "{slot} のみ表示"
+                  "Only Show {slot}":  "{slot} のみ表示",
+                  "Check for Updates":  "更新を確認",
+                  "Release notes are not available for this build.":  "このビルドのリリースノートはまだありません。",
+                  "Failed to save support package: {error}":  "サポートパッケージの保存に失敗しました: {error}",
+                  "Update check failed: {error}":  "更新確認に失敗しました: {error}",
+                  "Support package saved: {path}":  "サポートパッケージを保存しました: {path}",
+                  "No update available. Installed: {current}. Latest: {latest}.":  "利用可能な更新はありません。インストール済み: {current}。最新: {latest}。",
+                  "Checking for updates...":  "更新を確認しています...",
+                  "What\u0027s New in {version}":  "{version} の変更点",
+                  "Update check is already running.":  "更新確認はすでに実行中です。",
+                  "Zip Files (*.zip);;All Files (*)":  "ZIPファイル (*.zip);;すべてのファイル (*)",
+                  "Save Support Package":  "サポートパッケージを保存"
               },
     "tooltips":  {
                      "Lock subgroup":  "このサブグループをロックし、HP解析とLPメッシュ割り当てで再構築されないようにします。",
