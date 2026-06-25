@@ -58,6 +58,24 @@
                   "Freeze Transformations failed: {error}":  "Freeze Transformations 失败: {error}",
                   "Freeze Transformations did not clear all invalid transforms.":  "Freeze Transformations 未能清除所有无效 transform。",
                   "Invalid transforms":  "未冻结的 transform",
+                  "Duplicate Meshes Found":  "发现重复网格",
+                  "Duplicate meshes were found before Analyze HP.":  "Analyze HP 前发现重复网格。",
+                  "Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue.":  "请在运行 Analyze HP 前处理重复项。可以现在选择找到的网格，或跳过此警告继续。",
+                  "{label}: {groups} duplicate group(s), {meshes} mesh(es)":  "{label}: 重复组 {groups}，网格 {meshes}",
+                  "Analyze HP paused: selected {count} duplicate mesh(es).":  "Analyze HP 已暂停：已选择 {count} 个重复网格。",
+                  "Duplicate mesh check failed: {error}":  "重复网格检查失败: {error}",
+                  "Group":  "组",
+                  "Combined Meshes Found":  "发现合并网格",
+                  "Combined mesh candidates were found before Analyze HP.":  "Analyze HP 前发现合并网格候选项。",
+                  "These meshes may need to be separated before analysis. Select them now, or skip this warning and continue.":  "这些网格可能需要在分析前分离。可以现在选择它们，或跳过此警告继续。",
+                  "Single mesh root candidates:":  "单网格 root 候选项:",
+                  "Combined mesh candidates:":  "合并网格候选项:",
+                  "{label}: {count} combined mesh candidate(s)":  "{label}: 合并网格候选项 {count}",
+                  "Analyze HP paused: selected {count} combined mesh candidate(s).":  "Analyze HP 已暂停：已选择 {count} 个合并网格候选项。",
+                  "Combined mesh check failed: {error}":  "合并网格检查失败: {error}",
+                  "Checking combined meshes...":  "正在检查合并网格...",
+                  "Checking combined meshes: {name}":  "正在检查合并网格: {name}",
+                  "Combined mesh check canceled.":  "合并网格检查已取消。",
                   "Analyze HP":  "分析 HP",
                   "Create Pair":  "创建配对",
                   "Algorithm":  "算法",
@@ -211,7 +229,11 @@
                   "What\u0027s New in {version}":  "{version} 更新内容",
                   "Update check is already running.":  "更新检查已在运行。",
                   "Zip Files (*.zip);;All Files (*)":  "ZIP 文件 (*.zip);;所有文件 (*)",
-                  "Save Support Package":  "保存支持包"
+                  "Save Support Package":  "保存支持包",
+                  "Undo BG":  "撤销 BG",
+                  "Maya undo failed: {error}":  "Maya 撤销失败: {error}",
+                  "Undone Bake Groups action: {action}":  "已撤销 Bake Groups 操作: {action}",
+                  "No Bake Groups action to undo.":  "没有可撤销的 Bake Groups 操作。"
               },
     "tooltips":  {
                      "Lock subgroup":  "锁定此子组，使分析 HP 和分配 LP 网格不会重建它。",
@@ -313,6 +335,7 @@
                      "Groups Hid/M":  "当前材质分区中有部分子组隐藏。点击可重新显示所有材质分区。",
                      "Algorithm":  "Analyze HP 的自动 HP 分组设置。",
                      "Groups Hid":  "部分子组已隐藏。点击可显示活动章节中的所有子组。",
-                     "Groups Vis/M":  "材质可见性过滤已启用。点击可重新显示所有材质分区。"
+                     "Groups Vis/M":  "材质可见性过滤已启用。点击可重新显示所有材质分区。",
+                     "Undo BG":  "撤销上一个轻量 Bake Groups 操作。不包括 Analyze HP、Assign LP、导出、Combine Fin 和 Color Groups。"
                  }
 }

@@ -146,6 +146,444 @@ class HPAnalysisMixin:
 
         return box.clickedButton() == skip_btn
 
+    def _duplicate_check_shape(self, mesh_transform):
+        shapes = cmds.listRelatives(mesh_transform, shapes=True, fullPath=True, type='mesh') or []
+        for shape in shapes:
+            try:
+                if not cmds.getAttr(shape + ".intermediateObject"):
+                    return shape
+            except Exception:
+                continue
+        return None
+
+    def _duplicate_check_dag_path(self, mesh_shape):
+        selection = om.MSelectionList()
+        try:
+            selection.add(mesh_shape)
+            return selection.getDagPath(0)
+        except Exception:
+            return None
+
+    def _combined_check_mesh_shells(self, mesh_transform):
+        shape = self._duplicate_check_shape(mesh_transform)
+        if not shape:
+            return None
+        dag_path = self._duplicate_check_dag_path(shape)
+        if not dag_path:
+            return None
+
+        mesh_fn = om.MFnMesh(dag_path)
+        face_count = mesh_fn.numPolygons
+        vertex_count = mesh_fn.numVertices
+        if face_count <= 0 or vertex_count <= 0:
+            return None
+
+        points = mesh_fn.getPoints(om.MSpace.kWorld)
+        counts, connects = mesh_fn.getVertices()
+        face_vertices = []
+        vertex_to_faces = {}
+        index = 0
+        for face_id, count in enumerate(counts):
+            verts = list(connects[index:index + count])
+            index += count
+            face_vertices.append(verts)
+            for vertex_id in verts:
+                vertex_to_faces.setdefault(vertex_id, []).append(face_id)
+
+        visited = set()
+        shells = []
+        for start_face in range(len(face_vertices)):
+            if start_face in visited:
+                continue
+            stack = [start_face]
+            visited.add(start_face)
+            shell_faces = []
+            shell_vertices = set()
+            while stack:
+                face_id = stack.pop()
+                shell_faces.append(face_id)
+                for vertex_id in face_vertices[face_id]:
+                    shell_vertices.add(vertex_id)
+                    for next_face in vertex_to_faces.get(vertex_id, []):
+                        if next_face not in visited:
+                            visited.add(next_face)
+                            stack.append(next_face)
+            if not shell_vertices:
+                continue
+            xs = [points[v].x for v in shell_vertices]
+            ys = [points[v].y for v in shell_vertices]
+            zs = [points[v].z for v in shell_vertices]
+            mn = [min(xs), min(ys), min(zs)]
+            mx = [max(xs), max(ys), max(zs)]
+            size = [mx[i] - mn[i] for i in range(3)]
+            diag = math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2])
+            vol = max(size[0] * size[1] * size[2], 1e-6)
+            shells.append({
+                "faces": len(shell_faces),
+                "vertices": len(shell_vertices),
+                "bbox": [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]],
+                "diag": diag,
+                "volume": vol
+            })
+
+        if not shells:
+            return None
+
+        try:
+            overall_bbox = cmds.exactWorldBoundingBox(mesh_transform)
+        except Exception:
+            overall_bbox = cmds.xform(mesh_transform, query=True, boundingBox=True, worldSpace=True) or []
+        if overall_bbox:
+            overall_size = [
+                abs(overall_bbox[3] - overall_bbox[0]),
+                abs(overall_bbox[4] - overall_bbox[1]),
+                abs(overall_bbox[5] - overall_bbox[2])
+            ]
+        else:
+            xs = [point.x for point in points]
+            ys = [point.y for point in points]
+            zs = [point.z for point in points]
+            overall_size = [max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)]
+        overall_diag = math.sqrt(overall_size[0] * overall_size[0] + overall_size[1] * overall_size[1] + overall_size[2] * overall_size[2])
+        overall_volume = max(overall_size[0] * overall_size[1] * overall_size[2], 1e-6)
+        min_faces = max(6, int(face_count * 0.0002))
+        meaningful_shells = [shell for shell in shells if shell.get("faces", 0) >= min_faces]
+        max_shell_diag = max([shell.get("diag", 0.0) for shell in meaningful_shells] or [overall_diag, 1e-6])
+        shell_volume_sum = sum(shell.get("volume", 0.0) for shell in meaningful_shells)
+        spread_ratio = overall_diag / max(max_shell_diag, 1e-6)
+        fill_ratio = min(shell_volume_sum / overall_volume, 1.0)
+        return {
+            "shell_count": len(shells),
+            "meaningful_shell_count": len(meaningful_shells),
+            "face_count": face_count,
+            "vertex_count": vertex_count,
+            "spread_ratio": spread_ratio,
+            "fill_ratio": fill_ratio
+        }
+
+    def _find_combined_mesh_candidates_under_root(self, root_node, mesh_transforms=None, progress_callback=None):
+        candidates = []
+        for mesh_transform in (mesh_transforms if mesh_transforms is not None else self._mesh_transforms_under_root(root_node)):
+            if progress_callback and progress_callback(mesh_transform):
+                return None
+            try:
+                info = self._combined_check_mesh_shells(mesh_transform)
+            except Exception:
+                continue
+            if not info:
+                continue
+            if info.get("meaningful_shell_count", 0) < 2:
+                continue
+            if (info.get("spread_ratio", 1.0) >= 1.35 or
+                    info.get("fill_ratio", 1.0) <= 0.75 or
+                    info.get("meaningful_shell_count", 0) >= 3):
+                long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
+                candidates.append((long_node, info))
+        return candidates
+
+    def _confirm_combined_meshes_before_hp_analysis(self, hp_main, lp_main=None):
+        progress_dlg = None
+        progress_step = [0]
+
+        def _make_progress(total):
+            dlg = QtWidgets.QProgressDialog(bg_l10n.text("Checking combined meshes..."), bg_l10n.text("Cancel"), 0, max(int(total), 1), self)
+            dlg.setWindowModality(QtCore.Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            dlg.setValue(0)
+            return dlg
+
+        def _update_progress(mesh_transform):
+            if not progress_dlg:
+                return False
+            progress_step[0] += 1
+            progress_dlg.setLabelText(
+                bg_l10n.text("Checking combined meshes: {name}").format(name=mesh_transform.split('|')[-1])
+            )
+            progress_dlg.setValue(min(progress_step[0], progress_dlg.maximum()))
+            progress_dlg.repaint()
+            QtWidgets.QApplication.processEvents()
+            return progress_dlg.wasCanceled()
+
+        def _close_progress():
+            if progress_dlg:
+                progress_dlg.close()
+
+        try:
+            roots = [("HP", hp_main)]
+            if lp_main and cmds.objExists(lp_main):
+                roots.append(("LP", lp_main))
+
+            root_meshes = []
+            total_meshes = 0
+            for label, root_node in roots:
+                if not root_node or not cmds.objExists(root_node):
+                    continue
+                mesh_transforms = self._mesh_transforms_under_root(root_node)
+                root_meshes.append((label, root_node, mesh_transforms))
+                total_meshes += len(mesh_transforms)
+
+            if total_meshes:
+                progress_dlg = _make_progress(total_meshes)
+
+            single_roots = []
+            combined = []
+            for label, root_node, mesh_transforms in root_meshes:
+                if len(mesh_transforms) == 1:
+                    single_roots.append((label, mesh_transforms[0]))
+                candidates = self._find_combined_mesh_candidates_under_root(root_node, mesh_transforms, _update_progress)
+                if candidates is None:
+                    _close_progress()
+                    self.log(bg_l10n.text("Combined mesh check canceled."), "orange")
+                    return False
+                if candidates:
+                    combined.append((label, candidates))
+        except Exception as exc:
+            _close_progress()
+            message = bg_l10n.text("Combined mesh check failed: {error}").format(error=exc)
+            cmds.warning(message)
+            self.log(message, "orange")
+            return True
+        finally:
+            _close_progress()
+
+        if not single_roots and not combined:
+            return True
+
+        problem_nodes = []
+        seen = set()
+        preview_lines = []
+        if single_roots:
+            preview_lines.append(bg_l10n.text("Single mesh root candidates:"))
+            for label, node in single_roots:
+                if node not in seen and cmds.objExists(node):
+                    problem_nodes.append(node)
+                    seen.add(node)
+                preview_lines.append("  {}: {}".format(label, node.split('|')[-1]))
+        if combined:
+            preview_lines.append(bg_l10n.text("Combined mesh candidates:"))
+            for label, candidates in combined:
+                preview_lines.append(
+                    bg_l10n.text("{label}: {count} combined mesh candidate(s)").format(
+                        label=label,
+                        count=len(candidates)
+                    )
+                )
+                for node, info in candidates[:8]:
+                    if node not in seen and cmds.objExists(node):
+                        problem_nodes.append(node)
+                        seen.add(node)
+                    preview_lines.append(
+                        "  {} | shells={} | spread={:.2f} | fill={:.2f}".format(
+                            node.split('|')[-1],
+                            info.get("meaningful_shell_count", 0),
+                            info.get("spread_ratio", 0.0),
+                            info.get("fill_ratio", 0.0)
+                        )
+                    )
+                if len(candidates) > 8:
+                    preview_lines.append("  ... +{} more".format(len(candidates) - 8))
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Combined Meshes Found"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText(bg_l10n.text("Combined mesh candidates were found before Analyze HP."))
+        box.setInformativeText(
+            "{}\n\n{}".format(
+                bg_l10n.text("These meshes may need to be separated before analysis. Select them now, or skip this warning and continue."),
+                "\n".join(preview_lines)
+            )
+        )
+        select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
+        skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
+        bg_l10n.localize_widget_tree(box)
+        box.setDefaultButton(select_btn)
+        box.exec_()
+
+        if box.clickedButton() == select_btn:
+            if problem_nodes:
+                cmds.select(problem_nodes, replace=True)
+                message = bg_l10n.text("Analyze HP paused: selected {count} combined mesh candidate(s).").format(
+                    count=len(problem_nodes)
+                )
+                self.log(message, "orange")
+                cmds.warning(message)
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action(
+                    "Combined mesh check failed",
+                    "Analyze HP | candidates={}".format(len(problem_nodes))
+                )
+            return False
+
+        return box.clickedButton() == skip_btn
+
+    def _duplicate_check_bbox_key(self, mesh_transform, tolerance):
+        try:
+            values = cmds.exactWorldBoundingBox(mesh_transform)
+        except Exception:
+            values = cmds.xform(mesh_transform, query=True, boundingBox=True, worldSpace=True) or []
+        if not values:
+            return None
+        scale = 1.0 / max(float(tolerance), 0.000001)
+        return tuple(int(round(float(value) * scale)) for value in values)
+
+    def _duplicate_check_meshes_identical(self, data_a, data_b, tolerance):
+        points_a = data_a.get('points')
+        points_b = data_b.get('points')
+        if points_a is None or points_b is None or len(points_a) != len(points_b):
+            return False
+        for point_a, point_b in zip(points_a, points_b):
+            if (abs(point_a.x - point_b.x) > tolerance or
+                    abs(point_a.y - point_b.y) > tolerance or
+                    abs(point_a.z - point_b.z) > tolerance):
+                return False
+        return True
+
+    def _duplicate_check_connected_components(self, adjacency):
+        visited = set()
+        components = []
+        for node in adjacency.keys():
+            if node in visited:
+                continue
+            stack = [node]
+            component = []
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                component.append(current)
+                for neighbor in adjacency.get(current, []):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+            components.append(component)
+        return components
+
+    def _find_duplicate_mesh_groups_under_root(self, root_node, tolerance=0.001):
+        if not root_node or not cmds.objExists(root_node):
+            return []
+
+        mesh_transforms = self._mesh_transforms_under_root(root_node)
+        buckets = {}
+        mesh_data = {}
+        for mesh_transform in mesh_transforms:
+            shape = self._duplicate_check_shape(mesh_transform)
+            if not shape:
+                continue
+            dag_path = self._duplicate_check_dag_path(shape)
+            if not dag_path:
+                continue
+            try:
+                mesh_fn = om.MFnMesh(dag_path)
+                vertex_count = mesh_fn.numVertices
+                polygon_count = mesh_fn.numPolygons
+                if vertex_count <= 0:
+                    continue
+                bbox_key = self._duplicate_check_bbox_key(mesh_transform, tolerance)
+                if bbox_key is None:
+                    continue
+                long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
+                mesh_data[long_node] = {
+                    'points': mesh_fn.getPoints(om.MSpace.kWorld)
+                }
+                buckets.setdefault((vertex_count, polygon_count, bbox_key), []).append(long_node)
+            except Exception:
+                continue
+
+        duplicate_groups = []
+        for bucket in buckets.values():
+            if len(bucket) < 2:
+                continue
+            adjacency = dict((node, []) for node in bucket)
+            for index_a in range(len(bucket)):
+                node_a = bucket[index_a]
+                for index_b in range(index_a + 1, len(bucket)):
+                    node_b = bucket[index_b]
+                    if self._duplicate_check_meshes_identical(mesh_data[node_a], mesh_data[node_b], tolerance):
+                        adjacency[node_a].append(node_b)
+                        adjacency[node_b].append(node_a)
+            for component in self._duplicate_check_connected_components(adjacency):
+                if len(component) > 1:
+                    duplicate_groups.append(component)
+        return duplicate_groups
+
+    def _confirm_duplicate_meshes_before_hp_analysis(self, hp_main, lp_main=None):
+        try:
+            roots = [("HP", hp_main)]
+            if lp_main and cmds.objExists(lp_main):
+                roots.append(("LP", lp_main))
+
+            found = []
+            for label, root_node in roots:
+                groups = self._find_duplicate_mesh_groups_under_root(root_node)
+                if groups:
+                    found.append((label, groups))
+        except Exception as exc:
+            message = bg_l10n.text("Duplicate mesh check failed: {error}").format(error=exc)
+            cmds.warning(message)
+            self.log(message, "orange")
+            return True
+
+        if not found:
+            return True
+
+        duplicate_meshes = []
+        seen = set()
+        preview_lines = []
+        for label, groups in found:
+            mesh_count = sum(len(group) for group in groups)
+            preview_lines.append(
+                bg_l10n.text("{label}: {groups} duplicate group(s), {meshes} mesh(es)").format(
+                    label=label,
+                    groups=len(groups),
+                    meshes=mesh_count
+                )
+            )
+            for group_index, group in enumerate(groups[:4], 1):
+                names = [node.split('|')[-1] for node in group[:5]]
+                if len(group) > 5:
+                    names.append("... +{} more".format(len(group) - 5))
+                preview_lines.append("  {} {}: {}".format(bg_l10n.text("Group"), group_index, ", ".join(names)))
+            if len(groups) > 4:
+                preview_lines.append("  ... +{} more".format(len(groups) - 4))
+            for group in groups:
+                for node in group:
+                    if node not in seen and cmds.objExists(node):
+                        duplicate_meshes.append(node)
+                        seen.add(node)
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Duplicate Meshes Found"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText(bg_l10n.text("Duplicate meshes were found before Analyze HP."))
+        box.setInformativeText(
+            "{}\n\n{}".format(
+                bg_l10n.text("Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue."),
+                "\n".join(preview_lines)
+            )
+        )
+        select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
+        skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
+        bg_l10n.localize_widget_tree(box)
+        box.setDefaultButton(select_btn)
+        box.exec_()
+
+        if box.clickedButton() == select_btn:
+            if duplicate_meshes:
+                cmds.select(duplicate_meshes, replace=True)
+                message = bg_l10n.text("Analyze HP paused: selected {count} duplicate mesh(es).").format(
+                    count=len(duplicate_meshes)
+                )
+                self.log(message, "orange")
+                cmds.warning(message)
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action(
+                    "Duplicate mesh check failed",
+                    "Analyze HP | duplicates={}".format(len(duplicate_meshes))
+                )
+            return False
+
+        return box.clickedButton() == skip_btn
+
     def run_hp_analysis(self, _):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
@@ -158,6 +596,12 @@ class HPAnalysisMixin:
             return
 
         if not self.validate_frozen_transforms([hp_main], [hp_main], bg_l10n.text("Analyze HP")):
+            return
+
+        if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
+            return
+
+        if not self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main):
             return
 
         if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
@@ -1914,7 +2358,7 @@ class FinalViewMixin:
             btn_vis.setFixedSize(30, 24)
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.setFocusPolicy(QtCore.Qt.NoFocus)
-            btn_vis.clicked.connect(lambda checked=False, h=hp_nodes, b=btn_vis: self.toggle_final_hp_vis(h, b))
+            btn_vis.clicked.connect(lambda checked=False, h=hp_nodes, b=btn_vis: self.run_undoable_bg_action("Final HP Visibility", self.toggle_final_hp_vis, h, b))
             row_layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(display_name)
@@ -1925,7 +2369,7 @@ class FinalViewMixin:
                 btn_name.setStyleSheet("background-color: transparent; text-align: left; padding-left: 5px;")
             btn_name.clicked.connect(lambda checked=False, n=display_name: self.set_final_row_selected(n, checked, from_click=True))
             btn_name.doubleClicked.connect(lambda checked=False, n=display_name: self.select_final_hp_nodes(n))
-            btn_name.rightClicked.connect(lambda checked=False, n=display_name: self.show_final_row_context_menu(n))
+            btn_name.rightClicked.connect(lambda checked=False, n=display_name: self.run_undoable_bg_action("Rename Final Group", self.show_final_row_context_menu, n))
             row_layout.addWidget(btn_name, stretch=1)
 
             combo = QtWidgets.QComboBox()
@@ -1938,7 +2382,7 @@ class FinalViewMixin:
             cached_level = self.final_smooth_states.get(display_name, 2)
             combo.setCurrentIndex(cached_level)
             combo.currentIndexChanged.connect(lambda idx, prefix=full_prefix, name=display_name, c=combo:
-                                               self.on_final_smooth_combo_changed(name, idx, prefix, c))
+                                               self.run_undoable_bg_action("Final Smooth Level", self.on_final_smooth_combo_changed, name, idx, prefix, c))
             row_layout.addWidget(combo)
 
             btn_smooth_up = QtWidgets.QPushButton(bg_l10n.text("+"))
@@ -2875,7 +3319,7 @@ class SceneInteractionMixin:
         if action == run_action:
             self.find_zbrush_meshes()
         elif action == add_to_layer_action:
-            self.add_selected_zbrush_meshes_to_layer()
+            self.run_undoable_bg_action("Add ZBrush Layer Meshes", self.add_selected_zbrush_meshes_to_layer)
 
     def _find_zbrush_display_layers(self):
         layers = cmds.ls(type="displayLayer") or []
@@ -3619,7 +4063,7 @@ class TOCMixin:
         menu.addAction(act_sel)
 
         act_group = QAction("Group into Book (Ctrl+G)", self)
-        act_group.triggered.connect(self.group_selected_into_book)
+        act_group.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Group into Book", self.group_selected_into_book))
         menu.addAction(act_group)
 
         existing_books = sorted(list(set([p.get('book') for p in self.root_pairs if p.get('book')])))
@@ -3628,16 +4072,16 @@ class TOCMixin:
             add_to_menu.setStyleSheet("QMenu { background-color: #242424; color: #ddd; border: 1px solid #444; } QMenu::item:selected { background-color: #3e3e3e; }")
             for b_name in existing_books:
                 action = QAction(b_name, self)
-                action.triggered.connect(lambda checked=False, b=b_name: self.add_selected_to_existing_book(b))
+                action.triggered.connect(lambda checked=False, b=b_name: self.run_undoable_bg_action("Add to Book", self.add_selected_to_existing_book, b))
                 add_to_menu.addAction(action)
 
         act_ungroup = QAction("Extract from the book", self)
-        act_ungroup.triggered.connect(self.ungroup_toc_items)
+        act_ungroup.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Extract from Book", self.ungroup_toc_items))
         menu.addAction(act_ungroup)
 
         menu.addSeparator()
         act_del = QAction("Delete Selection", self)
-        act_del.triggered.connect(self.delete_toc_items)
+        act_del.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Delete TOC Selection", self.delete_toc_items))
         menu.addAction(act_del)
 
         bg_l10n.localize_menu(menu)

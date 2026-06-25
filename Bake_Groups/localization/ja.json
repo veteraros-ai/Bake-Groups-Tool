@@ -58,6 +58,24 @@
                   "Freeze Transformations failed: {error}":  "Freeze Transformationsに失敗しました: {error}",
                   "Freeze Transformations did not clear all invalid transforms.":  "Freeze Transformationsですべての問題あるtransformを解消できませんでした。",
                   "Invalid transforms":  "未フリーズのtransform",
+                  "Duplicate Meshes Found":  "重複メッシュが見つかりました",
+                  "Duplicate meshes were found before Analyze HP.":  "Analyze HP の前に重複メッシュが見つかりました。",
+                  "Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue.":  "Analyze HP を実行する前に重複を修正してください。見つかったメッシュを選択するか、この警告をスキップして続行できます。",
+                  "{label}: {groups} duplicate group(s), {meshes} mesh(es)":  "{label}: 重複グループ {groups}、メッシュ {meshes}",
+                  "Analyze HP paused: selected {count} duplicate mesh(es).":  "Analyze HP を一時停止しました: 重複メッシュ {count} 個を選択しました。",
+                  "Duplicate mesh check failed: {error}":  "重複メッシュチェックに失敗しました: {error}",
+                  "Group":  "グループ",
+                  "Combined Meshes Found":  "結合メッシュが見つかりました",
+                  "Combined mesh candidates were found before Analyze HP.":  "Analyze HP の前に結合メッシュ候補が見つかりました。",
+                  "These meshes may need to be separated before analysis. Select them now, or skip this warning and continue.":  "解析前に分離が必要な可能性があります。今すぐ選択するか、この警告をスキップして続行できます。",
+                  "Single mesh root candidates:":  "単一メッシュ root 候補:",
+                  "Combined mesh candidates:":  "結合メッシュ候補:",
+                  "{label}: {count} combined mesh candidate(s)":  "{label}: 結合メッシュ候補 {count}",
+                  "Analyze HP paused: selected {count} combined mesh candidate(s).":  "Analyze HP を一時停止しました: 結合メッシュ候補 {count} 個を選択しました。",
+                  "Combined mesh check failed: {error}":  "結合メッシュチェックに失敗しました: {error}",
+                  "Checking combined meshes...":  "結合メッシュをチェック中...",
+                  "Checking combined meshes: {name}":  "結合メッシュをチェック中: {name}",
+                  "Combined mesh check canceled.":  "結合メッシュチェックをキャンセルしました。",
                   "Analyze HP":  "HP解析",
                   "Create Pair":  "ペアを作成",
                   "Algorithm":  "アルゴリズム",
@@ -211,7 +229,11 @@
                   "What\u0027s New in {version}":  "{version} の変更点",
                   "Update check is already running.":  "更新確認はすでに実行中です。",
                   "Zip Files (*.zip);;All Files (*)":  "ZIPファイル (*.zip);;すべてのファイル (*)",
-                  "Save Support Package":  "サポートパッケージを保存"
+                  "Save Support Package":  "サポートパッケージを保存",
+                  "Undo BG":  "BG取消",
+                  "Maya undo failed: {error}":  "Maya の取り消しに失敗しました: {error}",
+                  "Undone Bake Groups action: {action}":  "Bake Groups 操作を取り消しました: {action}",
+                  "No Bake Groups action to undo.":  "取り消す Bake Groups 操作がありません。"
               },
     "tooltips":  {
                      "Lock subgroup":  "このサブグループをロックし、HP解析とLPメッシュ割り当てで再構築されないようにします。",
@@ -313,6 +335,7 @@
                      "Groups Hid/M":  "現在の材質セクションで一部のサブグループが非表示です。クリックすると全材質セクションを再表示します。",
                      "Algorithm":  "Analyze HP用の自動HPグループ化設定です。",
                      "Groups Hid":  "一部のサブグループが非表示です。クリックすると全サブグループを表示します。",
-                     "Groups Vis/M":  "材質表示フィルターが有効です。クリックすると全材質セクションを再表示します。"
+                     "Groups Vis/M":  "材質表示フィルターが有効です。クリックすると全材質セクションを再表示します。",
+                     "Undo BG":  "最後の軽量な Bake Groups 操作を取り消します。Analyze HP、Assign LP、エクスポート、Combine Fin、Color Groups は対象外です。"
                  }
 }

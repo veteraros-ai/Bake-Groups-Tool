@@ -58,6 +58,24 @@
                   "Freeze Transformations failed: {error}":  "Freeze Transformations не выполнен: {error}",
                   "Freeze Transformations did not clear all invalid transforms.":  "Freeze Transformations не исправил все проблемные transform.",
                   "Invalid transforms":  "Незамороженные transform",
+                  "Duplicate Meshes Found":  "Найдены дубли мешей",
+                  "Duplicate meshes were found before Analyze HP.":  "Перед Analyze HP найдены дубли мешей.",
+                  "Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue.":  "Исправьте дубли перед запуском Analyze HP. Можно выделить найденные меши сейчас или пропустить предупреждение и продолжить.",
+                  "{label}: {groups} duplicate group(s), {meshes} mesh(es)":  "{label}: групп дублей: {groups}, мешей: {meshes}",
+                  "Analyze HP paused: selected {count} duplicate mesh(es).":  "Analyze HP остановлен: выделено дублей мешей: {count}.",
+                  "Duplicate mesh check failed: {error}":  "Проверка дублей мешей не выполнена: {error}",
+                  "Group":  "Группа",
+                  "Combined Meshes Found":  "Найдены скомбайненные меши",
+                  "Combined mesh candidates were found before Analyze HP.":  "Перед Analyze HP найдены кандидаты на скомбайненные меши.",
+                  "These meshes may need to be separated before analysis. Select them now, or skip this warning and continue.":  "Эти меши, возможно, нужно разбить перед анализом. Можно выделить их сейчас или пропустить предупреждение и продолжить.",
+                  "Single mesh root candidates:":  "Root с одним мешем:",
+                  "Combined mesh candidates:":  "Кандидаты на скомбайненные меши:",
+                  "{label}: {count} combined mesh candidate(s)":  "{label}: кандидатов на скомбайненные меши: {count}",
+                  "Analyze HP paused: selected {count} combined mesh candidate(s).":  "Analyze HP остановлен: выделено кандидатов на скомбайненные меши: {count}.",
+                  "Combined mesh check failed: {error}":  "Проверка скомбайненных мешей не выполнена: {error}",
+                  "Checking combined meshes...":  "Проверка скомбайненных мешей...",
+                  "Checking combined meshes: {name}":  "Проверка скомбайненных мешей: {name}",
+                  "Combined mesh check canceled.":  "Проверка скомбайненных мешей отменена.",
                   "Analyze HP":  "Анализ HP",
                   "Create Pair":  "Создать пару",
                   "Algorithm":  "Алгоритм",
@@ -211,7 +229,11 @@
                   "What\u0027s New in {version}":  "Что нового в {version}",
                   "Update check is already running.":  "Проверка обновлений уже выполняется.",
                   "Zip Files (*.zip);;All Files (*)":  "ZIP файлы (*.zip);;Все файлы (*)",
-                  "Save Support Package":  "Сохранить Support Package"
+                  "Save Support Package":  "Сохранить Support Package",
+                  "Undo BG":  "Отмена BG",
+                  "Maya undo failed: {error}":  "Maya undo не сработал: {error}",
+                  "Undone Bake Groups action: {action}":  "Отменено действие Bake Groups: {action}",
+                  "No Bake Groups action to undo.":  "Нет действия Bake Groups для отмены."
               },
     "tooltips":  {
                      "Lock subgroup":  "Заблокировать сабгруппу, чтобы Analyze HP и Assign LP Meshes не пересобирали ее.",
@@ -313,6 +335,7 @@
                      "Groups Hid/M":  "В активной материальной секции часть сабгрупп скрыта. Нажмите, чтобы снова показать все материалы.",
                      "Algorithm":  "Настройки автоматической группировки HP для Analyze HP.",
                      "Groups Hid":  "Часть сабгрупп скрыта. Нажмите, чтобы показать все сабгруппы активной главы.",
-                     "Groups Vis/M":  "Активен фильтр видимости по материалу. Нажмите, чтобы снова показать все материалы."
+                     "Groups Vis/M":  "Активен фильтр видимости по материалу. Нажмите, чтобы снова показать все материалы.",
+                     "Undo BG":  "Отменить последнее лёгкое действие Bake Groups. Analyze HP, Assign LP, экспорт, Combine Fin и Color Groups не входят."
                  }
 }

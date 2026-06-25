@@ -8,6 +8,7 @@ import uuid
 import contextlib
 import re
 import zipfile
+import copy
 from datetime import datetime
 
 import maya.cmds as cmds
@@ -102,8 +103,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self._dock_relayout_pending = False
         self._resize_relayout_pending = False
         self._shutdown_for_reload_done = False
+        self.bg_undo_stack = []
+        self._bg_undo_restoring = False
+        self._bg_undo_running = False
+        self._bg_undo_event_filter_app = None
 
         self.init_ui()
+        self.install_bg_undo_event_filter()
         self.apply_stylesheet()
         self.relax_dock_width_constraints()
         self.refresh_right_panel()
@@ -161,7 +167,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         btn_create_main = QtWidgets.QPushButton(" Create Pair from Picked")
         btn_create_main.setIcon(get_icon("add_group.png"))
         btn_create_main.setStyleSheet("background-color: #3f523f; font-weight: bold; padding: 8px;")
-        btn_create_main.clicked.connect(self.create_root_pair_from_picked)
+        btn_create_main.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create Pair", self.create_root_pair_from_picked))
         g_layout.addWidget(btn_create_main)
 
         tool_layout = QtWidgets.QHBoxLayout()
@@ -174,10 +180,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         self.btn_combine_mesh = QtWidgets.QPushButton("Combine")
         self.btn_combine_mesh.setStyleSheet("background-color: #3b5998;")
-        self.btn_combine_mesh.clicked.connect(self.tool_combine)
+        self.btn_combine_mesh.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Combine", self.tool_combine))
         self.btn_separate_mesh = QtWidgets.QPushButton("Separate")
         self.btn_separate_mesh.setStyleSheet("background-color: #8c6239;")
-        self.btn_separate_mesh.clicked.connect(self.tool_separate)
+        self.btn_separate_mesh.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Separate", self.tool_separate))
         self.btn_find_zbrush = QtWidgets.QPushButton("Find ZBrush")
         self.btn_find_zbrush.setStyleSheet("background-color: #d18c15; font-weight: bold;")
         self.btn_find_zbrush.clicked.connect(self.find_zbrush_meshes)
@@ -218,13 +224,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         v_layout = QtWidgets.QHBoxLayout()
         self.btn_toggle_hp = QtWidgets.QPushButton("HP Visible")
         self.btn_toggle_hp.setCheckable(True)
-        self.btn_toggle_hp.toggled.connect(lambda state: self.toggle_root_vis("HP", state))
+        self.btn_toggle_hp.toggled.connect(lambda state: self.run_undoable_bg_action("HP Visibility", self.toggle_root_vis, "HP", state))
         self.btn_toggle_lp = QtWidgets.QPushButton("LP Visible")
         self.btn_toggle_lp.setCheckable(True)
-        self.btn_toggle_lp.toggled.connect(lambda state: self.toggle_root_vis("LP", state))
+        self.btn_toggle_lp.toggled.connect(lambda state: self.run_undoable_bg_action("LP Visibility", self.toggle_root_vis, "LP", state))
         self.btn_toggle_groups = QtWidgets.QPushButton("Groups Vis")
         self.btn_toggle_groups.setCheckable(True)
-        self.btn_toggle_groups.toggled.connect(self.set_all_subgroups_vis)
+        self.btn_toggle_groups.toggled.connect(lambda state: self.run_undoable_bg_action("Groups Visibility", self.set_all_subgroups_vis, state))
         self.btn_toggle_groups.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.btn_toggle_groups.customContextMenuRequested.connect(self.show_groups_visibility_context_menu)
         v_layout.addWidget(self.btn_toggle_hp)
@@ -264,7 +270,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.btn_add = QtWidgets.QPushButton("Add to Act")
         self.btn_add.setFixedHeight(30)
         self.btn_add.setStyleSheet("background-color: #425c42; font-weight: bold;")
-        self.btn_add.clicked.connect(self.add_to_selected_subgroup_ui)
+        self.btn_add.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Add to Selected Group", self.add_to_selected_subgroup_ui))
 
         self.btn_combine_bake = QtWidgets.QPushButton("Combine Fin")
         self.btn_combine_bake.setFixedHeight(30)
@@ -280,7 +286,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.btn_toggle_view = QtWidgets.QPushButton("Final Group")
         self.btn_toggle_view.setFixedHeight(30)
         self.btn_toggle_view.setStyleSheet("background-color: #d35400; font-weight: bold;")
-        self.btn_toggle_view.clicked.connect(self.toggle_final_view)
+        self.btn_toggle_view.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Final Group", self.toggle_final_view))
 
         self.btn_process_final = QtWidgets.QPushButton("Export")
         self.btn_process_final.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -352,7 +358,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         self.shortcut_group = QShortcut(QtGui.QKeySequence("Ctrl+G"), self.toc_tree)
         self.shortcut_group.setContext(QtCore.Qt.WidgetShortcut)
-        self.shortcut_group.activated.connect(self.group_selected_into_book)
+        self.shortcut_group.activated.connect(lambda: self.run_undoable_bg_action("Group into Book", self.group_selected_into_book))
 
 
         self.shortcut_select_by_mesh = QShortcut(QtGui.QKeySequence("Ctrl+Shift+Z"), self)
@@ -533,7 +539,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.input_suffix.setMinimumWidth(70)
         btn_c_pair = QtWidgets.QPushButton("Create Group")
         btn_c_pair.setIcon(get_icon("add_group.png"))
-        btn_c_pair.clicked.connect(self.create_subgroup_pair)
+        btn_c_pair.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create Group", self.create_subgroup_pair))
         self.algo_group.addHeaderWidget(self.input_suffix, stretch=1)
         self.algo_group.addHeaderWidget(btn_c_pair)
 
@@ -645,6 +651,207 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.user_action_lines.append(line)
         if len(self.user_action_lines) > 500:
             self.user_action_lines = self.user_action_lines[-500:]
+
+    def _bg_undo_candidate_nodes(self):
+        nodes = set()
+        for pair in self.root_pairs or []:
+            try:
+                hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
+            except Exception:
+                hp_node, lp_node = None, None
+            for root in (hp_node, lp_node):
+                if root and cmds.objExists(root):
+                    long_root = (cmds.ls(root, long=True) or [root])[0]
+                    nodes.add(long_root)
+                    for child in (cmds.listRelatives(long_root, allDescendents=True, type='transform', fullPath=True) or []):
+                        if cmds.objExists(child):
+                            nodes.add(child)
+        for root in ("LP_Combine_BG", "Bake_Groups"):
+            if cmds.objExists(root):
+                long_root = (cmds.ls(root, long=True) or [root])[0]
+                nodes.add(long_root)
+                for child in (cmds.listRelatives(long_root, allDescendents=True, type='transform', fullPath=True) or []):
+                    if cmds.objExists(child):
+                        nodes.add(child)
+        return sorted(nodes)
+
+    def capture_bg_undo_snapshot(self):
+        visibility = {}
+        for node in self._bg_undo_candidate_nodes():
+            if not cmds.objExists(node):
+                continue
+            try:
+                visibility[node] = bool(cmds.getAttr(node + ".visibility"))
+            except Exception:
+                pass
+        return {
+            "root_pairs": copy.deepcopy(self.root_pairs),
+            "active_root_id": self.active_root_id,
+            "active_subgroup_name": self.active_subgroup_name,
+            "is_isolated": bool(getattr(self, 'is_isolated', False)),
+            "is_final_view": bool(getattr(self, 'is_final_view', False)),
+            "is_preview_active": bool(getattr(self, 'is_preview_active', False)),
+            "is_final_low_visible": bool(getattr(self, 'is_final_low_visible', False)),
+            "active_material_visibility_filter": getattr(self, 'active_material_visibility_filter', None),
+            "final_smooth_states": copy.deepcopy(getattr(self, 'final_smooth_states', {}) or {}),
+            "saved_subgroup_vis": copy.deepcopy(getattr(self, 'saved_subgroup_vis', {}) or {}),
+            "visibility": visibility,
+            "selection": cmds.ls(selection=True, long=True) or []
+        }
+
+    def restore_bg_undo_snapshot(self, snapshot):
+        self.root_pairs = copy.deepcopy(snapshot.get("root_pairs", []))
+        if hasattr(self.core, 'root_pairs'):
+            self.core.root_pairs = self.root_pairs
+        if hasattr(self.core, '_node_cache'):
+            self.core._node_cache.clear()
+        self.active_root_id = snapshot.get("active_root_id")
+        self.active_subgroup_name = snapshot.get("active_subgroup_name")
+        self.is_isolated = bool(snapshot.get("is_isolated", False))
+        self.is_final_view = bool(snapshot.get("is_final_view", False))
+        self.is_preview_active = bool(snapshot.get("is_preview_active", False))
+        self.is_final_low_visible = bool(snapshot.get("is_final_low_visible", False))
+        self.active_material_visibility_filter = snapshot.get("active_material_visibility_filter")
+        self.final_smooth_states = copy.deepcopy(snapshot.get("final_smooth_states", {}) or {})
+        self.saved_subgroup_vis = copy.deepcopy(snapshot.get("saved_subgroup_vis", {}) or {})
+        for node, state in (snapshot.get("visibility", {}) or {}).items():
+            if cmds.objExists(node):
+                try:
+                    cmds.setAttr(node + ".visibility", bool(state))
+                except Exception:
+                    pass
+        bg_core.BakeSessionModel.save(self.root_pairs)
+        self.refresh_right_panel()
+        self.refresh_left_panel()
+        pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+        if pair:
+            hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
+            if hp_node and lp_node:
+                self.sync_toggle_buttons(hp_node, lp_node)
+        selection = [node for node in (snapshot.get("selection", []) or []) if cmds.objExists(node)]
+        if selection:
+            cmds.select(selection, replace=True)
+        else:
+            cmds.select(clear=True)
+
+    def install_bg_undo_event_filter(self):
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return
+        try:
+            app.installEventFilter(self)
+            self._bg_undo_event_filter_app = app
+        except RuntimeError:
+            self._bg_undo_event_filter_app = None
+
+    def remove_bg_undo_event_filter(self):
+        app = getattr(self, '_bg_undo_event_filter_app', None)
+        if not app:
+            return
+        try:
+            app.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self._bg_undo_event_filter_app = None
+
+    def eventFilter(self, watched, event):
+        try:
+            event_type = event.type()
+        except Exception:
+            return super(BakeManagerUI, self).eventFilter(watched, event)
+        shortcut_types = (QtCore.QEvent.KeyPress, QtCore.QEvent.ShortcutOverride)
+        if event_type in shortcut_types and self.should_handle_bg_undo_shortcut(event):
+            if event_type == QtCore.QEvent.ShortcutOverride:
+                event.accept()
+                return True
+            self.undo_last_bg_action()
+            event.accept()
+            return True
+        return super(BakeManagerUI, self).eventFilter(watched, event)
+
+    def should_handle_bg_undo_shortcut(self, event):
+        if not getattr(self, 'bg_undo_stack', []):
+            return False
+        if getattr(self, '_bg_undo_restoring', False) or getattr(self, '_bg_undo_running', False):
+            return False
+        try:
+            if event.key() != QtCore.Qt.Key_Z:
+                return False
+            modifiers = event.modifiers()
+            if not (modifiers & QtCore.Qt.ControlModifier):
+                return False
+            if modifiers & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier):
+                return False
+        except Exception:
+            return False
+        focus = QtWidgets.QApplication.focusWidget()
+        if not self.is_bg_undo_focus_inside_window(focus):
+            return False
+        return not self.is_bg_undo_editable_focus(focus)
+
+    def is_bg_undo_focus_inside_window(self, focus):
+        if not focus:
+            return False
+        try:
+            return focus is self or self.isAncestorOf(focus)
+        except RuntimeError:
+            return False
+
+    def is_bg_undo_editable_focus(self, focus):
+        widget = focus
+        while widget and widget is not self:
+            if isinstance(widget, QtWidgets.QLineEdit) and not widget.isReadOnly():
+                return True
+            if isinstance(widget, (QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)) and not widget.isReadOnly():
+                return True
+            if isinstance(widget, QtWidgets.QAbstractSpinBox):
+                return True
+            if isinstance(widget, QtWidgets.QComboBox) and widget.isEditable():
+                return True
+            try:
+                widget = widget.parentWidget()
+            except RuntimeError:
+                return False
+        return False
+
+    def update_bg_undo_button(self):
+        pass
+
+    def run_undoable_bg_action(self, action_name, callback, *args, **kwargs):
+        if getattr(self, '_bg_undo_restoring', False) or getattr(self, '_bg_undo_running', False):
+            return callback(*args, **kwargs)
+        snapshot = self.capture_bg_undo_snapshot()
+        self._bg_undo_running = True
+        try:
+            chunk_name = "BG_{}".format(re.sub(r'[^A-Za-z0-9_]+', '_', str(action_name))[:48])
+            with bg_core.undo_chunk(chunk_name):
+                result = callback(*args, **kwargs)
+        finally:
+            self._bg_undo_running = False
+        self.bg_undo_stack.append({"action": str(action_name), "snapshot": snapshot})
+        if len(self.bg_undo_stack) > 20:
+            self.bg_undo_stack = self.bg_undo_stack[-20:]
+        self.update_bg_undo_button()
+        return result
+
+    def undo_last_bg_action(self):
+        if not getattr(self, 'bg_undo_stack', []):
+            self.log(bg_l10n.text("No Bake Groups action to undo."), "orange")
+            return
+        entry = self.bg_undo_stack.pop()
+        self._bg_undo_restoring = True
+        try:
+            try:
+                cmds.undo()
+            except Exception as exc:
+                self.log(bg_l10n.text("Maya undo failed: {error}").format(error=exc), "orange")
+            self.restore_bg_undo_snapshot(entry.get("snapshot", {}))
+        finally:
+            self._bg_undo_restoring = False
+            self.update_bg_undo_button()
+        message = bg_l10n.text("Undone Bake Groups action: {action}").format(action=entry.get("action", ""))
+        self.log(message, "lightgreen")
+        cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
 
     def _format_debug_names(self, names, limit=30):
         names = [str(n) for n in (names or [])]
@@ -1496,6 +1703,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             except:
                 pass
         self.script_jobs = []
+        self.remove_bg_undo_event_filter()
         self.update_worker = None
         self.update_dialog = None
         self.update_check_timer = None
@@ -1720,23 +1928,23 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             btn_vis = QtWidgets.QPushButton("Vis" if is_vis else "Hid")
             btn_vis.setFixedSize(30, 24)
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
-            btn_vis.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, b=btn_vis: self.toggle_subgroup_vis(h, l, b))
+            btn_vis.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, b=btn_vis: self.run_undoable_bg_action("Subgroup Visibility", self.toggle_subgroup_vis, h, l, b))
             btn_vis.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-            btn_vis.customContextMenuRequested.connect(lambda pos, h=hp_node, l=lp_node: self.isolate_subgroup_vis(h, l))
+            btn_vis.customContextMenuRequested.connect(lambda pos, h=hp_node, l=lp_node: self.run_undoable_bg_action("Isolate Subgroup Visibility", self.isolate_subgroup_vis, h, l))
             layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(ui_name)
             btn_name.setStyleSheet(self.subgroup_name_style(ui_name, is_active_subgroup))
             btn_name.clicked.connect(lambda checked=False, n=ui_name: self.set_active_subgroup(n))
             btn_name.doubleClicked.connect(lambda checked=False, h=hp_node, l=lp_node: self.select_meshes_in_group(h, l))
-            btn_name.rightClicked.connect(lambda checked=False, old_name=ui_name, h=hp_node, l=lp_node: self.rename_subgroup_ui(old_name, h, l))
+            btn_name.rightClicked.connect(lambda checked=False, old_name=ui_name, h=hp_node, l=lp_node: self.run_undoable_bg_action("Rename Group", self.rename_subgroup_ui, old_name, h, l))
             layout.addWidget(btn_name, stretch=1)
 
             btn_plus = QtWidgets.QPushButton("Add")
             btn_plus.setFixedSize(56, 24)
             btn_plus.setProperty("bg_no_tooltip", True)
             btn_plus.setStyleSheet(self.subgroup_add_button_style(is_active_subgroup))
-            btn_plus.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, pm_hp=hp_main, pm_lp=lp_main: self.add_to_groups_ui(h, l, pm_hp, pm_lp))
+            btn_plus.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, pm_hp=hp_main, pm_lp=lp_main: self.run_undoable_bg_action("Add to Group", self.add_to_groups_ui, h, l, pm_hp, pm_lp))
             layout.addWidget(btn_plus)
 
             btn_lock = QtWidgets.QPushButton()
@@ -1751,13 +1959,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             lock_tip_key = "Unlock subgroup" if is_locked else "Lock subgroup"
             btn_lock.setToolTip(bg_l10n.tooltip(lock_tip_key))
             btn_lock.setStatusTip(bg_l10n.tooltip(lock_tip_key))
-            btn_lock.clicked.connect(lambda checked=False, n=ui_name: self.toggle_lock(n))
+            btn_lock.clicked.connect(lambda checked=False, n=ui_name: self.run_undoable_bg_action("Toggle Group Lock", self.toggle_lock, n))
             layout.addWidget(btn_lock)
 
             btn_del = QtWidgets.QPushButton("X")
             btn_del.setFixedSize(24, 24)
             btn_del.setStyleSheet("background-color: #8c4242;")
-            btn_del.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, r_h=hp_main, r_l=lp_main: self.safe_delete_subgroup_ui(h, l, r_h, r_l))
+            btn_del.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, r_h=hp_main, r_l=lp_main: self.run_undoable_bg_action("Delete Group", self.safe_delete_subgroup_ui, h, l, r_h, r_l))
             layout.addWidget(btn_del)
 
             self.subgroups_layout.addWidget(frame)
@@ -2084,13 +2292,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         if slots:
             for slot in slots:
                 action = menu.addAction(bg_l10n.text("Only Show {slot}").format(slot=slot))
-                action.triggered.connect(lambda checked=False, s=slot: self.only_show_material_slot(s))
+                action.triggered.connect(lambda checked=False, s=slot: self.run_undoable_bg_action("Only Show Material Section", self.only_show_material_slot, s))
             menu.addSeparator()
         else:
             action = menu.addAction(bg_l10n.text("No material sections found"))
             action.setEnabled(False)
         show_all_action = menu.addAction(bg_l10n.text("Groups Vis"))
-        show_all_action.triggered.connect(lambda checked=False: self.set_all_subgroups_vis(True))
+        show_all_action.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Groups Visibility", self.set_all_subgroups_vis, True))
         menu.exec_(self.btn_toggle_groups.mapToGlobal(pos)) if hasattr(menu, 'exec_') else menu.exec(self.btn_toggle_groups.mapToGlobal(pos))
 
     def only_show_material_slot(self, slot):
@@ -2261,7 +2469,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
         action_optimize = menu.addAction("Optimize subgroups (delete empty)")
-        action_optimize.triggered.connect(self.optimize_subgroups)
+        action_optimize.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Optimize Groups", self.optimize_subgroups))
         action_select_by_mesh = menu.addAction("Group search by mesh (Ctrl+Shift+Z)")
         action_select_by_mesh.triggered.connect(self.select_subgroup_by_selected_mesh)
         menu.addSeparator()

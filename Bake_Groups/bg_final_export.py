@@ -122,6 +122,7 @@ class FinalExportProcessor(object):
         if not meshes:
             return meshes, None
 
+        FinalExportProcessor._cleanup_zero_transform_hp_export_temps()
         smooth_levels = smooth_levels or {}
         temp_root = cmds.group(em=True, name="BG_HP_Export_Zero_Temp#", world=True)
         temp_root = cmds.ls(temp_root, long=True)[0]
@@ -178,6 +179,23 @@ class FinalExportProcessor(object):
                 prepared.append(mesh)
 
         return prepared, temp_root
+
+    @staticmethod
+    def _cleanup_zero_transform_hp_export_temps(extra_nodes=None):
+        nodes = []
+        for node in extra_nodes or []:
+            if node and cmds.objExists(node):
+                nodes.append(node)
+        nodes.extend(cmds.ls("BG_HP_Export_Zero_Temp*", type='transform', long=True) or [])
+        seen = set()
+        for node in sorted(nodes, key=lambda n: n.count('|'), reverse=True):
+            if not node or node in seen or not cmds.objExists(node):
+                continue
+            seen.add(node)
+            try:
+                cmds.delete(node)
+            except Exception:
+                pass
 
 
     @staticmethod
@@ -471,6 +489,8 @@ class FinalExportProcessor(object):
         if not cmds.pluginInfo('fbxmaya', query=True, loaded=True):
             cmds.loadPlugin('fbxmaya')
 
+        FinalExportProcessor._cleanup_zero_transform_hp_export_temps()
+
         # Determine prefixes and smooth levels (support UI and Batch export)
         prefixes_to_process = []
         
@@ -661,14 +681,7 @@ class FinalExportProcessor(object):
             return False
         
         finally:
-            existing_temp_nodes = [node for node in reversed(temp_nodes) if node and cmds.objExists(node)]
-            if existing_temp_nodes:
-                for node in existing_temp_nodes:
-                    if cmds.objExists(node + ".visibility"):
-                        try:
-                            cmds.setAttr(node + ".visibility", False)
-                        except Exception:
-                            pass
+            FinalExportProcessor._cleanup_zero_transform_hp_export_temps(reversed(temp_nodes))
             cmds.select(clear=True)
             cmds.refresh(suspend=False)
             progress_dlg.close()

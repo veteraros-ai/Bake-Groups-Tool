@@ -58,6 +58,24 @@
                   "Freeze Transformations failed: {error}":  "Freeze Transformations failed: {error}",
                   "Freeze Transformations did not clear all invalid transforms.":  "Freeze Transformations did not clear all invalid transforms.",
                   "Invalid transforms":  "Invalid transforms",
+                  "Duplicate Meshes Found":  "Duplicate Meshes Found",
+                  "Duplicate meshes were found before Analyze HP.":  "Duplicate meshes were found before Analyze HP.",
+                  "Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue.":  "Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue.",
+                  "{label}: {groups} duplicate group(s), {meshes} mesh(es)":  "{label}: {groups} duplicate group(s), {meshes} mesh(es)",
+                  "Analyze HP paused: selected {count} duplicate mesh(es).":  "Analyze HP paused: selected {count} duplicate mesh(es).",
+                  "Duplicate mesh check failed: {error}":  "Duplicate mesh check failed: {error}",
+                  "Group":  "Group",
+                  "Combined Meshes Found":  "Combined Meshes Found",
+                  "Combined mesh candidates were found before Analyze HP.":  "Combined mesh candidates were found before Analyze HP.",
+                  "These meshes may need to be separated before analysis. Select them now, or skip this warning and continue.":  "These meshes may need to be separated before analysis. Select them now, or skip this warning and continue.",
+                  "Single mesh root candidates:":  "Single mesh root candidates:",
+                  "Combined mesh candidates:":  "Combined mesh candidates:",
+                  "{label}: {count} combined mesh candidate(s)":  "{label}: {count} combined mesh candidate(s)",
+                  "Analyze HP paused: selected {count} combined mesh candidate(s).":  "Analyze HP paused: selected {count} combined mesh candidate(s).",
+                  "Combined mesh check failed: {error}":  "Combined mesh check failed: {error}",
+                  "Checking combined meshes...":  "Checking combined meshes...",
+                  "Checking combined meshes: {name}":  "Checking combined meshes: {name}",
+                  "Combined mesh check canceled.":  "Combined mesh check canceled.",
                   "Analyze HP":  "Analyze HP",
                   "Create Pair":  "Create Pair",
                   "Algorithm":  "Algorithm",
@@ -211,7 +229,11 @@
                   "What\u0027s New in {version}":  "What\u0027s New in {version}",
                   "Update check is already running.":  "Update check is already running.",
                   "Zip Files (*.zip);;All Files (*)":  "Zip Files (*.zip);;All Files (*)",
-                  "Save Support Package":  "Save Support Package"
+                  "Save Support Package":  "Save Support Package",
+                  "Undo BG":  "Undo BG",
+                  "Maya undo failed: {error}":  "Maya undo failed: {error}",
+                  "Undone Bake Groups action: {action}":  "Undone Bake Groups action: {action}",
+                  "No Bake Groups action to undo.":  "No Bake Groups action to undo."
               },
     "tooltips":  {
                      "Lock subgroup":  "Lock this subgroup so Analyze HP and Assign LP Meshes do not rebuild it.",
@@ -313,6 +335,7 @@
                      "Groups Hid/M":  "Some subgroups in the active material section are hidden. Click to show all material sections again.",
                      "Algorithm":  "Automatic HP grouping settings for Analyze HP.",
                      "Groups Hid":  "Some subgroups are hidden. Click to show all subgroups in the active chapter.",
-                     "Groups Vis/M":  "Material visibility filter is active. Click to show all material sections again."
+                     "Groups Vis/M":  "Material visibility filter is active. Click to show all material sections again.",
+                     "Undo BG":  "Undo the last lightweight Bake Groups action. Analyze HP, Assign LP, export, Combine Fin, and Color Groups are excluded."
                  }
 }
