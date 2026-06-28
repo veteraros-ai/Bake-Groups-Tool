@@ -253,6 +253,25 @@ class FinalExportProcessor(object):
                         flags=re.IGNORECASE
                     )
 
+                def _is_old_chapter_lp_output(node, chapter_base):
+                    if not node or not cmds.objExists(node):
+                        return False
+                    if not cmds.listRelatives(node, shapes=True, type='mesh'):
+                        return False
+                    short_name = node.split('|')[-1].replace(".", "_")
+                    base = re.escape(chapter_base.replace(".", "_"))
+                    pattern = r'^{}(?:_.+)?_low\d*$'.format(base)
+                    return bool(re.match(pattern, short_name, re.IGNORECASE))
+
+                def _cleanup_old_chapter_lp_outputs(chapter_lp_root, chapter_base):
+                    old_outputs = [
+                        child for child in (cmds.listRelatives(chapter_lp_root, children=True, fullPath=True, type='transform') or [])
+                        if _is_old_chapter_lp_output(child, chapter_base)
+                    ]
+                    if old_outputs:
+                        cmds.delete(old_outputs)
+                    return len(old_outputs)
+
                 def _combine_lp_transforms(transforms, final_lp_name, chapter_lp_root):
                     if not transforms:
                         return False
@@ -295,6 +314,8 @@ class FinalExportProcessor(object):
                 if not cmds.objExists(chapter_lp_root):
                     grp = cmds.group(em=True, name=base_name)
                     cmds.parent(grp, global_lp_root, absolute=True)
+
+                _cleanup_old_chapter_lp_outputs(chapter_lp_root, base_name)
                 
                 for sg in lp_subgroups:
                     sg_name = _clean_lp_group_name(sg)

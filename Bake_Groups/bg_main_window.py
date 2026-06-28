@@ -107,6 +107,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self._bg_undo_restoring = False
         self._bg_undo_running = False
         self._bg_undo_event_filter_app = None
+        self._combined_check_skipped_chapters = set()
 
         self.init_ui()
         self.install_bg_undo_event_filter()
@@ -164,11 +165,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         lp_layout.addWidget(btn_pick_lp, stretch=1)
         g_layout.addLayout(lp_layout)
 
+        create_layout = QtWidgets.QHBoxLayout()
         btn_create_main = QtWidgets.QPushButton(" Create Pair from Picked")
         btn_create_main.setIcon(get_icon("add_group.png"))
         btn_create_main.setStyleSheet("background-color: #3f523f; font-weight: bold; padding: 8px;")
         btn_create_main.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create Pair", self.create_root_pair_from_picked))
-        g_layout.addWidget(btn_create_main)
+        create_layout.addWidget(btn_create_main)
+
+        self.btn_create_by_material = QtWidgets.QPushButton("Create by Mat")
+        self.btn_create_by_material.setStyleSheet("background-color: #4b5140; font-weight: bold; padding: 8px;")
+        self.btn_create_by_material.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create by Mat", self.create_root_pairs_by_material_from_picked))
+        create_layout.addWidget(self.btn_create_by_material)
+        g_layout.addLayout(create_layout)
 
         tool_layout = QtWidgets.QHBoxLayout()
         self.cb_color_subgroups = QtWidgets.QCheckBox("Color Groups")
@@ -559,6 +567,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.spin_threshold = QtWidgets.QSpinBox()
         self.spin_threshold.setRange(0, 100)
         self.spin_threshold.setValue(15)
+        self.spin_threshold.setFixedWidth(50)
         self.spin_collision_pct = self.spin_threshold
         grid.addWidget(self.spin_threshold, 0, 1)
 
@@ -571,19 +580,30 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.chk_material_slots.setChecked(False)
         grid.addWidget(self.chk_material_slots, 0, 3)
 
-        grid.addWidget(QtWidgets.QLabel("HP Link Vtx:"), 1, 0)
+        self.lbl_hp_link_vtx = QtWidgets.QLabel("HP Link Vtx:")
+        grid.addWidget(self.lbl_hp_link_vtx, 1, 0)
         self.spin_compound_link_verts = QtWidgets.QSpinBox()
         self.spin_compound_link_verts.setRange(1, 500)
         self.spin_compound_link_verts.setValue(8)
+        self.spin_compound_link_verts.setObjectName("HP Link Vtx:")
+        self.spin_compound_link_verts.setFixedWidth(50)
         grid.addWidget(self.spin_compound_link_verts, 1, 1)
 
-        grid.addWidget(QtWidgets.QLabel("HP Link Dist (%):"), 1, 2)
+        self.lbl_hp_link_dist = QtWidgets.QLabel("HP Link Dist (%):")
+        grid.addWidget(self.lbl_hp_link_dist, 1, 2)
         self.spin_compound_link_dist = QtWidgets.QDoubleSpinBox()
         self.spin_compound_link_dist.setRange(0.01, 25.0)
         self.spin_compound_link_dist.setDecimals(2)
         self.spin_compound_link_dist.setValue(0.1)
         self.spin_compound_link_dist.setSingleStep(0.05)
+        self.spin_compound_link_dist.setObjectName("HP Link Dist (%):")
+        self.spin_compound_link_dist.setFixedWidth(58)
         grid.addWidget(self.spin_compound_link_dist, 1, 3)
+
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 0)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 0)
 
         self.algo_group.addLayout(grid)
 
@@ -1495,14 +1515,30 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
     def refresh_subgroup_color_preview(self, reset_indices=False):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
+        if not self.active_chapter_has_subgroups():
+            return
         if reset_indices:
             self.subgroup_color_index_map = {}
         self.update_subgroup_colors()
 
+    def active_chapter_has_subgroups(self, pair=None):
+        pair = pair or next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+        if not pair:
+            return False
+        hp_main, _, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not cmds.objExists(hp_main):
+            return False
+        for child in cmds.listRelatives(hp_main, children=True, type='transform', fullPath=True) or []:
+            if not child or not cmds.objExists(child):
+                continue
+            if cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                continue
+            return True
+        return False
+
     def update_subgroup_colors(self):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
-        self.restore_subgroup_colors(clean_history=True)
         if not self.active_root_id:
             return
         if getattr(self, 'is_final_view', False):
@@ -1520,6 +1556,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
+        if not self.active_chapter_has_subgroups(pair):
+            return
+        self.restore_subgroup_colors(clean_history=True)
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         self.cleanup_subgroup_preview_color_sets([hp_main])
         group_names = []

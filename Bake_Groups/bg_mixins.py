@@ -261,13 +261,64 @@ class HPAnalysisMixin:
             "fill_ratio": fill_ratio
         }
 
+    def _combined_check_cache_key(self, mesh_transform):
+        shape = self._duplicate_check_shape(mesh_transform)
+        if not shape:
+            return None, None
+        try:
+            shape_uuid = (cmds.ls(shape, uuid=True) or [shape])[0]
+        except Exception:
+            shape_uuid = shape
+        try:
+            vertex_count = int(cmds.polyEvaluate(mesh_transform, vertex=True) or 0)
+            face_count = int(cmds.polyEvaluate(mesh_transform, face=True) or 0)
+        except Exception:
+            vertex_count = 0
+            face_count = 0
+        try:
+            bbox = cmds.exactWorldBoundingBox(mesh_transform)
+        except Exception:
+            bbox = cmds.xform(mesh_transform, query=True, boundingBox=True, worldSpace=True) or []
+        if not bbox:
+            bbox = [0.0] * 6
+        bbox_key = tuple(int(round(float(value) * 10000.0)) for value in bbox[:6])
+        return shape_uuid, (shape_uuid, vertex_count, face_count, bbox_key)
+
+    def _combined_check_mesh_shells_cached(self, mesh_transform):
+        long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
+        cache_id, cache_key = self._combined_check_cache_key(long_node)
+        if not cache_id or not cache_key:
+            return None, "miss"
+
+        cache = getattr(self, '_combined_mesh_check_cache', None)
+        if cache is None or not isinstance(cache, dict):
+            cache = {}
+            self._combined_mesh_check_cache = cache
+
+        cached = cache.get(cache_id)
+        if cached and cached.get("key") == cache_key:
+            cached["path"] = long_node
+            return cached.get("info"), "hit"
+
+        status = "stale" if cached else "miss"
+        info = self._combined_check_mesh_shells(long_node)
+        cache[cache_id] = {
+            "key": cache_key,
+            "info": info,
+            "path": long_node,
+            "name": long_node.split('|')[-1]
+        }
+        return info, status
+
     def _find_combined_mesh_candidates_under_root(self, root_node, mesh_transforms=None, progress_callback=None):
         candidates = []
+        stats = {"hit": 0, "miss": 0, "stale": 0}
         for mesh_transform in (mesh_transforms if mesh_transforms is not None else self._mesh_transforms_under_root(root_node)):
             if progress_callback and progress_callback(mesh_transform):
-                return None
+                return None, stats
             try:
-                info = self._combined_check_mesh_shells(mesh_transform)
+                info, cache_status = self._combined_check_mesh_shells_cached(mesh_transform)
+                stats[cache_status] = stats.get(cache_status, 0) + 1
             except Exception:
                 continue
             if not info:
@@ -279,11 +330,19 @@ class HPAnalysisMixin:
                     info.get("meaningful_shell_count", 0) >= 3):
                 long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
                 candidates.append((long_node, info))
-        return candidates
+        return candidates, stats
 
     def _confirm_combined_meshes_before_hp_analysis(self, hp_main, lp_main=None):
         progress_dlg = None
         progress_step = [0]
+        chapter_id = getattr(self, 'active_root_id', None)
+        skipped_chapters = getattr(self, '_combined_check_skipped_chapters', None)
+        if skipped_chapters is None:
+            skipped_chapters = set()
+            self._combined_check_skipped_chapters = skipped_chapters
+        if chapter_id and chapter_id in skipped_chapters:
+            self.log(bg_l10n.text("Combined mesh check skipped for this chapter."), "lightblue")
+            return True
 
         def _make_progress(total):
             dlg = QtWidgets.QProgressDialog(bg_l10n.text("Checking combined meshes..."), bg_l10n.text("Cancel"), 0, max(int(total), 1), self)
@@ -327,14 +386,18 @@ class HPAnalysisMixin:
 
             single_roots = []
             combined = []
+            cache_stats_total = {"hit": 0, "miss": 0, "stale": 0}
             for label, root_node, mesh_transforms in root_meshes:
                 if len(mesh_transforms) == 1:
                     single_roots.append((label, mesh_transforms[0]))
-                candidates = self._find_combined_mesh_candidates_under_root(root_node, mesh_transforms, _update_progress)
-                if candidates is None:
+                result = self._find_combined_mesh_candidates_under_root(root_node, mesh_transforms, _update_progress)
+                if result is None or result[0] is None:
                     _close_progress()
                     self.log(bg_l10n.text("Combined mesh check canceled."), "orange")
                     return False
+                candidates, cache_stats = result
+                for key, value in (cache_stats or {}).items():
+                    cache_stats_total[key] = cache_stats_total.get(key, 0) + int(value or 0)
                 if candidates:
                     combined.append((label, candidates))
         except Exception as exc:
@@ -345,6 +408,19 @@ class HPAnalysisMixin:
             return True
         finally:
             _close_progress()
+
+        cache_hits = cache_stats_total.get("hit", 0)
+        cache_misses = cache_stats_total.get("miss", 0)
+        cache_stale = cache_stats_total.get("stale", 0)
+        if cache_hits or cache_stale:
+            self.log(
+                bg_l10n.text("Combined mesh cache: cached={cached}, calculated={calculated}, stale={stale}.").format(
+                    cached=cache_hits,
+                    calculated=cache_misses + cache_stale,
+                    stale=cache_stale
+                ),
+                "lightblue" if cache_hits else "orange"
+            )
 
         if not single_roots and not combined:
             return True
@@ -389,14 +465,19 @@ class HPAnalysisMixin:
         box.setText(bg_l10n.text("Combined mesh candidates were found before Analyze HP."))
         box.setInformativeText(
             "{}\n\n{}".format(
-                bg_l10n.text("These meshes may need to be separated before analysis. Select them now, or skip this warning and continue."),
+                bg_l10n.text("These meshes may need to be separated before analysis. Select them, separate them now, or skip this warning and continue."),
                 "\n".join(preview_lines)
             )
         )
         select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
+        separate_btn = box.addButton(bg_l10n.text("Separate"), QtWidgets.QMessageBox.ActionRole)
+        skip_chapter_btn = box.addButton(bg_l10n.text("Skip This Chapter"), QtWidgets.QMessageBox.ActionRole)
         skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
         bg_l10n.localize_widget_tree(box)
         box.setDefaultButton(select_btn)
+        box.setWindowModality(QtCore.Qt.ApplicationModal)
+        box.raise_()
+        box.activateWindow()
         box.exec_()
 
         if box.clickedButton() == select_btn:
@@ -413,6 +494,31 @@ class HPAnalysisMixin:
                     "Analyze HP | candidates={}".format(len(problem_nodes))
                 )
             return False
+
+        if box.clickedButton() == separate_btn:
+            separated = self._separate_mesh_transforms(problem_nodes, select_result=True)
+            if separated:
+                message = bg_l10n.text("Combined mesh cleanup: separated {count} mesh part(s).").format(
+                    count=len(separated)
+                )
+                self.log(message, "lightgreen")
+                cmds.warning(message)
+                if hasattr(self, 'record_user_action'):
+                    self.record_user_action(
+                        "Separate Combined Meshes",
+                        "parts={}".format(len(separated))
+                    )
+                return True
+            self.log(bg_l10n.text("Combined mesh cleanup: nothing was separated."), "orange")
+            return False
+
+        if box.clickedButton() == skip_chapter_btn:
+            if chapter_id:
+                skipped_chapters.add(chapter_id)
+            self.log(bg_l10n.text("Combined mesh check skipped for this chapter."), "lightblue")
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action("Skip Combined Mesh Check", "chapter={}".format(chapter_id or "unknown"))
+            return True
 
         return box.clickedButton() == skip_btn
 
@@ -506,6 +612,42 @@ class HPAnalysisMixin:
                     duplicate_groups.append(component)
         return duplicate_groups
 
+    def _remove_duplicate_mesh_copies(self, found):
+        to_delete = []
+        skipped = []
+        kept = []
+        seen_delete = set()
+        for _label, groups in found:
+            for group in groups:
+                existing = [node for node in group if node and cmds.objExists(node)]
+                if len(existing) < 2:
+                    continue
+                existing = sorted(existing, key=lambda node: (len(node), node.lower()))
+                keep_node = existing[0]
+                kept.append(keep_node)
+                for node in existing[1:]:
+                    if node in seen_delete:
+                        continue
+                    child_transforms = cmds.listRelatives(node, children=True, fullPath=True, type='transform') or []
+                    if child_transforms:
+                        skipped.append(node)
+                        continue
+                    seen_delete.add(node)
+                    to_delete.append(node)
+
+        removed = 0
+        if to_delete:
+            with bg_core.undo_chunk("RemoveDuplicateMeshes"):
+                for node in to_delete:
+                    if not cmds.objExists(node):
+                        continue
+                    try:
+                        cmds.delete(node)
+                        removed += 1
+                    except Exception:
+                        skipped.append(node)
+        return removed, kept, skipped
+
     def _confirm_duplicate_meshes_before_hp_analysis(self, hp_main, lp_main=None):
         try:
             roots = [("HP", hp_main)]
@@ -557,11 +699,13 @@ class HPAnalysisMixin:
         box.setText(bg_l10n.text("Duplicate meshes were found before Analyze HP."))
         box.setInformativeText(
             "{}\n\n{}".format(
-                bg_l10n.text("Resolve duplicates before running Analyze HP. Select the found meshes now, or skip this warning and continue."),
+                bg_l10n.text("Resolve duplicates before running Analyze HP. Select the found meshes, remove extra copies, or skip this warning and continue."),
                 "\n".join(preview_lines)
             )
         )
         select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
+        destructive_role = getattr(QtWidgets.QMessageBox, "DestructiveRole", QtWidgets.QMessageBox.ActionRole)
+        remove_btn = box.addButton(bg_l10n.text("Remove Extra Copies"), destructive_role)
         skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
         bg_l10n.localize_widget_tree(box)
         box.setDefaultButton(select_btn)
@@ -582,6 +726,33 @@ class HPAnalysisMixin:
                 )
             return False
 
+        if box.clickedButton() == remove_btn:
+            removed, kept, skipped = self._remove_duplicate_mesh_copies(found)
+            if removed:
+                message = bg_l10n.text("Duplicate mesh cleanup: removed {removed} extra copy/copies, kept {kept}.").format(
+                    removed=removed,
+                    kept=len([node for node in kept if node and cmds.objExists(node)])
+                )
+                self.log(message, "lightgreen")
+                cmds.warning(message)
+                if hasattr(self, 'record_user_action'):
+                    self.record_user_action(
+                        "Remove Duplicate Meshes",
+                        "removed={} | skipped={}".format(removed, len(skipped))
+                    )
+            else:
+                self.log(bg_l10n.text("Duplicate mesh cleanup: nothing was removed."), "orange")
+            if skipped:
+                names = [node.split('|')[-1] for node in skipped[:8]]
+                self.log(
+                    bg_l10n.text("Duplicate mesh cleanup skipped {count} mesh(es): {names}").format(
+                        count=len(skipped),
+                        names=", ".join(names)
+                    ),
+                    "orange"
+                )
+            return True
+
         return box.clickedButton() == skip_btn
 
     def run_hp_analysis(self, _):
@@ -598,13 +769,13 @@ class HPAnalysisMixin:
         if not self.validate_frozen_transforms([hp_main], [hp_main], bg_l10n.text("Analyze HP")):
             return
 
-        if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
-            return
-
         if not self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main):
             return
 
         if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
+            return
+
+        if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
             return
 
         worker_params = self.gather_hp_worker_params()
@@ -2787,6 +2958,8 @@ class ExportMixin:
         if not hp_main or not lp_main:
             cmds.warning("Bake Groups: HP or LP root objects not found.")
             return
+        if not self.validate_combine_fin_lp_structure(hp_main, lp_main):
+            return
         result = bg_final_export.FinalExportProcessor.combine_all_subgroups(base_name, hp_main, lp_main, parent_window=self)
         self.refresh_left_panel()
         if not result or not result.get('success'):
@@ -2808,6 +2981,68 @@ class ExportMixin:
             pos='midCenter',
             fade=True
         )
+
+    def combine_fin_subgroup_names(self, root_node, suffix, expected_group=None):
+        result = set()
+        if not root_node or not cmds.objExists(root_node):
+            return result
+        suffix_re = re.escape(suffix) + r'\d*$'
+        for child in (cmds.listRelatives(root_node, children=True, fullPath=True, type='transform') or []):
+            if not child or not cmds.objExists(child):
+                continue
+            if cmds.listRelatives(child, shapes=True, fullPath=True, type='mesh', noIntermediate=True):
+                continue
+            if expected_group:
+                attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                if cmds.objExists(attr):
+                    try:
+                        if cmds.getAttr(attr) != expected_group:
+                            continue
+                    except Exception:
+                        pass
+            short_name = child.split('|')[-1].replace(".", "_")
+            clean_name = re.sub(suffix_re, '', short_name, flags=re.IGNORECASE).strip()
+            if clean_name:
+                result.add(clean_name)
+        return result
+
+    def validate_combine_fin_lp_structure(self, hp_main, lp_main):
+        hp_names = self.combine_fin_subgroup_names(hp_main, bg_core.BakeConfig.SUFFIX_HP, "HP")
+        lp_names = self.combine_fin_subgroup_names(lp_main, bg_core.BakeConfig.SUFFIX_LP, "LP")
+        missing_in_lp = sorted(hp_names - lp_names)
+        extra_in_lp = sorted(lp_names - hp_names)
+        if not missing_in_lp and not extra_in_lp:
+            return True
+
+        def _format_names(names, limit=12):
+            names = list(names or [])
+            if not names:
+                return "-"
+            shown = names[:limit]
+            text = ", ".join(shown)
+            if len(names) > limit:
+                text += ", +{}".format(len(names) - limit)
+            return text
+
+        message = bg_l10n.text("Combine Fin stopped: LP subgroup structure does not match HP.")
+        details = [
+            bg_l10n.text("Missing in LP: {names}").format(names=_format_names(missing_in_lp)),
+            bg_l10n.text("Extra in LP: {names}").format(names=_format_names(extra_in_lp)),
+            bg_l10n.text("Fix LP subgroups with Assign LP Meshes or rename/create matching LP subgroups before Combine Fin.")
+        ]
+        full_message = "{}\n\n{}".format(message, "\n".join(details))
+        self.log(full_message.replace("\n", " | "), "orange")
+        cmds.warning(full_message)
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(bg_l10n.text("LP Subgroup Structure Mismatch"))
+        box.setText(message)
+        box.setInformativeText("\n".join(details))
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        box.setStyleSheet("QMessageBox { background-color: #242424; color: white; } QPushButton { background-color: #333; padding: 5px; }")
+        box.exec_()
+        return False
 
 
 # ============================================================================
@@ -3512,6 +3747,1147 @@ class SceneInteractionMixin:
             self.picked_lp = node
             self.le_picked_lp.setText(short_name)
 
+    def _create_by_mat_short_name(self, name):
+        value = str(name or "").split('|')[-1].split(':')[-1].strip()
+        return value or "No_Material"
+
+    def _create_by_mat_safe_base(self, raw_name, used_names):
+        value = self._create_by_mat_short_name(raw_name)
+        value = re.sub(r'[^A-Za-z0-9_]+', '_', value).strip('_')
+        value = re.sub(r'_+', '_', value)
+        if not value:
+            value = "Material"
+        if not re.match(r'^[A-Za-z_]', value):
+            value = "Mat_{}".format(value)
+        value = re.sub(r'(_HP|_LP)$', '', value, flags=re.IGNORECASE).strip('_') or "Material"
+        base = value[:54]
+        existing_bases = set([str(p.get('base', '')) for p in self.root_pairs or []])
+        candidate = base
+        index = 2
+        while (
+            candidate in used_names or
+            candidate in existing_bases or
+            cmds.objExists(candidate + bg_core.BakeConfig.SUFFIX_HP) or
+            cmds.objExists(candidate + bg_core.BakeConfig.SUFFIX_LP)
+        ):
+            suffix = "_{:02d}".format(index)
+            candidate = "{}{}".format(base[:max(1, 54 - len(suffix))], suffix)
+            index += 1
+        used_names.add(candidate)
+        return candidate
+
+    def _create_by_mat_next_book_name(self):
+        existing = set([p.get('book') for p in self.root_pairs or [] if p.get('book')])
+        index = 1
+        while True:
+            name = "Book_{:02d}".format(index)
+            if name not in existing:
+                return name
+            index += 1
+
+    def _create_by_mat_material_signature(self, lp_node):
+        records = []
+        if hasattr(self, 'lp_material_records_for_node'):
+            records = self.lp_material_records_for_node(lp_node, include_faces=True)
+            if not records:
+                records = self.lp_material_records_for_node(lp_node, include_faces=False)
+        by_key = {}
+        for rec in records or []:
+            key = rec.get("key") or rec.get("material")
+            if not key:
+                continue
+            by_key.setdefault(key, self._create_by_mat_short_name(rec.get("material") or key))
+        if not by_key:
+            by_key["No_Material"] = "No_Material"
+        signature = tuple(sorted(by_key.keys(), key=lambda key: by_key.get(key, key).lower()))
+        labels = [by_key[key] for key in signature]
+        return signature, labels
+
+    def _create_by_mat_mesh_data(self, mesh_node):
+        data = bg_core.MeshDataManager.get_mesh_data(mesh_node)
+        if not data:
+            try:
+                bb = cmds.exactWorldBoundingBox(mesh_node)
+                center = [(bb[0] + bb[3]) * 0.5, (bb[1] + bb[4]) * 0.5, (bb[2] + bb[5]) * 0.5]
+                diag = ((bb[3] - bb[0]) ** 2 + (bb[4] - bb[1]) ** 2 + (bb[5] - bb[2]) ** 2) ** 0.5
+                data = {
+                    "name": mesh_node,
+                    "min": [bb[0], bb[1], bb[2]],
+                    "max": [bb[3], bb[4], bb[5]],
+                    "center": center,
+                    "diag": diag,
+                    "volume": max((bb[3] - bb[0]) * (bb[4] - bb[1]) * (bb[5] - bb[2]), 0.0)
+                }
+            except Exception:
+                return None
+        if "volume" not in data:
+            mn = data.get("min", [0.0, 0.0, 0.0])
+            mx = data.get("max", [0.0, 0.0, 0.0])
+            data["volume"] = max((mx[0] - mn[0]) * (mx[1] - mn[1]) * (mx[2] - mn[2]), 0.0)
+        if not data.get("sample_points"):
+            data["sample_points"] = self._create_by_mat_mesh_sample_points(mesh_node, 48) or self._create_by_mat_bbox_points(data)
+        return data
+
+    def _create_by_mat_bbox_points(self, data):
+        try:
+            mn = data.get("min")
+            mx = data.get("max")
+            center = data.get("center", [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5])
+            return [
+                [mn[0], mn[1], mn[2]], [mn[0], mn[1], mx[2]], [mn[0], mx[1], mn[2]], [mn[0], mx[1], mx[2]],
+                [mx[0], mn[1], mn[2]], [mx[0], mn[1], mx[2]], [mx[0], mx[1], mn[2]], [mx[0], mx[1], mx[2]],
+                [center[0], center[1], center[2]]
+            ]
+        except Exception:
+            return []
+
+    def _create_by_mat_mesh_sample_points(self, mesh_node, max_points=64):
+        if not om or not mesh_node or not cmds.objExists(mesh_node):
+            return []
+        try:
+            sel = om.MSelectionList()
+            sel.add(mesh_node)
+            dag = sel.getDagPath(0)
+            if dag.hasFn(om.MFn.kTransform):
+                dag.extendToShape()
+            mesh_fn = om.MFnMesh(dag)
+            points = mesh_fn.getPoints(om.MSpace.kWorld)
+            if len(points) == 0:
+                return []
+            total = len(points)
+            step = max(1, int(math.ceil(total / float(max(max_points, 1)))))
+            result = []
+            for index in range(0, total, step):
+                pnt = points[index]
+                result.append([pnt.x, pnt.y, pnt.z])
+                if len(result) >= max_points:
+                    break
+            return result
+        except Exception:
+            return []
+
+    def _create_by_mat_shell_sample_points(self, points, shell_verts, shell_faces, face_vertices, max_points=160):
+        result = []
+        try:
+            ordered_verts = sorted(shell_verts)
+            vert_budget = max(16, int(max_points * 0.55))
+            vert_step = max(1, int(math.ceil(len(ordered_verts) / float(max(vert_budget, 1)))))
+            for vertex_id in ordered_verts[::vert_step]:
+                pnt = points[vertex_id]
+                result.append([pnt.x, pnt.y, pnt.z])
+                if len(result) >= vert_budget:
+                    break
+
+            face_budget = max_points - len(result)
+            if face_budget > 0 and shell_faces:
+                face_step = max(1, int(math.ceil(len(shell_faces) / float(face_budget))))
+                for face_id in shell_faces[::face_step]:
+                    verts = face_vertices[face_id]
+                    if not verts:
+                        continue
+                    acc_x = acc_y = acc_z = 0.0
+                    for vertex_id in verts:
+                        pnt = points[vertex_id]
+                        acc_x += pnt.x
+                        acc_y += pnt.y
+                        acc_z += pnt.z
+                    inv = 1.0 / float(len(verts))
+                    result.append([acc_x * inv, acc_y * inv, acc_z * inv])
+                    if len(result) >= max_points:
+                        break
+        except Exception:
+            pass
+        return result
+
+    def _create_by_mat_lp_proxy_records(self, lp_node, signature, labels):
+        fallback_data = self._create_by_mat_mesh_data(lp_node)
+        fallback = [{
+            "lp_node": lp_node,
+            "signature": signature,
+            "labels": labels,
+            "data": fallback_data,
+            "node_data": fallback_data,
+            "signature_size": len(signature or []),
+            "face_count": 0,
+            "material_key": None
+        }] if fallback_data else []
+
+        if not om or not lp_node or not cmds.objExists(lp_node):
+            return fallback
+
+        try:
+            material_records = []
+            if hasattr(self, 'lp_material_records_for_node'):
+                material_records = self.lp_material_records_for_node(lp_node, include_faces=True) or []
+            use_material_regions = len([rec for rec in material_records if rec.get("faces")]) > 1
+
+            face_material = {}
+            if use_material_regions:
+                for rec in material_records:
+                    for face_id in rec.get("faces") or []:
+                        face_material[face_id] = rec
+
+            sel = om.MSelectionList()
+            sel.add(lp_node)
+            dag = sel.getDagPath(0)
+            if dag.hasFn(om.MFn.kTransform):
+                dag.extendToShape()
+
+            mesh_fn = om.MFnMesh(dag)
+            points = mesh_fn.getPoints(om.MSpace.kWorld)
+            counts, connects = mesh_fn.getVertices()
+            if len(counts) == 0:
+                return fallback
+
+            face_vertices = []
+            vertex_to_faces = {}
+            cursor = 0
+            for face_id, count in enumerate(counts):
+                verts = list(connects[cursor:cursor + count])
+                cursor += count
+                face_vertices.append(verts)
+                for vertex_id in verts:
+                    vertex_to_faces.setdefault(vertex_id, []).append(face_id)
+
+            visited_faces = set()
+            proxies = []
+            shell_index = 0
+
+            for start_face in range(len(face_vertices)):
+                if start_face in visited_faces:
+                    continue
+                start_rec = face_material.get(start_face)
+                start_key = start_rec.get("key") if start_rec else None
+                stack = [start_face]
+                visited_faces.add(start_face)
+                shell_faces = []
+                shell_verts = set()
+
+                while stack:
+                    face_id = stack.pop()
+                    shell_faces.append(face_id)
+                    for vertex_id in face_vertices[face_id]:
+                        shell_verts.add(vertex_id)
+                        for next_face in vertex_to_faces.get(vertex_id, []):
+                            if next_face in visited_faces:
+                                continue
+                            if use_material_regions:
+                                next_rec = face_material.get(next_face)
+                                next_key = next_rec.get("key") if next_rec else None
+                                if next_key != start_key:
+                                    continue
+                            visited_faces.add(next_face)
+                            stack.append(next_face)
+
+                if not shell_verts:
+                    continue
+
+                xs = [points[v].x for v in shell_verts]
+                ys = [points[v].y for v in shell_verts]
+                zs = [points[v].z for v in shell_verts]
+                mn = [min(xs), min(ys), min(zs)]
+                mx = [max(xs), max(ys), max(zs)]
+                size = [max(mx[i] - mn[i], 0.0) for i in range(3)]
+                center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
+                diag = math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2])
+                volume = max(size[0] * size[1] * size[2], 0.0)
+                sample_points = self._create_by_mat_shell_sample_points(points, shell_verts, shell_faces, face_vertices)
+                data = {
+                    "name": "{}::mat_proxy_{:03d}".format(lp_node, shell_index),
+                    "real_node": lp_node,
+                    "min": mn,
+                    "max": mx,
+                    "center": center,
+                    "diag": diag,
+                    "volume": volume,
+                    "sample_points": sample_points or self._create_by_mat_bbox_points({"min": mn, "max": mx, "center": center})
+                }
+                proxies.append({
+                    "lp_node": lp_node,
+                    "signature": signature,
+                    "labels": labels,
+                    "data": data,
+                    "node_data": fallback_data,
+                    "signature_size": len(signature or []),
+                    "face_count": len(shell_faces),
+                    "material_key": start_key
+                })
+                shell_index += 1
+
+            return proxies or fallback
+        except Exception as e:
+            self.log("Create by Mat: LP proxy build failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
+            return fallback
+
+    def _create_by_mat_intersection_volume(self, data_a, data_b):
+        try:
+            mn_a = data_a.get("min")
+            mx_a = data_a.get("max")
+            mn_b = data_b.get("min")
+            mx_b = data_b.get("max")
+            dx = max(0.0, min(mx_a[0], mx_b[0]) - max(mn_a[0], mn_b[0]))
+            dy = max(0.0, min(mx_a[1], mx_b[1]) - max(mn_a[1], mn_b[1]))
+            dz = max(0.0, min(mx_a[2], mx_b[2]) - max(mn_a[2], mn_b[2]))
+            return dx * dy * dz
+        except Exception:
+            return 0.0
+
+    def _create_by_mat_bbox_gap_distance(self, data_a, data_b):
+        try:
+            mn_a = data_a.get("min")
+            mx_a = data_a.get("max")
+            mn_b = data_b.get("min")
+            mx_b = data_b.get("max")
+            total = 0.0
+            for axis in range(3):
+                if mx_a[axis] < mn_b[axis]:
+                    delta = mn_b[axis] - mx_a[axis]
+                elif mx_b[axis] < mn_a[axis]:
+                    delta = mn_a[axis] - mx_b[axis]
+                else:
+                    delta = 0.0
+                total += delta * delta
+            return math.sqrt(total)
+        except Exception:
+            return 1e18
+
+    def _create_by_mat_point_sample_distance(self, data_a, data_b):
+        points_a = data_a.get("sample_points") or self._create_by_mat_bbox_points(data_a)
+        points_b = data_b.get("sample_points") or self._create_by_mat_bbox_points(data_b)
+        if not points_a or not points_b:
+            return 1e18
+        best_sq = 1e36
+        try:
+            for pa in points_a:
+                ax, ay, az = pa[0], pa[1], pa[2]
+                for pb in points_b:
+                    dx = ax - pb[0]
+                    dy = ay - pb[1]
+                    dz = az - pb[2]
+                    dist_sq = dx * dx + dy * dy + dz * dz
+                    if dist_sq < best_sq:
+                        best_sq = dist_sq
+            return math.sqrt(best_sq)
+        except Exception:
+            return 1e18
+
+    def _create_by_mat_hp_proxy_quick_score(self, hp_data, proxy):
+        lp_data = proxy.get("data") or {}
+        inter = self._create_by_mat_intersection_volume(hp_data, lp_data)
+        bbox_gap = self._create_by_mat_bbox_gap_distance(hp_data, lp_data)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        min_diag = max(min(hp_diag, lp_diag), 0.000001)
+        max_diag = max(hp_diag, lp_diag, 0.000001)
+        if inter <= 0.0 and bbox_gap > max(min_diag * 4.0, max_diag * 0.06):
+            return None
+        center_dist = bg_core.MathUtils.distance(hp_data.get("center", [0.0, 0.0, 0.0]), lp_data.get("center", [0.0, 0.0, 0.0]))
+        hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
+        overlap_hp = inter / hp_vol
+        gap_norm = bbox_gap / max(min_diag, max_diag * 0.01, 0.000001)
+        center_norm = center_dist / max_diag
+        size_ratio = min_diag / max_diag
+        score = (1600.0 if inter > 0.0 else 0.0) + (overlap_hp * 400.0) + (size_ratio * 30.0)
+        score -= gap_norm * 100.0
+        score -= center_norm * 20.0
+        return {
+            "quick_score": score,
+            "proxy": proxy
+        }
+
+    def _create_by_mat_hp_proxy_score(self, hp_data, proxy):
+        lp_data = proxy.get("data") or {}
+        inter = self._create_by_mat_intersection_volume(hp_data, lp_data)
+        bbox_gap = self._create_by_mat_bbox_gap_distance(hp_data, lp_data)
+        sample_dist = self._create_by_mat_point_sample_distance(hp_data, lp_data)
+        hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
+        lp_vol = max(float(lp_data.get("volume", 0.0) or 0.0), 0.000001)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        min_diag = max(min(hp_diag, lp_diag), 0.000001)
+        max_diag = max(hp_diag, lp_diag, 0.000001)
+        overlap_min = inter / max(min(hp_vol, lp_vol), 0.000001)
+        overlap_hp = inter / hp_vol
+        center_dist = bg_core.MathUtils.distance(hp_data.get("center", [0.0, 0.0, 0.0]), lp_data.get("center", [0.0, 0.0, 0.0]))
+        center_norm = center_dist / max_diag
+        sample_norm = sample_dist / max(min_diag, max_diag * 0.01, 0.000001)
+        gap_norm = bbox_gap / max(min_diag, max_diag * 0.01, 0.000001)
+        size_ratio = min_diag / max_diag
+
+        score = (overlap_min * 900.0) + (overlap_hp * 350.0) + (size_ratio * 45.0)
+        if inter > 0.0:
+            score += 1800.0
+        score -= sample_norm * 95.0
+        score -= gap_norm * 120.0
+        score -= center_norm * 18.0
+        if lp_diag > hp_diag * 18.0 and overlap_hp < 0.35:
+            score -= 80.0
+
+        confident = False
+        if inter > 0.0 and (overlap_hp >= 0.015 or sample_norm <= 1.75):
+            confident = True
+        elif bbox_gap <= max(min_diag * 0.35, max_diag * 0.005) and sample_norm <= 1.35:
+            confident = True
+
+        return {
+            "score": score,
+            "has_overlap": inter > 0.0,
+            "confident": confident,
+            "bbox_gap": bbox_gap,
+            "sample_dist": sample_dist,
+            "overlap_hp": overlap_hp,
+            "overlap_min": overlap_min,
+            "proxy": proxy
+        }
+
+    def _create_by_mat_bbox_contains_point(self, data, point, padding=0.0):
+        try:
+            mn = data.get("min")
+            mx = data.get("max")
+            return (
+                point[0] >= mn[0] - padding and point[0] <= mx[0] + padding and
+                point[1] >= mn[1] - padding and point[1] <= mx[1] + padding and
+                point[2] >= mn[2] - padding and point[2] <= mx[2] + padding
+            )
+        except Exception:
+            return False
+
+    def _create_by_mat_mark_container_proxies(self, proxies):
+        source_by_node = {}
+        for proxy in proxies or []:
+            lp_node = proxy.get("lp_node")
+            data = proxy.get("node_data") or proxy.get("data")
+            if not lp_node or not data:
+                continue
+            source_by_node.setdefault(lp_node, {
+                "data": data,
+                "signature_size": int(proxy.get("signature_size") or 0)
+            })
+
+        volumes = sorted([
+            float(info.get("data", {}).get("volume", 0.0) or 0.0)
+            for info in source_by_node.values()
+            if float(info.get("data", {}).get("volume", 0.0) or 0.0) > 0.0
+        ])
+        if volumes:
+            mid = len(volumes) // 2
+            median_volume = volumes[mid] if len(volumes) % 2 else (volumes[mid - 1] + volumes[mid]) * 0.5
+        else:
+            median_volume = 1.0
+
+        centers = []
+        for lp_node, info in source_by_node.items():
+            data = info.get("data") or {}
+            center = data.get("center")
+            if center:
+                centers.append((lp_node, center))
+
+        container_nodes = set()
+        total_centers = max(len(centers) - 1, 1)
+        for lp_node, info in source_by_node.items():
+            data = info.get("data") or {}
+            if int(info.get("signature_size") or 0) <= 1:
+                continue
+            volume = float(data.get("volume", 0.0) or 0.0)
+            diag = float(data.get("diag", 0.0) or 0.0)
+            padding = max(diag * 0.005, 0.000001)
+            inside_count = 0
+            for other_node, center in centers:
+                if other_node == lp_node:
+                    continue
+                if self._create_by_mat_bbox_contains_point(data, center, padding):
+                    inside_count += 1
+            inside_ratio = inside_count / float(total_centers)
+            if (
+                volume >= max(median_volume * 6.0, 0.000001)
+                and (inside_count >= 8 or inside_ratio >= 0.08)
+            ):
+                container_nodes.add(lp_node)
+
+        for proxy in proxies or []:
+            proxy["is_container"] = proxy.get("lp_node") in container_nodes
+        return len(container_nodes)
+
+    def _create_by_mat_hp_owner_score(self, hp_data, proxy, scene_diag):
+        lp_data = proxy.get("data") or {}
+        inter = self._create_by_mat_intersection_volume(hp_data, lp_data)
+        bbox_gap = self._create_by_mat_bbox_gap_distance(hp_data, lp_data)
+        sample_dist = self._create_by_mat_point_sample_distance(hp_data, lp_data)
+        hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
+        lp_vol = max(float(lp_data.get("volume", 0.0) or 0.0), 0.000001)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        min_diag = max(min(hp_diag, lp_diag), 0.000001)
+        max_diag = max(hp_diag, lp_diag, 0.000001)
+        overlap_hp = inter / hp_vol
+        overlap_lp = inter / lp_vol
+        size_ratio = min_diag / max_diag
+        near_scale = max(hp_diag * 0.25, lp_diag * 0.02, scene_diag * 0.001, 0.000001)
+        sample_norm = sample_dist / near_scale
+        gap_norm = bbox_gap / max(hp_diag * 0.25, lp_diag * 0.02, scene_diag * 0.001, 0.000001)
+        is_container = bool(proxy.get("is_container"))
+
+        score = overlap_hp * 1800.0
+        score += max(0.0, 1.0 - min(sample_norm, 1.0)) * 420.0
+        score += size_ratio * 120.0
+        score += overlap_lp * 80.0
+        if inter > 0.0:
+            score += 260.0
+        score -= gap_norm * 140.0
+        if lp_diag < hp_diag * 0.22 and overlap_hp < 0.12:
+            score -= 520.0
+        if is_container:
+            score -= 180.0
+            if overlap_hp < 0.16 and sample_norm > 0.75:
+                score -= 260.0
+
+        confident = False
+        if overlap_hp >= 0.10 and sample_norm <= 2.2:
+            confident = True
+        elif overlap_hp >= 0.04 and size_ratio >= 0.22 and sample_norm <= 1.25:
+            confident = True
+        elif not is_container and sample_norm <= 0.55 and bbox_gap <= max(hp_diag * 0.12, scene_diag * 0.0005):
+            confident = True
+        elif is_container and overlap_hp >= 0.22:
+            confident = True
+
+        strong = (
+            overlap_hp >= 0.22 or
+            (sample_norm <= 0.45 and size_ratio >= 0.12) or
+            (is_container and overlap_hp >= 0.35)
+        )
+
+        return {
+            "score": score,
+            "confident": confident,
+            "strong": strong,
+            "has_overlap": inter > 0.0,
+            "overlap_hp": overlap_hp,
+            "sample_dist": sample_dist,
+            "bbox_gap": bbox_gap,
+            "proxy": proxy
+        }
+
+    def _create_by_mat_hp_parent_score(self, child_data, parent_data, scene_diag):
+        child_diag = max(float(child_data.get("diag", 0.0) or 0.0), 0.000001)
+        parent_diag = max(float(parent_data.get("diag", 0.0) or 0.0), 0.000001)
+        if parent_diag <= child_diag * 1.25:
+            return None
+
+        inter = self._create_by_mat_intersection_volume(child_data, parent_data)
+        child_vol = max(float(child_data.get("volume", 0.0) or 0.0), 0.000001)
+        overlap_child = inter / child_vol
+        bbox_gap = self._create_by_mat_bbox_gap_distance(child_data, parent_data)
+        if inter <= 0.0 and bbox_gap > max(child_diag * 1.2, parent_diag * 0.08, scene_diag * 0.003):
+            return None
+        sample_dist = self._create_by_mat_point_sample_distance(child_data, parent_data)
+        near_limit = max(child_diag * 0.55, parent_diag * 0.035, scene_diag * 0.001, 0.000001)
+        if sample_dist > near_limit and bbox_gap > max(child_diag * 0.25, parent_diag * 0.01, scene_diag * 0.0005) and overlap_child < 0.12:
+            return None
+
+        score = max(0.0, 1.0 - min(sample_dist / near_limit, 1.0)) * 130.0
+        score += min(overlap_child, 1.0) * 95.0
+        score += min(parent_diag / max(child_diag, 0.000001), 8.0) * 4.0
+        if bbox_gap <= max(child_diag * 0.15, parent_diag * 0.008):
+            score += 25.0
+        return {
+            "score": score,
+            "sample_dist": sample_dist,
+            "bbox_gap": bbox_gap,
+            "overlap_child": overlap_child
+        }
+
+    def _create_by_mat_avg_sample_distance(self, source_data, target_data, max_source=96, max_target=128):
+        source_points = source_data.get("sample_points") or self._create_by_mat_bbox_points(source_data)
+        target_points = target_data.get("sample_points") or self._create_by_mat_bbox_points(target_data)
+        if not source_points or not target_points:
+            return 1e18
+        if len(source_points) > max_source:
+            step = max(1, int(math.ceil(len(source_points) / float(max_source))))
+            source_points = source_points[::step][:max_source]
+        if len(target_points) > max_target:
+            step = max(1, int(math.ceil(len(target_points) / float(max_target))))
+            target_points = target_points[::step][:max_target]
+        total = 0.0
+        count = 0
+        try:
+            for src in source_points:
+                best_sq = 1e36
+                sx, sy, sz = src[0], src[1], src[2]
+                for dst in target_points:
+                    dx = sx - dst[0]
+                    dy = sy - dst[1]
+                    dz = sz - dst[2]
+                    dist_sq = dx * dx + dy * dy + dz * dz
+                    if dist_sq < best_sq:
+                        best_sq = dist_sq
+                total += math.sqrt(max(best_sq, 0.0))
+                count += 1
+            return total / float(max(count, 1))
+        except Exception:
+            return 1e18
+
+    def _create_by_mat_lp_hp_audit_quick_score(self, proxy, hp_data, scene_diag):
+        lp_data = proxy.get("data") or {}
+        inter = self._create_by_mat_intersection_volume(lp_data, hp_data)
+        bbox_gap = self._create_by_mat_bbox_gap_distance(lp_data, hp_data)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        if inter <= 0.0 and bbox_gap > max(lp_diag * 0.75, hp_diag * 1.10, scene_diag * 0.004):
+            return None
+        lp_vol = max(float(lp_data.get("volume", 0.0) or 0.0), 0.000001)
+        hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
+        overlap_lp = inter / lp_vol
+        overlap_hp = inter / hp_vol
+        center_dist = bg_core.MathUtils.distance(lp_data.get("center", [0.0, 0.0, 0.0]), hp_data.get("center", [0.0, 0.0, 0.0]))
+        scale = max(lp_diag, hp_diag, scene_diag * 0.01, 0.000001)
+        gap_norm = bbox_gap / max(min(lp_diag, hp_diag), scene_diag * 0.001, 0.000001)
+        center_norm = center_dist / scale
+        score = overlap_lp * 700.0 + overlap_hp * 180.0
+        if inter > 0.0:
+            score += 160.0
+        score -= gap_norm * 70.0
+        score -= center_norm * 25.0
+        if proxy.get("is_container"):
+            score -= 220.0
+        return score
+
+    def _create_by_mat_lp_hp_audit_score(self, proxy, hp_data, scene_diag):
+        lp_data = proxy.get("data") or {}
+        inter = self._create_by_mat_intersection_volume(lp_data, hp_data)
+        bbox_gap = self._create_by_mat_bbox_gap_distance(lp_data, hp_data)
+        if inter <= 0.0:
+            lp_diag_pre = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+            hp_diag_pre = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+            if bbox_gap > max(lp_diag_pre * 0.55, hp_diag_pre * 0.85, scene_diag * 0.003):
+                return None
+        avg_dist = self._create_by_mat_avg_sample_distance(lp_data, hp_data)
+        lp_vol = max(float(lp_data.get("volume", 0.0) or 0.0), 0.000001)
+        hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        overlap_lp = inter / lp_vol
+        overlap_hp = inter / hp_vol
+        near_limit = max(lp_diag * 0.12, hp_diag * 0.08, scene_diag * 0.001, 0.000001)
+        avg_norm = avg_dist / near_limit
+        gap_norm = bbox_gap / max(lp_diag * 0.20, hp_diag * 0.20, scene_diag * 0.001, 0.000001)
+        score = overlap_lp * 1200.0 + overlap_hp * 260.0
+        score += max(0.0, 1.0 - min(avg_norm, 1.0)) * 620.0
+        if inter > 0.0:
+            score += 220.0
+        score -= gap_norm * 120.0
+        if hp_diag < lp_diag * 0.08 and overlap_lp < 0.10:
+            score -= 260.0
+        if proxy.get("is_container"):
+            score -= 320.0
+
+        strong = False
+        if not proxy.get("is_container"):
+            strong = (
+                overlap_lp >= 0.16 or
+                (overlap_lp >= 0.055 and avg_norm <= 1.25) or
+                (avg_norm <= 0.62 and bbox_gap <= max(lp_diag * 0.10, hp_diag * 0.10, scene_diag * 0.0005))
+            )
+        else:
+            strong = overlap_lp >= 0.35 and avg_norm <= 1.0
+        return {
+            "score": score,
+            "strong": strong,
+            "overlap_lp": overlap_lp,
+            "overlap_hp": overlap_hp,
+            "avg_distance": avg_dist,
+            "bbox_gap": bbox_gap,
+            "proxy": proxy
+        }
+
+    def _create_by_mat_best_bucket_lp_audit_score(self, bucket, hp_data, scene_diag):
+        if not bucket:
+            return 0.0
+        best_score = 0.0
+        quick_candidates = []
+        for proxy in bucket.get("lp_proxies", []) or []:
+            quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
+            if quick is None:
+                continue
+            quick_candidates.append((quick, proxy))
+        quick_candidates.sort(key=lambda item: item[0], reverse=True)
+        for _quick, proxy in quick_candidates[:16]:
+            result = self._create_by_mat_lp_hp_audit_score(proxy, hp_data, scene_diag)
+            if result:
+                best_score = max(best_score, float(result.get("score", 0.0) or 0.0))
+        return best_score
+
+    def create_root_pairs_by_material_from_picked(self):
+        if not self.picked_hp or not cmds.objExists(self.picked_hp):
+            return cmds.warning("Invalid HP node.")
+        if not self.picked_lp or not cmds.objExists(self.picked_lp):
+            return cmds.warning("Invalid LP node.")
+
+        if not self.validate_frozen_transforms(
+            [self.picked_hp, self.picked_lp],
+            [self.picked_hp, self.picked_lp],
+            bg_l10n.text("Create by Mat")
+        ):
+            return
+
+        hp_source = (cmds.ls(self.picked_hp, long=True) or [self.picked_hp])[0]
+        lp_source = (cmds.ls(self.picked_lp, long=True) or [self.picked_lp])[0]
+
+        progress = QtWidgets.QProgressDialog(bg_l10n.text("Creating chapters by LP materials..."), bg_l10n.text("Cancel"), 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            with bg_core.undo_chunk("CreateByMaterial"):
+                progress.setLabelText(bg_l10n.text("Preparing source meshes..."))
+                progress.setValue(5)
+                QtWidgets.QApplication.processEvents()
+
+                hp_meshes = self.prepare_meshes(hp_source, flatten=True)
+                lp_meshes = self.prepare_meshes(lp_source, flatten=True)
+                hp_meshes = [m for m in hp_meshes if m and cmds.objExists(m)]
+                lp_meshes = [m for m in lp_meshes if m and cmds.objExists(m)]
+
+                if not lp_meshes:
+                    self.log("Create by Mat: no LP meshes found.", "red")
+                    return
+                if not hp_meshes:
+                    self.log("Create by Mat: no HP meshes found.", "red")
+                    return
+
+                buckets_by_signature = {}
+                all_lp_proxies = []
+                total_lp = max(len(lp_meshes), 1)
+                for index, lp_node in enumerate(lp_meshes):
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    progress.setLabelText(bg_l10n.text("Scanning LP materials: {name}").format(name=lp_node.split('|')[-1]))
+                    progress.setValue(5 + int((index / float(total_lp)) * 25))
+                    QtWidgets.QApplication.processEvents()
+
+                    signature, labels = self._create_by_mat_material_signature(lp_node)
+                    bucket = buckets_by_signature.setdefault(signature, {
+                        "labels": labels,
+                        "lp_meshes": [],
+                        "lp_proxies": [],
+                        "hp_meshes": []
+                    })
+                    bucket["lp_meshes"].append(lp_node)
+                    proxies = self._create_by_mat_lp_proxy_records(lp_node, signature, labels)
+                    for proxy in proxies:
+                        proxy["bucket"] = bucket
+                        bucket["lp_proxies"].append(proxy)
+                        all_lp_proxies.append(proxy)
+
+                if not buckets_by_signature:
+                    self.log("Create by Mat: LP materials were not detected.", "red")
+                    return
+                self.log("Create by Mat: built {} LP match proxy region(s).".format(len(all_lp_proxies)), "lightblue")
+
+                ordered_buckets = []
+                used_bases = set()
+                for signature, bucket in sorted(buckets_by_signature.items(), key=lambda item: " ".join(item[1].get("labels", [])).lower()):
+                    labels = bucket.get("labels") or ["Material"]
+                    raw_base = "_".join([self._create_by_mat_short_name(label) for label in labels])
+                    bucket["base"] = self._create_by_mat_safe_base(raw_base, used_bases)
+                    bucket["signature"] = signature
+                    ordered_buckets.append(bucket)
+
+                container_count = self._create_by_mat_mark_container_proxies(all_lp_proxies)
+                if container_count:
+                    self.log("Create by Mat: detected {} large multi-material LP container(s).".format(container_count), "lightblue")
+
+                lp_diags = sorted([
+                    float((proxy.get("data") or {}).get("diag", 0.0) or 0.0)
+                    for proxy in all_lp_proxies
+                    if float((proxy.get("data") or {}).get("diag", 0.0) or 0.0) > 0.0
+                ])
+                hp_scene_diag_values = []
+                for hp_node in hp_meshes:
+                    hp_data = self._create_by_mat_mesh_data(hp_node)
+                    if hp_data:
+                        hp_scene_diag_values.append(float(hp_data.get("diag", 0.0) or 0.0))
+                scene_diag_values = sorted([v for v in (lp_diags + hp_scene_diag_values) if v > 0.0])
+                if scene_diag_values:
+                    mid = len(scene_diag_values) // 2
+                    scene_diag = scene_diag_values[mid] if len(scene_diag_values) % 2 else (scene_diag_values[mid - 1] + scene_diag_values[mid]) * 0.5
+                else:
+                    scene_diag = 1.0
+                if hp_scene_diag_values:
+                    hp_diags_sorted = sorted([v for v in hp_scene_diag_values if v > 0.0])
+                    mid = len(hp_diags_sorted) // 2
+                    median_hp_diag = hp_diags_sorted[mid] if len(hp_diags_sorted) % 2 else (hp_diags_sorted[mid - 1] + hp_diags_sorted[mid]) * 0.5
+                else:
+                    median_hp_diag = scene_diag
+
+                progress.setLabelText(bg_l10n.text("Resolving HP ownership from LP chapters..."))
+                progress.setValue(35)
+                QtWidgets.QApplication.processEvents()
+
+                low_confidence = 0
+                review_hp_meshes = []
+                review_examples = []
+                hp_records = {}
+                direct_count = 0
+                container_direct_count = 0
+                total_hp = max(len(hp_meshes), 1)
+                for index, hp_node in enumerate(hp_meshes):
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    progress.setValue(35 + int((index / float(total_hp)) * 22))
+                    QtWidgets.QApplication.processEvents()
+
+                    hp_data = self._create_by_mat_mesh_data(hp_node)
+                    if not hp_data:
+                        continue
+                    quick_scored = []
+                    for proxy in all_lp_proxies:
+                        metrics = self._create_by_mat_hp_proxy_quick_score(hp_data, proxy)
+                        if metrics:
+                            quick_scored.append(metrics)
+                    hp_records[hp_node] = {
+                        "data": hp_data,
+                        "bucket": None,
+                        "score": 0.0,
+                        "strong": False,
+                        "source": "unassigned",
+                        "has_overlap": False
+                    }
+                    if not quick_scored:
+                        continue
+                    quick_scored.sort(key=lambda item: item.get("quick_score", -1e18), reverse=True)
+                    scored = []
+                    for quick in quick_scored[:48]:
+                        metrics = self._create_by_mat_hp_owner_score(hp_data, quick.get("proxy"), scene_diag)
+                        scored.append(metrics)
+                    if not scored:
+                        continue
+                    scored.sort(key=lambda item: item.get("score", -1e18), reverse=True)
+                    non_container = [candidate for candidate in scored if candidate.get("confident") and not (candidate.get("proxy") or {}).get("is_container")]
+                    container = [candidate for candidate in scored if candidate.get("confident") and (candidate.get("proxy") or {}).get("is_container")]
+                    best = non_container[0] if non_container else None
+                    if best is None and container:
+                        best = container[0]
+                    if best is None:
+                        continue
+                    best_bucket = (best.get("proxy") or {}).get("bucket")
+                    if best_bucket is None:
+                        continue
+                    hp_records[hp_node].update({
+                        "bucket": best_bucket,
+                        "score": float(best.get("score", 0.0) or 0.0),
+                        "strong": bool(best.get("strong")),
+                        "source": "container" if (best.get("proxy") or {}).get("is_container") else "lp",
+                        "has_overlap": bool(best.get("has_overlap"))
+                    })
+                    direct_count += 1
+                    if not best.get("has_overlap"):
+                        low_confidence += 1
+                    if (best.get("proxy") or {}).get("is_container"):
+                        container_direct_count += 1
+
+                progress.setLabelText(bg_l10n.text("Attaching HP floaters to large owners..."))
+                progress.setValue(58)
+                QtWidgets.QApplication.processEvents()
+
+                assigned_items = [(hp, rec) for hp, rec in hp_records.items() if rec.get("bucket") is not None]
+                stable_parents = [
+                    (hp, rec) for hp, rec in assigned_items
+                    if rec.get("strong") and float(rec.get("data", {}).get("diag", 0.0) or 0.0) >= median_hp_diag * 0.35
+                ]
+                floater_reassigned = 0
+                floater_assigned = 0
+                floater_tests = 0
+                total_records = max(len(hp_records), 1)
+                for index, (hp_node, rec) in enumerate(list(hp_records.items())):
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    if index % max(1, total_records // 20) == 0:
+                        progress.setValue(58 + int((index / float(total_records)) * 12))
+                        QtWidgets.QApplication.processEvents()
+
+                    hp_data = rec.get("data") or {}
+                    hp_diag = float(hp_data.get("diag", 0.0) or 0.0)
+                    if rec.get("strong") and rec.get("source") == "lp" and hp_diag >= median_hp_diag * 0.70:
+                        continue
+
+                    best_parent = None
+                    best_parent_score = None
+                    for parent_hp, parent_rec in stable_parents:
+                        if parent_hp == hp_node:
+                            continue
+                        parent_bucket = parent_rec.get("bucket")
+                        if parent_bucket is None:
+                            continue
+                        parent_data = parent_rec.get("data") or {}
+                        floater_tests += 1
+                        parent_score = self._create_by_mat_hp_parent_score(hp_data, parent_data, scene_diag)
+                        if not parent_score:
+                            continue
+                        if best_parent_score is None or parent_score.get("score", 0.0) > best_parent_score.get("score", 0.0):
+                            best_parent = parent_rec
+                            best_parent_score = parent_score
+
+                    if not best_parent or not best_parent_score:
+                        continue
+                    parent_score_value = float(best_parent_score.get("score", 0.0) or 0.0)
+                    current_score = float(rec.get("score", 0.0) or 0.0)
+                    can_relink = (
+                        rec.get("bucket") is None or
+                        not rec.get("strong") or
+                        rec.get("source") == "container" or
+                        current_score < 75.0
+                    )
+                    if not can_relink:
+                        continue
+                    if parent_score_value < 72.0 and rec.get("bucket") is not None:
+                        continue
+                    if parent_score_value < 54.0:
+                        continue
+                    old_bucket = rec.get("bucket")
+                    rec["bucket"] = best_parent.get("bucket")
+                    rec["source"] = "floater"
+                    rec["strong"] = False
+                    rec["score"] = max(current_score, parent_score_value)
+                    if old_bucket is None:
+                        floater_assigned += 1
+                    elif old_bucket is not rec["bucket"]:
+                        floater_reassigned += 1
+
+                progress.setLabelText(bg_l10n.text("Checking LP meshes for missing HP..."))
+                progress.setValue(70)
+                QtWidgets.QApplication.processEvents()
+
+                lp_audit_checked = 0
+                lp_audit_candidates = 0
+                lp_audit_assigned = 0
+                lp_audit_reassigned = 0
+                lp_audit_container_conflicts = 0
+                audit_best_by_hp = {}
+                audit_proxies = sorted(
+                    [proxy for proxy in all_lp_proxies if proxy.get("bucket") is not None],
+                    key=lambda proxy: (
+                        1 if proxy.get("is_container") else 0,
+                        float((proxy.get("data") or {}).get("volume", 0.0) or 0.0)
+                    )
+                )
+                total_audit = max(len(audit_proxies), 1)
+
+                for index, proxy in enumerate(audit_proxies):
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    if index % max(1, total_audit // 20) == 0:
+                        progress.setValue(70 + int((index / float(total_audit)) * 10))
+                        QtWidgets.QApplication.processEvents()
+
+                    target_bucket = proxy.get("bucket")
+                    if target_bucket is None:
+                        continue
+                    lp_audit_checked += 1
+                    quick_candidates = []
+                    for hp_node, rec in hp_records.items():
+                        if rec.get("bucket") is target_bucket:
+                            continue
+                        hp_data = rec.get("data") or {}
+                        quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
+                        if quick is None:
+                            continue
+                        quick_candidates.append((quick, hp_node, rec))
+                    if not quick_candidates:
+                        continue
+                    quick_candidates.sort(key=lambda item: item[0], reverse=True)
+
+                    for _quick, hp_node, rec in quick_candidates[:24]:
+                        result = self._create_by_mat_lp_hp_audit_score(proxy, rec.get("data") or {}, scene_diag)
+                        if not result or not result.get("strong"):
+                            continue
+                        lp_audit_candidates += 1
+                        current = audit_best_by_hp.get(hp_node)
+                        result_score = float(result.get("score", 0.0) or 0.0)
+                        if current is None or result_score > float(current.get("score", 0.0) or 0.0):
+                            audit_best_by_hp[hp_node] = {
+                                "score": result_score,
+                                "target_bucket": target_bucket,
+                                "proxy": proxy,
+                                "result": result
+                            }
+
+                for hp_node, candidate in audit_best_by_hp.items():
+                    rec = hp_records.get(hp_node)
+                    if not rec:
+                        continue
+                    target_bucket = candidate.get("target_bucket")
+                    current_bucket = rec.get("bucket")
+                    if target_bucket is None or current_bucket is target_bucket:
+                        continue
+
+                    target_proxy = candidate.get("proxy") or {}
+                    candidate_score = float(candidate.get("score", 0.0) or 0.0)
+                    current_score = self._create_by_mat_best_bucket_lp_audit_score(current_bucket, rec.get("data") or {}, scene_diag)
+
+                    if target_proxy.get("is_container"):
+                        lp_audit_container_conflicts += 1
+                        continue
+
+                    source = rec.get("source")
+                    needs_repair = (
+                        current_bucket is None or
+                        source in ("container", "unassigned") or
+                        not rec.get("strong") or
+                        candidate_score >= current_score + 85.0 or
+                        (current_score <= 1.0 and candidate_score >= 260.0)
+                    )
+                    if not needs_repair:
+                        continue
+
+                    old_bucket = current_bucket
+                    rec["bucket"] = target_bucket
+                    rec["source"] = "lp_audit"
+                    rec["strong"] = False
+                    rec["score"] = max(float(rec.get("score", 0.0) or 0.0), candidate_score)
+                    if old_bucket is None:
+                        lp_audit_assigned += 1
+                    else:
+                        lp_audit_reassigned += 1
+
+                for hp_node, rec in hp_records.items():
+                    bucket = rec.get("bucket")
+                    if bucket is None:
+                        review_hp_meshes.append(hp_node)
+                        if len(review_examples) < 8:
+                            review_examples.append("{} -> no LP owner".format(hp_node.split('|')[-1]))
+                        continue
+                    bucket.setdefault("hp_meshes", []).append(hp_node)
+
+                if review_hp_meshes:
+                    review_base = self._create_by_mat_safe_base("Review_Unmatched", used_bases)
+                    review_bucket = {
+                        "labels": ["Review_Unmatched"],
+                        "lp_meshes": [],
+                        "lp_proxies": [],
+                        "hp_meshes": review_hp_meshes,
+                        "base": review_base,
+                        "signature": ("Review_Unmatched",),
+                        "is_review": True
+                    }
+                    ordered_buckets.append(review_bucket)
+
+                book_name = self._create_by_mat_next_book_name()
+                new_pairs = []
+                progress.setLabelText(bg_l10n.text("Creating material chapters..."))
+                progress.setValue(82)
+                QtWidgets.QApplication.processEvents()
+
+                total_buckets = max(len(ordered_buckets), 1)
+                for index, bucket in enumerate(ordered_buckets):
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    progress.setValue(82 + int((index / float(total_buckets)) * 15))
+                    QtWidgets.QApplication.processEvents()
+
+                    base = bucket["base"]
+                    hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP, parent=hp_source)
+                    lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP, parent=lp_source)
+                    hp_root = (cmds.ls(hp_root, long=True) or [hp_root])[0]
+                    lp_root = (cmds.ls(lp_root, long=True) or [lp_root])[0]
+
+                    lp_to_move = [node for node in bucket.get("lp_meshes", []) if node and cmds.objExists(node)]
+                    hp_to_move = [node for node in bucket.get("hp_meshes", []) if node and cmds.objExists(node)]
+                    if lp_to_move:
+                        cmds.parent(lp_to_move, lp_root, absolute=True)
+                    if hp_to_move:
+                        cmds.parent(hp_to_move, hp_root, absolute=True)
+
+                    pair = {
+                        "id": str(uuid.uuid4()),
+                        "base": base,
+                        "hp_uuid": cmds.ls(hp_root, uuid=True)[0],
+                        "lp_uuid": cmds.ls(lp_root, uuid=True)[0],
+                        "locked": [],
+                        "book": book_name,
+                        "final_smooth_states": {}
+                    }
+                    new_pairs.append(pair)
+
+                self.root_pairs.extend(new_pairs)
+                if hasattr(self.core, 'root_pairs'):
+                    self.core.root_pairs = self.root_pairs
+                if hasattr(self.core, '_node_cache'):
+                    self.core._node_cache.clear()
+                bg_core.BakeSessionModel.save(self.root_pairs)
+
+                self.picked_hp, self.picked_lp = None, None
+                self.le_picked_hp.clear()
+                self.le_picked_lp.clear()
+                self.active_material_visibility_filter = None
+
+                if new_pairs:
+                    self.activate_root(new_pairs[0])
+                else:
+                    self.refresh_right_panel()
+                    self.refresh_left_panel()
+
+                message = "Create by Mat: created {} chapter(s) in {}.".format(len(new_pairs), book_name)
+                self.log(message, "lightgreen")
+                self.log(
+                    "Create by Mat HP ownership: direct={}, container_fallback={}, floater_assigned={}, floater_reassigned={}, lp_audit_assigned={}, lp_audit_reassigned={}, review={}.".format(
+                        direct_count,
+                        container_direct_count,
+                        floater_assigned,
+                        floater_reassigned,
+                        lp_audit_assigned,
+                        lp_audit_reassigned,
+                        len(review_hp_meshes)
+                    ),
+                    "lightblue"
+                )
+                self.log(
+                    "Create by Mat LP audit: checked={}, candidates={}, container_conflicts={}.".format(
+                        lp_audit_checked,
+                        lp_audit_candidates,
+                        lp_audit_container_conflicts
+                    ),
+                    "lightblue"
+                )
+                if low_confidence:
+                    self.log("Create by Mat: {} HP mesh(es) assigned by close LP proxy without bbox overlap.".format(low_confidence), "orange")
+                if review_hp_meshes:
+                    self.log("Create by Mat: {} HP mesh(es) moved to Review_Unmatched for manual check.".format(len(review_hp_meshes)), "orange")
+                    if review_examples:
+                        self.log("Create by Mat review examples: {}".format("; ".join(review_examples)), "orange")
+                if hasattr(self, 'record_user_action'):
+                    self.record_user_action(
+                        "Create by Mat",
+                        "chapters={} | book={} | direct_hp={} | container_hp={} | floater_assigned={} | floater_reassigned={} | lp_audit_assigned={} | lp_audit_reassigned={} | lp_audit_checked={} | lp_audit_candidates={} | lp_audit_container_conflicts={} | low_confidence_hp={} | review_hp={}".format(
+                            len(new_pairs),
+                            book_name,
+                            direct_count,
+                            container_direct_count,
+                            floater_assigned,
+                            floater_reassigned,
+                            lp_audit_assigned,
+                            lp_audit_reassigned,
+                            lp_audit_checked,
+                            lp_audit_candidates,
+                            lp_audit_container_conflicts,
+                            low_confidence,
+                            len(review_hp_meshes)
+                        )
+                    )
+                cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
+        finally:
+            try:
+                progress.close()
+            except RuntimeError:
+                pass
+
     def create_root_pair_from_picked(self):
         if not self.picked_hp or not cmds.objExists(self.picked_hp):
             return cmds.warning("Invalid HP node.")
@@ -3642,39 +5018,105 @@ class SceneInteractionMixin:
                 if temp_grp and cmds.objExists(temp_grp):
                     cmds.delete(temp_grp)
 
+    def _separate_mesh_transforms(self, mesh_nodes, select_result=True):
+        valid_nodes = []
+        seen = set()
+        for node in mesh_nodes or []:
+            if not node or not cmds.objExists(node):
+                continue
+            node_type = cmds.nodeType(node)
+            if node_type == "mesh":
+                parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                node = parents[0] if parents else None
+            if not node or not cmds.objExists(node) or cmds.nodeType(node) != "transform":
+                continue
+            shapes = cmds.listRelatives(node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+            if not shapes:
+                continue
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            if long_node not in seen:
+                seen.add(long_node)
+                valid_nodes.append(long_node)
+        if not valid_nodes:
+            return []
+
+        final_selection = []
+        with bg_core.undo_chunk("ModelPack_Separate"):
+            for obj in valid_nodes:
+                if not cmds.objExists(obj):
+                    continue
+                base_name = obj.split('|')[-1]
+                target_parent = self.get_parent_tool(obj)
+                try:
+                    result = cmds.polySeparate(obj, ch=False) or []
+                except Exception as e:
+                    cmds.warning("Separate failed for {}: {}".format(base_name, e))
+                    continue
+
+                parts = []
+                for item in result:
+                    if not item or not cmds.objExists(item):
+                        continue
+                    if cmds.nodeType(item) == "mesh":
+                        parents = cmds.listRelatives(item, parent=True, fullPath=True) or []
+                        item = parents[0] if parents else None
+                    if not item or not cmds.objExists(item) or cmds.nodeType(item) != "transform":
+                        continue
+                    if not cmds.listRelatives(item, shapes=True, fullPath=True, type='mesh', noIntermediate=True):
+                        continue
+                    long_item = (cmds.ls(item, long=True) or [item])[0]
+                    if long_item not in parts:
+                        parts.append(long_item)
+
+                if not parts:
+                    continue
+
+                for index, part in enumerate(parts, 1):
+                    if not cmds.objExists(part):
+                        continue
+                    try:
+                        cmds.delete(part, constructionHistory=True)
+                    except Exception:
+                        pass
+                    try:
+                        new_name = cmds.rename(part, "{}_Part{}".format(base_name, index))
+                    except Exception:
+                        new_name = part
+                    if target_parent and cmds.objExists(target_parent):
+                        try:
+                            new_name = cmds.parent(new_name, target_parent, absolute=True)[0]
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            if self.get_parent_tool(new_name):
+                                new_name = cmds.parent(new_name, world=True)[0]
+                        except Exception:
+                            pass
+                    final_selection.append((cmds.ls(new_name, long=True) or [new_name])[0])
+
+        cache = getattr(self, '_combined_mesh_check_cache', None)
+        if isinstance(cache, dict):
+            cache.clear()
+        if final_selection and select_result:
+            cmds.select(final_selection, replace=True)
+        return final_selection
+
     def tool_separate(self):
         sel = cmds.ls(sl=True, l=True)
         if not sel:
             return cmds.warning("Select an object to separate.")
-        with bg_core.undo_chunk("ModelPack_Separate"):
-            try:
-                final_selection = []
-                for obj in sel:
-                    base_name = obj.split('|')[-1]
-                    target_parent = self.get_parent_tool(obj)
-                    cmds.polySeparate(obj, ch=False)
-                    cmds.delete(obj, ch=True)
-                    parts = cmds.listRelatives(obj, children=True, fullPath=True, type='transform') or []
-                    if parts:
-                        for i, part in enumerate(parts):
-                            new_name = cmds.rename(part, "{}_Part{}".format(base_name, i+1))
-                            if target_parent and cmds.objExists(target_parent):
-                                new_name = cmds.parent(new_name, target_parent)[0]
-                            else:
-                                if self.get_parent_tool(new_name):
-                                    new_name = cmds.parent(new_name, world=True)[0]
-                            final_selection.append(new_name)
-                        if cmds.objExists(obj):
-                            cmds.delete(obj)
-                if final_selection:
-                    cmds.select(final_selection, r=True)
-                    if hasattr(self, 'record_user_action'):
-                        self.record_user_action(
-                            "Separate",
-                            "input={} | parts={}".format(len(sel), len(final_selection))
-                        )
-            except Exception as e:
-                cmds.warning("Separate failed: {}".format(e))
+        try:
+            final_selection = self._separate_mesh_transforms(sel, select_result=True)
+            if final_selection and hasattr(self, 'record_user_action'):
+                self.record_user_action(
+                    "Separate",
+                    "input={} | parts={}".format(len(sel), len(final_selection))
+                )
+            elif not final_selection:
+                cmds.warning("Separate: no mesh parts were created.")
+        except Exception as e:
+            cmds.warning("Separate failed: {}".format(e))
 
     def get_parent_tool(self, obj):
         parent = cmds.listRelatives(obj, parent=True, fullPath=True)
@@ -4003,6 +5445,573 @@ class TOCMixin:
                 bg_core.BakeSessionModel.save(self.root_pairs)
                 self.log("Book renamed to: {}".format(new_name), "lightgreen")
 
+    def _toc_pair_from_item(self, item):
+        if not item or item.data(0, QtCore.Qt.UserRole) == "BOOK":
+            return None
+        pair_id = item.data(0, QtCore.Qt.UserRole)
+        return next((p for p in self.root_pairs if p.get('id') == pair_id), None)
+
+    def _toc_safe_chapter_base(self, raw_name):
+        value = str(raw_name or "").strip().replace(" ", "_").replace(".", "_")
+        value = re.sub(r'[^A-Za-z0-9_]+', '_', value)
+        value = re.sub(r'_+', '_', value).strip('_')
+        value = re.sub(r'(_HP|_LP)$', '', value, flags=re.IGNORECASE).strip('_')
+        if not value:
+            value = "Chapter"
+        if not re.match(r'^[A-Za-z_]', value):
+            value = "Chapter_{}".format(value)
+        return value[:54] or "Chapter"
+
+    def rename_toc_chapter(self, pair_id):
+        pair = next((p for p in self.root_pairs if p.get('id') == pair_id), None)
+        if not pair:
+            return
+
+        old_base = pair.get('base', 'Chapter')
+        new_name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            bg_l10n.text("Rename Chapter"),
+            bg_l10n.text("New name for {name}:").format(name=old_base),
+            QtWidgets.QLineEdit.Normal,
+            old_base
+        )
+        if not ok:
+            return
+
+        new_base = self._toc_safe_chapter_base(new_name)
+        if not new_base or new_base == old_base:
+            return
+
+        duplicate = next((p for p in self.root_pairs if p.get('id') != pair_id and p.get('base') == new_base), None)
+        if duplicate:
+            self.log("Rename Chapter skipped: '{}' already exists.".format(new_base), "orange")
+            return
+
+        hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
+        with bg_core.undo_chunk("RenameChapter"):
+            try:
+                if hp_node and cmds.objExists(hp_node):
+                    hp_node = cmds.rename(hp_node, "{}{}".format(new_base, bg_core.BakeConfig.SUFFIX_HP))
+                    hp_node = (cmds.ls(hp_node, long=True) or [hp_node])[0]
+                    pair['hp_uuid'] = cmds.ls(hp_node, uuid=True)[0]
+                if lp_node and cmds.objExists(lp_node):
+                    lp_node = cmds.rename(lp_node, "{}{}".format(new_base, bg_core.BakeConfig.SUFFIX_LP))
+                    lp_node = (cmds.ls(lp_node, long=True) or [lp_node])[0]
+                    pair['lp_uuid'] = cmds.ls(lp_node, uuid=True)[0]
+
+                pair['base'] = new_base
+                if hasattr(self.core, '_node_cache'):
+                    self.core._node_cache.clear()
+                bg_core.BakeSessionModel.save(self.root_pairs)
+                self.refresh_right_panel()
+                if pair_id == getattr(self, 'active_root_id', None):
+                    self.refresh_left_panel()
+                self.log("Chapter renamed: {} -> {}".format(old_base, new_base), "lightgreen")
+                if hasattr(self, 'record_user_action'):
+                    self.record_user_action("Rename Chapter", "{} -> {}".format(old_base, new_base))
+            except Exception as e:
+                self.log("Rename Chapter failed: {}".format(e), "red")
+
+    def _toc_selected_mesh_transforms(self):
+        selected = cmds.ls(selection=True, long=True, objectsOnly=True) or []
+        transforms = []
+        seen = set()
+        for node in selected:
+            if not node or not cmds.objExists(node):
+                continue
+            node_type = cmds.nodeType(node)
+            if node_type == "mesh":
+                parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                node = parents[0] if parents else None
+            elif node_type != "transform":
+                continue
+            if not node or not cmds.objExists(node):
+                continue
+            shapes = cmds.listRelatives(node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+            if not shapes:
+                continue
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            if long_node not in seen:
+                seen.add(long_node)
+                transforms.append(long_node)
+        return transforms
+
+    def _toc_known_roots(self):
+        roots = []
+        for pair in self.root_pairs or []:
+            hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
+            if hp_node and cmds.objExists(hp_node):
+                roots.append((pair, "HP", (cmds.ls(hp_node, long=True) or [hp_node])[0]))
+            if lp_node and cmds.objExists(lp_node):
+                roots.append((pair, "LP", (cmds.ls(lp_node, long=True) or [lp_node])[0]))
+        roots.sort(key=lambda item: len(item[2]), reverse=True)
+        return roots
+
+    def _toc_mesh_root_kind(self, mesh_node, known_roots):
+        long_node = (cmds.ls(mesh_node, long=True) or [mesh_node])[0]
+        for pair, kind, root in known_roots:
+            if long_node == root:
+                return None, None
+            if long_node.startswith(root + "|"):
+                return pair, kind
+        return None, None
+
+    def _toc_meshes_by_kind(self, known_roots, kind):
+        meshes = []
+        seen = set()
+        for _pair, root_kind, root in known_roots:
+            if root_kind != kind or not root or not cmds.objExists(root):
+                continue
+            for node in (cmds.listRelatives(root, allDescendents=True, fullPath=True, type='transform') or []):
+                if not node or not cmds.objExists(node):
+                    continue
+                if not cmds.listRelatives(node, shapes=True, fullPath=True, type='mesh', noIntermediate=True):
+                    continue
+                long_node = (cmds.ls(node, long=True) or [node])[0]
+                if long_node not in seen:
+                    seen.add(long_node)
+                    meshes.append(long_node)
+        return meshes
+
+    def _toc_find_lost_sample_points(self, mesh_node, max_points=240):
+        if not om or not mesh_node or not cmds.objExists(mesh_node):
+            return self._create_by_mat_mesh_sample_points(mesh_node, max_points)
+        try:
+            sel = om.MSelectionList()
+            sel.add(mesh_node)
+            dag = sel.getDagPath(0)
+            if dag.hasFn(om.MFn.kTransform):
+                dag.extendToShape()
+            mesh_fn = om.MFnMesh(dag)
+            points = mesh_fn.getPoints(om.MSpace.kWorld)
+            if len(points) == 0:
+                return []
+
+            result = []
+            vert_budget = max(32, int(max_points * 0.45))
+            vert_step = max(1, int(math.ceil(len(points) / float(vert_budget))))
+            for index in range(0, len(points), vert_step):
+                pnt = points[index]
+                result.append([pnt.x, pnt.y, pnt.z])
+                if len(result) >= vert_budget:
+                    break
+
+            face_budget = max_points - len(result)
+            if face_budget > 0:
+                counts, connects = mesh_fn.getVertices()
+                if len(counts) > 0:
+                    face_step = max(1, int(math.ceil(len(counts) / float(face_budget))))
+                    cursor = 0
+                    for face_id, count in enumerate(counts):
+                        verts = list(connects[cursor:cursor + count])
+                        cursor += count
+                        if face_id % face_step != 0 or not verts:
+                            continue
+                        acc_x = acc_y = acc_z = 0.0
+                        for vertex_id in verts:
+                            pnt = points[vertex_id]
+                            acc_x += pnt.x
+                            acc_y += pnt.y
+                            acc_z += pnt.z
+                        inv = 1.0 / float(len(verts))
+                        result.append([acc_x * inv, acc_y * inv, acc_z * inv])
+                        if len(result) >= max_points:
+                            break
+            return result
+        except Exception:
+            return self._create_by_mat_mesh_sample_points(mesh_node, max_points)
+
+    def _toc_find_lost_mesh_data(self, mesh_node):
+        data = self._create_by_mat_mesh_data(mesh_node)
+        if not data:
+            return None
+        data = dict(data)
+        samples = self._toc_find_lost_sample_points(mesh_node, 240)
+        if samples:
+            data["sample_points"] = samples
+        return data
+
+    def _toc_find_lost_is_hp_floater_candidate(self, hp_data, lp_data):
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        if lp_diag <= hp_diag * 1.20:
+            return False
+        hp_vol = max(float(hp_data.get("volume", hp_data.get("bbox_vol", 0.0)) or 0.0), 0.000001)
+        lp_vol = max(float(lp_data.get("volume", lp_data.get("bbox_vol", 0.0)) or 0.0), 0.000001)
+        diag_ratio = hp_diag / lp_diag
+        vol_ratio = hp_vol / lp_vol
+        return diag_ratio <= 0.45 or vol_ratio <= 0.16
+
+    def _toc_find_lost_expanded_child_fraction(self, child_data, parent_data, expand):
+        try:
+            child_min = child_data.get("min")
+            child_max = child_data.get("max")
+            parent_min = parent_data.get("min")
+            parent_max = parent_data.get("max")
+            dx = max(0.0, min(child_max[0], parent_max[0] + expand) - max(child_min[0], parent_min[0] - expand))
+            dy = max(0.0, min(child_max[1], parent_max[1] + expand) - max(child_min[1], parent_min[1] - expand))
+            dz = max(0.0, min(child_max[2], parent_max[2] + expand) - max(child_min[2], parent_min[2] - expand))
+            child_vol = max(float(child_data.get("volume", child_data.get("bbox_vol", 0.0)) or 0.0), 0.000001)
+            return (dx * dy * dz) / child_vol
+        except Exception:
+            return 0.0
+
+    def _toc_find_lost_hp_floater_score(self, hp_data, lp_data):
+        if not self._toc_find_lost_is_hp_floater_candidate(hp_data, lp_data):
+            return None
+
+        inter = self._create_by_mat_intersection_volume(hp_data, lp_data)
+        gap = self._create_by_mat_bbox_gap_distance(hp_data, lp_data)
+        hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
+        lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
+        hp_vol = max(float(hp_data.get("volume", hp_data.get("bbox_vol", 0.0)) or 0.0), 0.000001)
+        overlap_hp = inter / hp_vol
+        expand = max(hp_diag * 0.35, lp_diag * 0.018, 0.001)
+        expanded_fraction = self._toc_find_lost_expanded_child_fraction(hp_data, lp_data, expand)
+
+        if inter <= 0.0 and expanded_fraction <= 0.0 and gap > max(hp_diag * 2.0, lp_diag * 0.08):
+            return None
+
+        hp_to_lp = self._create_by_mat_avg_sample_distance(hp_data, lp_data, max_source=180, max_target=260)
+        closest = self._create_by_mat_point_sample_distance(hp_data, lp_data)
+        near_limit = max(hp_diag * 0.38, lp_diag * 0.018, 0.001)
+        closest_limit = max(hp_diag * 0.18, lp_diag * 0.008, 0.001)
+        avg_norm = hp_to_lp / near_limit
+        closest_norm = closest / closest_limit
+        close_score = max(0.0, 1.0 - min(avg_norm, 1.0))
+        closest_score = max(0.0, 1.0 - min(closest_norm, 1.0))
+        size_bonus = max(0.0, 1.0 - min(hp_diag / max(lp_diag * 0.45, 0.000001), 1.0))
+        gap_norm = gap / max(hp_diag, lp_diag * 0.015, 0.001)
+
+        score = close_score * 980.0
+        score += closest_score * 360.0
+        score += min(expanded_fraction, 1.0) * 620.0
+        score += min(overlap_hp, 1.0) * 460.0
+        score += size_bonus * 130.0
+        if inter > 0.0:
+            score += 160.0
+        score -= gap_norm * 100.0
+
+        strong = (
+            (expanded_fraction >= 0.20 and avg_norm <= 2.15) or
+            (avg_norm <= 1.05 and closest_norm <= 1.60) or
+            (overlap_hp >= 0.08 and closest_norm <= 1.20)
+        )
+        return {
+            "score": score,
+            "strong": strong,
+            "floater": True,
+            "overlap_source": overlap_hp,
+            "overlap_target": expanded_fraction,
+            "avg_distance": hp_to_lp,
+            "closest_distance": closest
+        }
+
+    def _toc_find_lost_subgroup_name_for_mesh(self, mesh_node, pair, kind):
+        if not mesh_node or not pair or kind not in ("HP", "LP"):
+            return None
+        try:
+            hp_root, lp_root, _ = self.core.resolve_main_nodes(pair)
+            root = hp_root if kind == "HP" else lp_root
+            if not root or not cmds.objExists(root):
+                return None
+            root = (cmds.ls(root, long=True) or [root])[0]
+            current = (cmds.ls(mesh_node, long=True) or [mesh_node])[0]
+            direct_child = None
+            while current and cmds.objExists(current) and current != root:
+                parent = cmds.listRelatives(current, parent=True, fullPath=True) or []
+                if not parent:
+                    break
+                if parent[0] == root:
+                    direct_child = current
+                    break
+                current = parent[0]
+            if not direct_child or cmds.listRelatives(direct_child, shapes=True, fullPath=True, type='mesh', noIntermediate=True):
+                return None
+            short_name = direct_child.split('|')[-1]
+            pattern = r'(_HP|_hp|HP|hp)(\d*)$' if kind == "HP" else r'(_LP|_lp|LP|lp)(\d*)$'
+            match = re.search(pattern, short_name)
+            if match:
+                return short_name[:match.start()] + match.group(2)
+            return short_name
+        except Exception:
+            return None
+
+    def _toc_find_lost_hp_target_for_lp(self, lp_node, known_roots):
+        lp_pair, lp_kind = self._toc_mesh_root_kind(lp_node, known_roots)
+        if not lp_pair or lp_kind != "LP":
+            return None, None, None
+        hp_root, lp_root, _ = self.core.resolve_main_nodes(lp_pair)
+        if not hp_root or not cmds.objExists(hp_root):
+            return None, lp_pair, None
+        hp_target = (cmds.ls(hp_root, long=True) or [hp_root])[0]
+        subgroup_name = self._toc_find_lost_subgroup_name_for_mesh(lp_node, lp_pair, "LP")
+        if subgroup_name and hasattr(self, 'find_subgroup_nodes_by_ui_name'):
+            hp_grp, _lp_grp = self.find_subgroup_nodes_by_ui_name(hp_root, lp_root, subgroup_name)
+            if hp_grp and cmds.objExists(hp_grp):
+                hp_target = (cmds.ls(hp_grp, long=True) or [hp_grp])[0]
+        return hp_target, lp_pair, subgroup_name
+
+    def _toc_find_lost_parent_hp_meshes(self, hp_nodes, hp_target):
+        moved_nodes = []
+        skipped = []
+        if not hp_target or not cmds.objExists(hp_target):
+            return moved_nodes, list(hp_nodes or [])
+        hp_target = (cmds.ls(hp_target, long=True) or [hp_target])[0]
+        for hp_node in hp_nodes or []:
+            if not hp_node or not cmds.objExists(hp_node):
+                skipped.append(hp_node)
+                continue
+            hp_node = (cmds.ls(hp_node, long=True) or [hp_node])[0]
+            current_parent = cmds.listRelatives(hp_node, parent=True, fullPath=True) or []
+            if current_parent and current_parent[0] == hp_target:
+                moved_nodes.append(hp_node)
+                continue
+            try:
+                parented = cmds.parent(hp_node, hp_target, absolute=True) or []
+                moved_nodes.extend(cmds.ls(parented, long=True) or parented)
+            except Exception as e:
+                skipped.append("{} ({})".format(hp_node, e))
+        return moved_nodes, skipped
+
+    def _toc_find_lost_quick_score(self, source_data, target_data, source_kind):
+        inter = self._create_by_mat_intersection_volume(source_data, target_data)
+        gap = self._create_by_mat_bbox_gap_distance(source_data, target_data)
+        source_diag = max(float(source_data.get("diag", 0.0) or 0.0), 0.000001)
+        target_diag = max(float(target_data.get("diag", 0.0) or 0.0), 0.000001)
+        if inter <= 0.0 and gap > max(source_diag * 0.9, target_diag * 0.9):
+            return None
+        source_vol = max(float(source_data.get("volume", 0.0) or 0.0), 0.000001)
+        target_vol = max(float(target_data.get("volume", 0.0) or 0.0), 0.000001)
+        overlap_source = inter / source_vol
+        overlap_target = inter / target_vol
+        center_dist = bg_core.MathUtils.distance(source_data.get("center", [0.0, 0.0, 0.0]), target_data.get("center", [0.0, 0.0, 0.0]))
+        center_norm = center_dist / max(source_diag, target_diag, 0.000001)
+        if source_kind == "LP":
+            score = overlap_target * 520.0 + overlap_source * 220.0
+        else:
+            score = overlap_source * 520.0 + overlap_target * 220.0
+        if inter > 0.0:
+            score += 120.0
+        score -= center_norm * 40.0
+        score -= gap / max(min(source_diag, target_diag), 0.000001) * 55.0
+        return score
+
+    def _toc_find_lost_precise_score(self, source_data, target_data, source_kind):
+        if source_kind == "LP":
+            floater_score = self._toc_find_lost_hp_floater_score(target_data, source_data)
+        else:
+            floater_score = self._toc_find_lost_hp_floater_score(source_data, target_data)
+        if floater_score:
+            return floater_score
+
+        inter = self._create_by_mat_intersection_volume(source_data, target_data)
+        gap = self._create_by_mat_bbox_gap_distance(source_data, target_data)
+        source_diag = max(float(source_data.get("diag", 0.0) or 0.0), 0.000001)
+        target_diag = max(float(target_data.get("diag", 0.0) or 0.0), 0.000001)
+        source_vol = max(float(source_data.get("volume", 0.0) or 0.0), 0.000001)
+        target_vol = max(float(target_data.get("volume", 0.0) or 0.0), 0.000001)
+        overlap_source = inter / source_vol
+        overlap_target = inter / target_vol
+        source_to_target = self._create_by_mat_avg_sample_distance(source_data, target_data, max_source=120, max_target=160)
+        target_to_source = self._create_by_mat_avg_sample_distance(target_data, source_data, max_source=120, max_target=160)
+        if source_kind == "LP":
+            avg_dist = target_to_source
+            fit_overlap = overlap_target
+            cover_overlap = overlap_source
+        else:
+            avg_dist = source_to_target
+            fit_overlap = overlap_source
+            cover_overlap = overlap_target
+        near_limit = max(min(source_diag, target_diag) * 0.28, max(source_diag, target_diag) * 0.025, 0.000001)
+        avg_norm = avg_dist / near_limit
+        score = fit_overlap * 1050.0 + cover_overlap * 260.0
+        score += max(0.0, 1.0 - min(avg_norm, 1.0)) * 680.0
+        if inter > 0.0:
+            score += 180.0
+        score -= gap / max(source_diag * 0.20, target_diag * 0.20, 0.000001) * 120.0
+        strong = (
+            fit_overlap >= 0.18 or
+            (fit_overlap >= 0.05 and avg_norm <= 1.35) or
+            (avg_norm <= 0.72 and gap <= max(source_diag * 0.10, target_diag * 0.10))
+        )
+        return {
+            "score": score,
+            "strong": strong,
+            "overlap_source": overlap_source,
+            "overlap_target": overlap_target,
+            "avg_distance": avg_dist
+        }
+
+    def find_lost_meshes_from_selection(self, target_pair_id=None):
+        selected_meshes = self._toc_selected_mesh_transforms()
+        if not selected_meshes:
+            self.log("Find Lost: select an LP or HP mesh first.", "orange")
+            return
+
+        known_roots = self._toc_known_roots()
+        data_cache = {}
+        meshes_by_kind = {
+            "HP": self._toc_meshes_by_kind(known_roots, "HP"),
+            "LP": self._toc_meshes_by_kind(known_roots, "LP")
+        }
+        result_nodes = []
+        moved_nodes = []
+        move_skipped = []
+        seen_results = set()
+        skipped = 0
+        floater_hits = 0
+
+        def mesh_data(node):
+            if node not in data_cache:
+                data_cache[node] = self._toc_find_lost_mesh_data(node)
+            return data_cache.get(node)
+
+        for source_node in selected_meshes:
+            source_pair, source_kind = self._toc_mesh_root_kind(source_node, known_roots)
+            if source_kind not in ("HP", "LP"):
+                skipped += 1
+                continue
+            target_kind = "HP" if source_kind == "LP" else "LP"
+            source_data = mesh_data(source_node)
+            if not source_data:
+                skipped += 1
+                continue
+
+            candidates = []
+            for target_node in meshes_by_kind.get(target_kind, []):
+                if target_node == source_node:
+                    continue
+                target_data = mesh_data(target_node)
+                if not target_data:
+                    continue
+                quick = self._toc_find_lost_quick_score(source_data, target_data, source_kind)
+                if quick is None:
+                    continue
+                candidates.append((quick, target_node, target_data))
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            precise = []
+            for _quick, target_node, target_data in candidates[:96]:
+                score = self._toc_find_lost_precise_score(source_data, target_data, source_kind)
+                if score and score.get("strong"):
+                    precise.append((float(score.get("score", 0.0) or 0.0), target_node, score))
+            if not precise:
+                continue
+
+            precise.sort(key=lambda item: item[0], reverse=True)
+            best_score = precise[0][0]
+            limit = max(best_score * 0.62, best_score - 220.0)
+            source_results = []
+            for score, target_node, _meta in precise[:16]:
+                if score < limit:
+                    continue
+                if target_node not in seen_results:
+                    seen_results.add(target_node)
+                    result_nodes.append(target_node)
+                    source_results.append((target_node, _meta))
+                    if _meta.get("floater"):
+                        floater_hits += 1
+
+            if source_kind == "LP":
+                hp_target, _lp_pair, subgroup_name = self._toc_find_lost_hp_target_for_lp(source_node, known_roots)
+                hp_nodes = [node for node, _meta in source_results if node and cmds.objExists(node)]
+                moved, move_failed = self._toc_find_lost_parent_hp_meshes(hp_nodes, hp_target)
+                moved_nodes.extend(moved)
+                move_skipped.extend(move_failed)
+                if moved and subgroup_name and hasattr(self, 'recolor_moved_subgroup_nodes'):
+                    self.recolor_moved_subgroup_nodes(moved, subgroup_name)
+            elif source_kind == "HP" and source_results:
+                best_lp = source_results[0][0]
+                hp_target, _lp_pair, subgroup_name = self._toc_find_lost_hp_target_for_lp(best_lp, known_roots)
+                moved, move_failed = self._toc_find_lost_parent_hp_meshes([source_node], hp_target)
+                moved_nodes.extend(moved)
+                move_skipped.extend(move_failed)
+                if moved and subgroup_name and hasattr(self, 'recolor_moved_subgroup_nodes'):
+                    self.recolor_moved_subgroup_nodes(moved, subgroup_name)
+
+        if moved_nodes:
+            unique_moved = []
+            seen_moved = set()
+            for node in moved_nodes:
+                if node and cmds.objExists(node):
+                    long_node = (cmds.ls(node, long=True) or [node])[0]
+                    if long_node not in seen_moved:
+                        seen_moved.add(long_node)
+                        unique_moved.append(long_node)
+            if unique_moved:
+                cmds.select(unique_moved, replace=True)
+            if hasattr(self, 'refresh_left_panel'):
+                self.refresh_left_panel()
+            if hasattr(self, 'refresh_right_panel'):
+                self.refresh_right_panel()
+            found_kind = "HP/LP"
+            if unique_moved:
+                _pair, result_kind = self._toc_mesh_root_kind(unique_moved[0], self._toc_known_roots())
+                if result_kind:
+                    found_kind = result_kind
+            floater_note = " (floater mode: {})".format(floater_hits) if floater_hits else ""
+            self.log("Find Lost: moved {} {} mesh(es){}.".format(len(unique_moved), found_kind, floater_note), "lightgreen")
+            if move_skipped:
+                names = [str(n).split('|')[-1] for n in move_skipped[:8]]
+                self.log("Find Lost: skipped {} mesh(es): {}".format(len(move_skipped), ", ".join(names)), "orange")
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action("Find Lost", "moved={} found={} skipped={} move_skipped={} floaters={}".format(len(unique_moved), len(result_nodes), skipped, len(move_skipped), floater_hits))
+        elif result_nodes:
+            cmds.select(result_nodes, replace=True)
+            self.log("Find Lost: found {} candidate mesh(es), but nothing was moved.".format(len(result_nodes)), "orange")
+        else:
+            self.log("Find Lost: no matching opposite meshes found.", "orange")
+
+    def move_selected_meshes_to_chapter(self, target_pair_id):
+        target_pair = next((p for p in self.root_pairs if p.get('id') == target_pair_id), None)
+        if not target_pair:
+            return
+
+        selected_meshes = self._toc_selected_mesh_transforms()
+        if not selected_meshes:
+            self.log("Move Mesh to: no selected mesh transforms.", "orange")
+            return
+
+        target_hp, target_lp, _ = self.core.resolve_main_nodes(target_pair)
+        if not target_hp or not cmds.objExists(target_hp) or not target_lp or not cmds.objExists(target_lp):
+            self.log("Move Mesh to failed: target chapter roots are missing.", "red")
+            return
+
+        target_hp = (cmds.ls(target_hp, long=True) or [target_hp])[0]
+        target_lp = (cmds.ls(target_lp, long=True) or [target_lp])[0]
+        known_roots = self._toc_known_roots()
+        moved = 0
+        skipped = []
+
+        with bg_core.undo_chunk("MoveSelectedMeshesToChapter"):
+            for mesh_node in selected_meshes:
+                source_pair, kind = self._toc_mesh_root_kind(mesh_node, known_roots)
+                if not source_pair or kind not in ("HP", "LP"):
+                    skipped.append(mesh_node)
+                    continue
+                if source_pair.get('id') == target_pair_id:
+                    continue
+                target_root = target_hp if kind == "HP" else target_lp
+                try:
+                    cmds.parent(mesh_node, target_root, absolute=True)
+                    moved += 1
+                except Exception as e:
+                    skipped.append("{} ({})".format(mesh_node, e))
+
+        if moved:
+            self.log("Move Mesh to '{}': moved {} mesh(es).".format(target_pair.get('base', 'Chapter'), moved), "lightgreen")
+            if hasattr(self, 'record_user_action'):
+                self.record_user_action("Move Mesh to Chapter", "{} | moved={}".format(target_pair.get('base', 'Chapter'), moved))
+        if skipped:
+            names = [str(n).split('|')[-1] for n in skipped[:8]]
+            self.log("Move Mesh to: skipped {} item(s) outside known HP/LP roots or failed to move: {}".format(len(skipped), ", ".join(names)), "orange")
+        self.refresh_right_panel()
+        if target_pair_id == getattr(self, 'active_root_id', None):
+            self.refresh_left_panel()
+
     def group_selected_into_book(self):
         items = self.toc_tree.selectedItems()
         if not items:
@@ -4053,14 +6062,35 @@ class TOCMixin:
 
     def show_toc_context_menu(self, pos):
         items = self.toc_tree.selectedItems()
+        clicked_item = self.toc_tree.itemAt(pos)
+        if clicked_item and not clicked_item.isSelected():
+            self.toc_tree.clearSelection()
+            clicked_item.setSelected(True)
+            items = [clicked_item]
         if not items:
             return
+        clicked_pair = self._toc_pair_from_item(clicked_item)
         menu = QtWidgets.QMenu()
         menu.setStyleSheet("QMenu { background-color: #242424; color: #ddd; border: 1px solid #444; } QMenu::item:selected { background-color: #3e3e3e; }")
 
         act_sel = QAction("Select Meshes", self)
         act_sel.triggered.connect(self.select_toc_items)
         menu.addAction(act_sel)
+
+        if clicked_pair:
+            act_move_mesh = QAction("Move Mesh to", self)
+            act_move_mesh.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Move Mesh to Chapter", self.move_selected_meshes_to_chapter, p_id))
+            menu.addAction(act_move_mesh)
+
+            act_rename_chapter = QAction("Rename Chapter", self)
+            act_rename_chapter.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Rename Chapter", self.rename_toc_chapter, p_id))
+            menu.addAction(act_rename_chapter)
+
+            act_find_lost = QAction("Find Lost (beta)", self)
+            act_find_lost.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Find Lost", self.find_lost_meshes_from_selection, p_id))
+            menu.addAction(act_find_lost)
+
+            menu.addSeparator()
 
         act_group = QAction("Group into Book (Ctrl+G)", self)
         act_group.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Group into Book", self.group_selected_into_book))

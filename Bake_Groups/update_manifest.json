@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.3.4",
+  "latest_version": "1.3.5",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
   "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main",
-  "release_notes": "Updated the preflight check before Analyze HP."
+  "release_notes": "Improved the preflight check before Analyze HP.\nAdded Create by Mat (beta).\nAdded Find Lost (beta).\nImproved Combine Fin behavior.\nImproved translation."
 }

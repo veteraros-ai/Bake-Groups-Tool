@@ -184,7 +184,7 @@ def localize_widget(widget):
         except Exception:
             pass
 
-    if isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QCheckBox, QtWidgets.QLabel)):
+    if isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QToolButton, QtWidgets.QCheckBox, QtWidgets.QLabel)):
         current = widget.text()
         if current:
             key = _source_key(widget, current)

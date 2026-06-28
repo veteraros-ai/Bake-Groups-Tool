@@ -60,8 +60,10 @@ class GTWidget(QtWidgets.QWidget):
         self.min_hp_spin.setValue(2)
         set_layout.addWidget(self.min_hp_spin, 1, 1)
 
-        set_layout.addWidget(QtWidgets.QLabel("Match Mode:"), 2, 0)
+        self.lbl_match_mode = QtWidgets.QLabel("Match Mode:")
+        set_layout.addWidget(self.lbl_match_mode, 2, 0)
         self.match_mode_combo = QtWidgets.QComboBox()
+        self.match_mode_combo.setObjectName("Match Mode:")
         self.match_mode_combo.addItem("Balanced", "BALANCED")
         self.match_mode_combo.addItem("Fast", "FAST")
         self.match_mode_combo.addItem("Accurate", "ACCURATE")
