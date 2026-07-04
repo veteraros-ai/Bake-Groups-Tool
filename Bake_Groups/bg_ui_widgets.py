@@ -20,13 +20,42 @@ import bg_core
 # ==========================================
 CURRENT_DIR = os.path.dirname(__file__)
 ICONS_DIR = os.path.join(CURRENT_DIR, "icons")
+ICON_SEARCH_DIRS = [
+    ICONS_DIR,
+    CURRENT_DIR,
+    os.path.join(CURRENT_DIR, "Icon_dop"),
+    os.path.join(os.path.dirname(CURRENT_DIR), "Icon_dop"),
+    os.path.join(os.path.dirname(os.path.dirname(CURRENT_DIR)), "Icon_dop"),
+]
 
 def get_icon(icon_name):
-    """Returns QIcon by filename from the icons folder."""
-    icon_path = os.path.join(ICONS_DIR, icon_name)
-    if os.path.exists(icon_path):
-        return QtGui.QIcon(icon_path)
+    """Returns QIcon by filename from the icon search paths."""
+    if os.path.isabs(icon_name) and os.path.exists(icon_name):
+        return QtGui.QIcon(icon_name)
+    for directory in ICON_SEARCH_DIRS:
+        icon_path = os.path.join(directory, icon_name)
+        if os.path.exists(icon_path):
+            return QtGui.QIcon(icon_path)
     return QtGui.QIcon()
+
+
+def configure_square_icon_button(button, icon_name, label_key=None, size=42, icon_size=30):
+    label_key = label_key or button.text().strip()
+    if label_key:
+        button.setProperty("bg_i18n_key", label_key)
+        tip = bg_l10n.tooltip(label_key)
+        if tip:
+            button.setToolTip(tip)
+            button.setStatusTip(tip)
+            button.setProperty("bg_status_tip", tip)
+    button.setText("")
+    button.setIcon(get_icon(icon_name))
+    button.setIconSize(QtCore.QSize(icon_size, icon_size))
+    button.setFixedSize(size, size)
+    button.setMinimumSize(size, size)
+    button.setMaximumSize(size, size)
+    button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+    return button
 
 
 # ==========================================

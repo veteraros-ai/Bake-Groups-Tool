@@ -1,5 +1,6 @@
 from __future__ import print_function, division, absolute_import
 
+import hashlib
 import json
 import os
 import re
@@ -85,11 +86,13 @@ def _manifest_info_from_text(data):
     release_notes = manifest.get("release_notes") or manifest.get("notes") or ""
     if isinstance(release_notes, (list, tuple)):
         release_notes = "\n".join([str(item) for item in release_notes])
+    package_sha256 = str(manifest.get("package_sha256") or "").strip().lower()
     return {
         "remote_version": remote_version,
         "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
         "package_url": manifest.get("package_url") or DEFAULT_PACKAGE_URL,
+        "package_sha256": package_sha256 or None,
         "release_notes": release_notes,
     }
 
@@ -135,6 +138,7 @@ def check_for_update():
         "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
         "package_url": update_info.get("package_url") or DEFAULT_PACKAGE_URL,
+        "package_sha256": update_info.get("package_sha256"),
         "release_notes": update_info.get("release_notes") or "",
     }
 
@@ -325,9 +329,23 @@ def install_update(update_info, progress_callback=None):
         if os.path.exists(staging_dir):
             shutil.rmtree(staging_dir)
 
+        package_bytes = _read_bytes_url(package_url, PACKAGE_DOWNLOAD_TIMEOUT, progress_callback)
+
+        expected_sha256 = str(update_info.get("package_sha256") or "").strip().lower()
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(package_bytes).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "Update package failed integrity check (sha256 mismatch, expected {} got {}). "
+                    "Install aborted.".format(expected_sha256, actual_sha256)
+                )
+            _progress(progress_callback, 58, "Update package verified.")
+        else:
+            print("Bake Groups update: manifest has no package_sha256, skipping integrity verification.")
+
         zip_path = os.path.join(work_dir, "package.zip")
         with open(zip_path, "wb") as handle:
-            handle.write(_read_bytes_url(package_url, PACKAGE_DOWNLOAD_TIMEOUT, progress_callback))
+            handle.write(package_bytes)
 
         _progress(progress_callback, 60, "Extracting update package...")
         extract_dir = os.path.join(work_dir, "extract")
@@ -387,8 +405,9 @@ class UpdateInstallWorker(QtCore.QThread):
 class UpdateAvailableDialog(QtWidgets.QDialog):
     update_requested = QtCore.Signal()
     release_notes_requested = QtCore.Signal()
+    check_requested = QtCore.Signal()
 
-    def __init__(self, update_info, parent=None):
+    def __init__(self, update_info=None, parent=None):
         super(UpdateAvailableDialog, self).__init__(parent)
         self.update_info = update_info or {}
         self.install_worker = None
@@ -400,6 +419,10 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.setMaximumWidth(560)
         self._build_ui()
         self._apply_style()
+        if update_info:
+            self.set_result(update_info)
+        else:
+            self.set_idle()
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -432,14 +455,14 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         header_layout.addLayout(title_layout, 1)
         layout.addLayout(header_layout)
 
-        message = QtWidgets.QLabel(bg_l10n.text("New version available"))
-        message.setObjectName("UpdateMessage")
-        layout.addWidget(message)
+        self.message_label = QtWidgets.QLabel(bg_l10n.text("Checking for updates..."))
+        self.message_label.setObjectName("UpdateMessage")
+        layout.addWidget(self.message_label)
 
-        body = QtWidgets.QLabel(bg_l10n.text("A newer build is available for your current installation."))
-        body.setObjectName("UpdateBody")
-        body.setWordWrap(True)
-        layout.addWidget(body)
+        self.body_label = QtWidgets.QLabel("")
+        self.body_label.setObjectName("UpdateBody")
+        self.body_label.setWordWrap(True)
+        layout.addWidget(self.body_label)
 
         self.status_label = QtWidgets.QLabel("")
         self.status_label.setObjectName("UpdateStatus")
@@ -454,42 +477,44 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
 
-        versions = QtWidgets.QFrame()
-        versions.setObjectName("VersionPanel")
-        versions_layout = QtWidgets.QGridLayout(versions)
+        self.versions_panel = QtWidgets.QFrame()
+        self.versions_panel.setObjectName("VersionPanel")
+        versions_layout = QtWidgets.QGridLayout(self.versions_panel)
         versions_layout.setContentsMargins(14, 10, 14, 10)
         versions_layout.setHorizontalSpacing(16)
         versions_layout.setVerticalSpacing(8)
 
         current_label = QtWidgets.QLabel(bg_l10n.text("Installed:"))
         latest_label = QtWidgets.QLabel(bg_l10n.text("Latest:"))
-        current_value = QtWidgets.QLabel(str(self.update_info.get("current_version") or bg_version.__version__))
-        latest_value = QtWidgets.QLabel(str(self.update_info.get("remote_version") or ""))
+        self.current_value = QtWidgets.QLabel(str(bg_version.__version__))
+        self.latest_value = QtWidgets.QLabel("")
         current_label.setObjectName("VersionLabel")
         latest_label.setObjectName("VersionLabel")
-        current_value.setObjectName("VersionValue")
-        latest_value.setObjectName("VersionValueAccent")
+        self.current_value.setObjectName("VersionValue")
+        self.latest_value.setObjectName("VersionValueAccent")
         versions_layout.addWidget(current_label, 0, 0)
-        versions_layout.addWidget(current_value, 0, 1)
+        versions_layout.addWidget(self.current_value, 0, 1)
         versions_layout.addWidget(latest_label, 1, 0)
-        versions_layout.addWidget(latest_value, 1, 1)
+        versions_layout.addWidget(self.latest_value, 1, 1)
         versions_layout.setColumnStretch(1, 1)
-        layout.addWidget(versions)
+        layout.addWidget(self.versions_panel)
 
-        notes_title = QtWidgets.QLabel(bg_l10n.text("What's New in {version}").format(version=str(self.update_info.get("remote_version") or "")))
-        notes_title.setObjectName("ReleaseNotesTitle")
-        layout.addWidget(notes_title)
+        self.notes_title = QtWidgets.QLabel("")
+        self.notes_title.setObjectName("ReleaseNotesTitle")
+        layout.addWidget(self.notes_title)
 
-        notes_text = self.update_info.get("release_notes") or bg_l10n.text("Release notes are not available for this build.")
         self.release_notes_box = QtWidgets.QTextEdit()
         self.release_notes_box.setObjectName("ReleaseNotesBox")
         self.release_notes_box.setReadOnly(True)
-        self.release_notes_box.setPlainText(str(notes_text))
         self.release_notes_box.setMaximumHeight(110)
         layout.addWidget(self.release_notes_box)
 
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(8)
+
+        self.check_btn = QtWidgets.QPushButton(bg_l10n.text("Check"))
+        self.check_btn.clicked.connect(self.check_requested.emit)
+        buttons.addWidget(self.check_btn)
         buttons.addStretch(1)
 
         self.release_btn = QtWidgets.QPushButton(bg_l10n.text("Release Notes"))
@@ -504,6 +529,81 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         buttons.addWidget(self.update_btn)
         layout.addLayout(buttons)
 
+    def set_idle(self):
+        self.update_info = {}
+        self._set_status_warning(False)
+        self.status_label.hide()
+        self.progress_bar.hide()
+        self.message_label.setText(bg_version.PLUGIN_NAME)
+        self.body_label.setText(bg_l10n.text("Click Check to look for a newer build on GitHub."))
+        self.current_value.setText(str(bg_version.__version__))
+        self.latest_value.setText("?")
+        self.versions_panel.show()
+        self.notes_title.hide()
+        self.release_notes_box.hide()
+        self.release_btn.hide()
+        self.update_btn.hide()
+        self.check_btn.setEnabled(True)
+        self.later_btn.setText(bg_l10n.text("Close"))
+
+    def set_checking(self):
+        self.update_info = {}
+        self._set_status_warning(False)
+        self.status_label.hide()
+        self.progress_bar.hide()
+        self.message_label.setText(bg_l10n.text("Checking for updates..."))
+        self.body_label.setText(bg_l10n.text("Looking for a newer build on GitHub..."))
+        self.current_value.setText(str(bg_version.__version__))
+        self.latest_value.setText("...")
+        self.versions_panel.show()
+        self.notes_title.hide()
+        self.release_notes_box.hide()
+        self.release_btn.hide()
+        self.update_btn.hide()
+        self.check_btn.setEnabled(False)
+        self.later_btn.setText(bg_l10n.text("Close"))
+
+    def set_result(self, result):
+        self.update_info = result or {}
+        self._set_status_warning(False)
+        self.status_label.hide()
+        self.progress_bar.hide()
+        self.check_btn.setEnabled(True)
+        self.later_btn.setText(bg_l10n.text("Close"))
+        self.current_value.setText(str(self.update_info.get("current_version") or bg_version.__version__))
+
+        if self.update_info.get("error"):
+            self.message_label.setText(bg_l10n.text("Update check failed"))
+            self.body_label.setText(bg_l10n.text("Update check failed: {error}").format(error=self.update_info.get("error")))
+            self.latest_value.setText("?")
+            self.notes_title.hide()
+            self.release_notes_box.hide()
+            self.release_btn.hide()
+            self.update_btn.hide()
+            return
+
+        self.latest_value.setText(str(self.update_info.get("remote_version") or self.update_info.get("current_version") or ""))
+
+        if self.update_info.get("is_update_available"):
+            self.message_label.setText(bg_l10n.text("New version available"))
+            self.body_label.setText(bg_l10n.text("A newer build is available for your current installation."))
+            self.notes_title.setText(bg_l10n.text("What's New in {version}").format(version=str(self.update_info.get("remote_version") or "")))
+            self.notes_title.show()
+            notes_text = self.update_info.get("release_notes") or bg_l10n.text("Release notes are not available for this build.")
+            self.release_notes_box.setPlainText(str(notes_text))
+            self.release_notes_box.show()
+            self.release_btn.show()
+            self.update_btn.show()
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(bg_l10n.text("Update Now"))
+        else:
+            self.message_label.setText(bg_l10n.text("You're up to date"))
+            self.body_label.setText(bg_l10n.text("No newer build was found."))
+            self.notes_title.hide()
+            self.release_notes_box.hide()
+            self.release_btn.hide()
+            self.update_btn.hide()
+
     def set_installing(self):
         self._set_status_warning(False)
         self.status_label.setText(bg_l10n.text("Installing update..."))
@@ -514,6 +614,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.release_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
         self.later_btn.show()
+        self.check_btn.setEnabled(False)
 
     def set_install_progress(self, value, message):
         self._set_status_warning(False)
@@ -526,6 +627,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.release_btn.setEnabled(True)
         self.later_btn.setEnabled(True)
         self.later_btn.setText(bg_l10n.text("Close"))
+        self.check_btn.setEnabled(not result.get("success"))
         if result.get("success"):
             self.install_success = True
             self.progress_bar.setValue(100)
@@ -677,9 +779,10 @@ def open_url(url):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
-def show_update_dialog(update_info, parent=None):
-    dialog = UpdateAvailableDialog(update_info, parent)
-    dialog.release_notes_requested.connect(lambda: open_url(update_info.get("releases_url") or bg_version.RELEASES_URL))
+def _wire_update_dialog(dialog):
+    dialog.release_notes_requested.connect(
+        lambda: open_url(dialog.update_info.get("releases_url") or bg_version.RELEASES_URL)
+    )
 
     def start_install():
         if getattr(dialog, "install_success", False):
@@ -688,7 +791,7 @@ def show_update_dialog(update_info, parent=None):
         if dialog.install_worker and dialog.install_worker.isRunning():
             return
         dialog.set_installing()
-        worker = UpdateInstallWorker(update_info, dialog)
+        worker = UpdateInstallWorker(dialog.update_info, dialog)
         dialog.install_worker = worker
         worker.install_progress.connect(dialog.set_install_progress)
         worker.install_result.connect(dialog.set_install_result)
@@ -697,6 +800,28 @@ def show_update_dialog(update_info, parent=None):
         worker.start()
 
     dialog.update_requested.connect(start_install)
+    return dialog
+
+
+def show_update_dialog(update_info, parent=None):
+    dialog = UpdateAvailableDialog(update_info, parent)
+    _wire_update_dialog(dialog)
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog
+
+
+def open_updates_window(parent, on_check_requested):
+    """Opens the "Updates" window immediately in an idle state (no network
+    call yet). The caller feeds check_for_update() results into it via
+    dialog.set_result(...) or dialog.set_checking() once a check actually
+    runs. The dialog's own "Check" button invokes on_check_requested, which
+    is the only thing that triggers the network check.
+    """
+    dialog = UpdateAvailableDialog(None, parent)
+    _wire_update_dialog(dialog)
+    dialog.check_requested.connect(on_check_requested)
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()

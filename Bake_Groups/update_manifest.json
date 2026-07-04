@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.3.5",
+  "latest_version": "1.3.6",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
   "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main",
-  "release_notes": "Improved the preflight check before Analyze HP.\nAdded Create by Mat (beta).\nAdded Find Lost (beta).\nImproved Combine Fin behavior.\nImproved translation."
+  "release_notes": "Updated the interface: new standalone Check button (duplicate/ZBrush/combined-mesh checks no longer slow down every Analyze HP run), redesigned update-check window, renamed Color Groups to Color HP.\nFixed old bugs: a crash in the final HP group merge pass, viewport refresh conflicts between Smooth View and Color HP that could crash Maya, the pre-analysis checker silently stopping after an in-window fix.\nAdded integrity verification to the auto-updater.\n...and, as always, probably added a few new ones :)"
 }

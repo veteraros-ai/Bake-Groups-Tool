@@ -190,6 +190,10 @@ def localize_widget(widget):
             key = _source_key(widget, current)
             widget.setText(text(key, _fallback_label(key)))
             _set_common_help(widget, key)
+        else:
+            existing = widget.property("bg_i18n_key") if hasattr(widget, "property") else None
+            if existing:
+                _set_common_help(widget, existing)
 
     if isinstance(widget, QtWidgets.QLineEdit):
         current = widget.placeholderText()

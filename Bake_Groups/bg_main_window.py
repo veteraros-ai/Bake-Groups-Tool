@@ -32,7 +32,8 @@ except ImportError:
     QAction = QtWidgets.QAction
     QShortcut = QtWidgets.QShortcut
 
-from bg_ui_widgets import CollapsibleSection, FinalMeshLineEdit, SubgroupButton, ResolveNameDialog, get_icon
+from bg_ui_widgets import (CollapsibleSection, FinalMeshLineEdit, SubgroupButton,
+                           ResolveNameDialog, configure_square_icon_button, get_icon)
 from bg_mixins import (HPAnalysisMixin, LPMatchingMixin, FinalViewMixin,
                        ExportMixin, GroupManagementMixin, SceneInteractionMixin, TOCMixin)
 
@@ -179,7 +180,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         g_layout.addLayout(create_layout)
 
         tool_layout = QtWidgets.QHBoxLayout()
-        self.cb_color_subgroups = QtWidgets.QCheckBox("Color Groups")
+        self.cb_color_subgroups = QtWidgets.QCheckBox("Color HP")
         self.cb_color_subgroups.setChecked(False)
         self.cb_color_subgroups.toggled.connect(self.on_color_by_subgroups_toggled)
         self.cb_keep_hp_structure = QtWidgets.QCheckBox("Keep HP")
@@ -188,19 +189,28 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
 
         self.btn_combine_mesh = QtWidgets.QPushButton("Combine")
         self.btn_combine_mesh.setStyleSheet("background-color: #3b5998;")
+        configure_square_icon_button(self.btn_combine_mesh, "Combine.png", "Combine")
         self.btn_combine_mesh.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Combine", self.tool_combine))
         self.btn_separate_mesh = QtWidgets.QPushButton("Separate")
         self.btn_separate_mesh.setStyleSheet("background-color: #8c6239;")
+        configure_square_icon_button(self.btn_separate_mesh, "Separate.png", "Separate")
         self.btn_separate_mesh.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Separate", self.tool_separate))
         self.btn_find_zbrush = QtWidgets.QPushButton("Find ZBrush")
         self.btn_find_zbrush.setStyleSheet("background-color: #d18c15; font-weight: bold;")
+        configure_square_icon_button(self.btn_find_zbrush, "Find_ZBRUSH.png", "Find ZBrush")
         self.btn_find_zbrush.clicked.connect(self.find_zbrush_meshes)
         self.btn_find_zbrush.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.btn_find_zbrush.customContextMenuRequested.connect(self.show_find_zbrush_context_menu)
 
+        self.btn_check_before_analyze = QtWidgets.QPushButton("Check Before Analyze")
+        self.btn_check_before_analyze.setStyleSheet("background-color: #555555;")
+        configure_square_icon_button(self.btn_check_before_analyze, "Cheking_Icon.png", "Check Before Analyze")
+        self.btn_check_before_analyze.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Check", self.run_pre_analysis_checks))
+
         tool_layout.addWidget(self.btn_combine_mesh)
         tool_layout.addWidget(self.btn_separate_mesh)
         tool_layout.addWidget(self.btn_find_zbrush)
+        tool_layout.addWidget(self.btn_check_before_analyze)
 
         tool_checks = QtWidgets.QVBoxLayout()
         tool_checks.setSpacing(0)
@@ -933,8 +943,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         menu.addSeparator()
         action_support_package = menu.addAction(bg_l10n.text("Save Support Package"))
         action_support_package.triggered.connect(self.save_support_package)
-        action_check_updates = menu.addAction(bg_l10n.text("Check for Updates"))
-        action_check_updates.triggered.connect(self.check_updates_from_log_menu)
+        action_about = menu.addAction(bg_l10n.text("About"))
+        action_about.triggered.connect(self.show_about_dialog)
         menu.addSeparator()
         action_save_debug = menu.addAction(bg_l10n.text("Save Debug Log"))
         action_save_debug.setEnabled(bool(getattr(self, 'last_debug_lines', []) or getattr(self, 'user_action_lines', [])))
@@ -1120,12 +1130,26 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         worker.finished.connect(self.clear_update_worker)
         worker.start()
 
-    def check_updates_from_log_menu(self):
+    def show_about_dialog(self):
+        # Just opens the window. It does not touch the network by itself -
+        # the actual update check only runs when the user clicks "Check"
+        # inside the window (run_manual_update_check).
+        if self.update_dialog:
+            self.update_dialog.raise_()
+            self.update_dialog.activateWindow()
+            return
+        self.update_dialog = bg_update.open_updates_window(self, self.run_manual_update_check)
+        self.update_dialog.destroyed.connect(self.clear_update_dialog)
+
+    def run_manual_update_check(self):
         if self.update_worker and self.update_worker.isRunning():
-            self.log(bg_l10n.text("Update check is already running."), "orange")
+            if self.update_dialog:
+                self.update_dialog.raise_()
+                self.update_dialog.activateWindow()
             return
         self.manual_update_check_requested = True
-        self.log(bg_l10n.text("Checking for updates..."), "lightblue")
+        if self.update_dialog:
+            self.update_dialog.set_checking()
         self.start_update_check()
 
     def handle_update_check_result(self, result):
@@ -1137,19 +1161,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             return
         manual_check = bool(getattr(self, "manual_update_check_requested", False))
         self.manual_update_check_requested = False
-        if not result:
-            if manual_check:
-                self.log(bg_l10n.text("Update check failed: {error}").format(error="No result"), "red")
+
+        dialog = self.update_dialog
+        if manual_check and dialog:
+            try:
+                dialog.set_result(result or {"error": "No result"})
+            except RuntimeError:
+                self.update_dialog = None
             return
-        if result.get("error"):
-            if manual_check:
-                self.log(bg_l10n.text("Update check failed: {error}").format(error=result.get("error")), "red")
-            return
-        if not result.get("is_update_available"):
-            if manual_check:
-                current = result.get("current_version") or getattr(bg_update.bg_version, "__version__", "")
-                latest = result.get("remote_version") or current
-                self.log(bg_l10n.text("No update available. Installed: {current}. Latest: {latest}.").format(current=current, latest=latest), "lightgreen")
+
+        if not result or result.get("error") or not result.get("is_update_available"):
             return
         self.update_dialog = bg_update.show_update_dialog(result, self)
         self.update_dialog.destroyed.connect(self.clear_update_dialog)
@@ -1163,18 +1184,19 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
         self.update_dialog = None
 
     def on_color_by_subgroups_toggled(self, checked):
-        if checked:
-            self.subgroup_color_index_map = {}
-            self.update_subgroup_colors()
-        else:
-            self.restore_subgroup_colors(clean_history=True)
-            pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
-            if pair:
-                hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-                removed = self.cleanup_subgroup_preview_color_sets([hp_main, lp_main], clean_history=True)
-                if removed:
-                    self.log("Color Groups: removed {} old preview color set(s).".format(removed), "lightblue")
-            self.subgroup_color_index_map = {}
+        with self._suspended_viewport_refresh():
+            if checked:
+                self.subgroup_color_index_map = {}
+                self.update_subgroup_colors()
+            else:
+                self.restore_subgroup_colors(clean_history=True)
+                pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+                if pair:
+                    hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+                    removed = self.cleanup_subgroup_preview_color_sets([hp_main, lp_main], clean_history=True)
+                    if removed:
+                        self.log("Color HP: removed {} old preview color set(s).".format(removed), "lightblue")
+                self.subgroup_color_index_map = {}
         self.refresh_left_panel()
 
     def subgroup_color_for_name(self, name):
@@ -1456,50 +1478,79 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             except Exception:
                 pass
 
-    def restore_subgroup_colors(self, clean_history=False):
-        cache = getattr(self, 'subgroup_color_override_cache', {})
-        for node, attrs in list(cache.items()):
-            if not cmds.objExists(node):
-                node_uuid = attrs.get("__uuid")
-                matches = cmds.ls(node_uuid, long=True) if node_uuid else []
-                if matches:
-                    node = matches[0]
-                else:
-                    continue
-            try:
-                if "overrideRGBColors" in attrs:
-                    cmds.setAttr("{}.overrideRGBColors".format(node), attrs["overrideRGBColors"])
-                if "overrideColorRGB" in attrs:
-                    rgb = attrs["overrideColorRGB"]
-                    cmds.setAttr("{}.overrideColorRGB".format(node), rgb[0], rgb[1], rgb[2])
-                if "overrideColor" in attrs:
-                    cmds.setAttr("{}.overrideColor".format(node), attrs["overrideColor"])
-                if "overrideEnabled" in attrs:
-                    cmds.setAttr("{}.overrideEnabled".format(node), attrs["overrideEnabled"])
-                target = self.color_target_for_shape(node)
-                has_external_color_set = False
-                if target:
+    @contextlib.contextmanager
+    def _suspended_viewport_refresh(self):
+        # Reentrant: update_subgroup_colors calls restore_subgroup_colors
+        # internally, so only the outermost call actually toggles Maya's
+        # refresh state. Batch mesh-color edits (polyColorPerVertex,
+        # polyColorSet, construction-history deletes) can otherwise race
+        # with an active Smooth Mesh Preview redraw and crash Maya.
+        depth = getattr(self, '_viewport_refresh_suspend_depth', 0)
+        if depth == 0:
+            cmds.refresh(suspend=True)
+        self._viewport_refresh_suspend_depth = depth + 1
+        try:
+            yield
+        finally:
+            depth = getattr(self, '_viewport_refresh_suspend_depth', 1) - 1
+            self._viewport_refresh_suspend_depth = depth
+            if depth <= 0:
+                cmds.refresh(suspend=False)
+
+                def safe_refresh():
                     try:
-                        color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-                        if "BG_Subgroup_Color" in color_sets:
-                            self.remove_subgroup_preview_color_set(target, clean_history=clean_history)
-                            color_sets = [name for name in color_sets if name != "BG_Subgroup_Color"]
-                        has_external_color_set = bool(color_sets)
+                        cmds.refresh()
                     except Exception:
                         pass
-                    if attrs.get("__current_color_set"):
+
+                # Даём Maya 100 мс на укладку памяти перед отрисовкой.
+                QtCore.QTimer.singleShot(100, safe_refresh)
+
+    def restore_subgroup_colors(self, clean_history=False):
+        cache = getattr(self, 'subgroup_color_override_cache', {})
+        with self._suspended_viewport_refresh():
+            for node, attrs in list(cache.items()):
+                if not cmds.objExists(node):
+                    node_uuid = attrs.get("__uuid")
+                    matches = cmds.ls(node_uuid, long=True) if node_uuid else []
+                    if matches:
+                        node = matches[0]
+                    else:
+                        continue
+                try:
+                    if "overrideRGBColors" in attrs:
+                        cmds.setAttr("{}.overrideRGBColors".format(node), attrs["overrideRGBColors"])
+                    if "overrideColorRGB" in attrs:
+                        rgb = attrs["overrideColorRGB"]
+                        cmds.setAttr("{}.overrideColorRGB".format(node), rgb[0], rgb[1], rgb[2])
+                    if "overrideColor" in attrs:
+                        cmds.setAttr("{}.overrideColor".format(node), attrs["overrideColor"])
+                    if "overrideEnabled" in attrs:
+                        cmds.setAttr("{}.overrideEnabled".format(node), attrs["overrideEnabled"])
+                    target = self.color_target_for_shape(node)
+                    has_external_color_set = False
+                    if target:
                         try:
-                            cmds.polyColorSet(target, currentColorSet=True, colorSet=attrs["__current_color_set"])
+                            color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
+                            if "BG_Subgroup_Color" in color_sets:
+                                self.remove_subgroup_preview_color_set(target, clean_history=clean_history)
+                                color_sets = [name for name in color_sets if name != "BG_Subgroup_Color"]
+                            has_external_color_set = bool(color_sets)
                         except Exception:
                             pass
-                if "displayColorChannel" in attrs and cmds.objExists("{}.displayColorChannel".format(node)):
-                    cmds.setAttr("{}.displayColorChannel".format(node), attrs["displayColorChannel"], type="string")
-                if "displayColors" in attrs and cmds.objExists("{}.displayColors".format(node)):
-                    cmds.setAttr("{}.displayColors".format(node), False if has_external_color_set else attrs["displayColors"])
-            except Exception:
-                pass
-        self.subgroup_color_override_cache = {}
-        self.delete_preview_materials()
+                        if attrs.get("__current_color_set"):
+                            try:
+                                cmds.polyColorSet(target, currentColorSet=True, colorSet=attrs["__current_color_set"])
+                            except Exception:
+                                pass
+                    if "displayColorChannel" in attrs and cmds.objExists("{}.displayColorChannel".format(node)):
+                        cmds.setAttr("{}.displayColorChannel".format(node), attrs["displayColorChannel"], type="string")
+                    if "displayColors" in attrs and cmds.objExists("{}.displayColors".format(node)):
+                        cmds.setAttr("{}.displayColors".format(node), False if has_external_color_set else attrs["displayColors"])
+                except Exception:
+                    pass
+            self.subgroup_color_override_cache = {}
+            self.delete_preview_materials()
 
     @contextlib.contextmanager
     def suspend_subgroup_color_preview(self):
@@ -1543,65 +1594,67 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
             return
         if getattr(self, 'is_final_view', False):
             colored_count = 0
-            self.ensure_subgroup_color_indices([w.get('subgroup_name') for w in getattr(self, 'final_mesh_widgets', []) if w.get('subgroup_name')])
-            for widget_data in getattr(self, 'final_mesh_widgets', []):
-                name = widget_data.get('subgroup_name')
-                color = self.subgroup_color_for_name(name)
-                for node in widget_data.get('hp_nodes', []):
-                    for color_node in self.iter_colorable_nodes(node):
-                        if self.apply_override_color(color_node, color):
-                            colored_count += 1
-            self.log("Color Groups: colored {} mesh shapes.".format(colored_count), "lightblue")
+            with self._suspended_viewport_refresh():
+                self.ensure_subgroup_color_indices([w.get('subgroup_name') for w in getattr(self, 'final_mesh_widgets', []) if w.get('subgroup_name')])
+                for widget_data in getattr(self, 'final_mesh_widgets', []):
+                    name = widget_data.get('subgroup_name')
+                    color = self.subgroup_color_for_name(name)
+                    for node in widget_data.get('hp_nodes', []):
+                        for color_node in self.iter_colorable_nodes(node):
+                            if self.apply_override_color(color_node, color):
+                                colored_count += 1
+            self.log("Color HP: colored {} mesh shapes.".format(colored_count), "lightblue")
             return
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
         if not self.active_chapter_has_subgroups(pair):
             return
-        self.restore_subgroup_colors(clean_history=True)
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        self.cleanup_subgroup_preview_color_sets([hp_main])
-        group_names = []
-        for root in (hp_main,):
-            if not root or not cmds.objExists(root):
-                continue
-            for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
-                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
-                    continue
-                short_name = child.split('|')[-1]
-                ui_name = short_name
-                for suffix in (bg_core.BakeConfig.SUFFIX_HP, bg_core.BakeConfig.SUFFIX_LP):
-                    if ui_name.endswith(suffix):
-                        ui_name = ui_name[:-len(suffix)]
-                        break
-                if ui_name not in group_names:
-                    group_names.append(ui_name)
-        self.ensure_subgroup_color_indices(sorted(group_names))
         colored_count = 0
-        for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP),):
-            if not root or not cmds.objExists(root):
-                continue
-            children = cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []
-            for child in children:
-                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+        with self._suspended_viewport_refresh():
+            self.restore_subgroup_colors(clean_history=True)
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            self.cleanup_subgroup_preview_color_sets([hp_main])
+            group_names = []
+            for root in (hp_main,):
+                if not root or not cmds.objExists(root):
                     continue
-                short_name = child.split('|')[-1]
-                if not self.cb_keep_hp_structure.isChecked():
-                    attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
-                    if cmds.objExists(attr):
-                        group_type = cmds.getAttr(attr)
-                        if suffix == bg_core.BakeConfig.SUFFIX_HP and group_type != "HP":
-                            continue
-                    elif not short_name.endswith(suffix):
+                for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
+                    if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
                         continue
-                ui_name = short_name
-                if short_name.endswith(suffix):
-                    ui_name = short_name[:-len(suffix)]
-                color = self.subgroup_color_for_name(ui_name)
-                for color_node in self.iter_colorable_nodes(child):
-                    if self.apply_override_color(color_node, color):
-                        colored_count += 1
-        self.log("Color Groups: colored {} mesh shapes.".format(colored_count), "lightblue")
+                    short_name = child.split('|')[-1]
+                    ui_name = short_name
+                    for suffix in (bg_core.BakeConfig.SUFFIX_HP, bg_core.BakeConfig.SUFFIX_LP):
+                        if ui_name.endswith(suffix):
+                            ui_name = ui_name[:-len(suffix)]
+                            break
+                    if ui_name not in group_names:
+                        group_names.append(ui_name)
+            self.ensure_subgroup_color_indices(sorted(group_names))
+            for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP),):
+                if not root or not cmds.objExists(root):
+                    continue
+                children = cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []
+                for child in children:
+                    if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                        continue
+                    short_name = child.split('|')[-1]
+                    if not self.cb_keep_hp_structure.isChecked():
+                        attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                        if cmds.objExists(attr):
+                            group_type = cmds.getAttr(attr)
+                            if suffix == bg_core.BakeConfig.SUFFIX_HP and group_type != "HP":
+                                continue
+                        elif not short_name.endswith(suffix):
+                            continue
+                    ui_name = short_name
+                    if short_name.endswith(suffix):
+                        ui_name = short_name[:-len(suffix)]
+                    color = self.subgroup_color_for_name(ui_name)
+                    for color_node in self.iter_colorable_nodes(child):
+                        if self.apply_override_color(color_node, color):
+                            colored_count += 1
+        self.log("Color HP: colored {} mesh shapes.".format(colored_count), "lightblue")
 
     def recolor_moved_subgroup_nodes(self, nodes, subgroup_name):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
@@ -1624,7 +1677,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
                 if self.apply_override_color(color_node, color):
                     colored_count += 1
         if colored_count:
-            self.log("Color Groups: recolored {} moved mesh shapes.".format(colored_count), "lightblue")
+            self.log("Color HP: recolored {} moved mesh shapes.".format(colored_count), "lightblue")
 
     def _disconnect_signal(self, signal, slot=None):
         try:

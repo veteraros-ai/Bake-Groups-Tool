@@ -496,7 +496,17 @@ class HPAnalysisMixin:
             return False
 
         if box.clickedButton() == separate_btn:
-            separated = self._separate_mesh_transforms(problem_nodes, select_result=True)
+            # Corrected in-dialog (not "Select"/manual, not "Skip") - the
+            # check must keep going to the remaining checks afterward either
+            # way, so failures here are logged, never left to raise and
+            # silently kill the rest of run_pre_analysis_checks.
+            try:
+                separated = self._separate_mesh_transforms(problem_nodes, select_result=True)
+            except Exception as exc:
+                message = bg_l10n.text("Combined mesh separation failed: {error}").format(error=exc)
+                cmds.warning(message)
+                self.log(message, "red")
+                return True
             if separated:
                 message = bg_l10n.text("Combined mesh cleanup: separated {count} mesh part(s).").format(
                     count=len(separated)
@@ -508,9 +518,9 @@ class HPAnalysisMixin:
                         "Separate Combined Meshes",
                         "parts={}".format(len(separated))
                     )
-                return True
-            self.log(bg_l10n.text("Combined mesh cleanup: nothing was separated."), "orange")
-            return False
+            else:
+                self.log(bg_l10n.text("Combined mesh cleanup: nothing was separated."), "orange")
+            return True
 
         if box.clickedButton() == skip_chapter_btn:
             if chapter_id:
@@ -727,7 +737,17 @@ class HPAnalysisMixin:
             return False
 
         if box.clickedButton() == remove_btn:
-            removed, kept, skipped = self._remove_duplicate_mesh_copies(found)
+            # Corrected in-dialog (not "Select"/manual, not "Skip") - the
+            # check must keep going to ZBrush/combined afterward, so any
+            # failure here is logged, never allowed to raise and silently
+            # kill the rest of run_pre_analysis_checks.
+            try:
+                removed, kept, skipped = self._remove_duplicate_mesh_copies(found)
+            except Exception as exc:
+                message = bg_l10n.text("Duplicate mesh cleanup failed: {error}").format(error=exc)
+                cmds.warning(message)
+                self.log(message, "red")
+                return True
             if removed:
                 message = bg_l10n.text("Duplicate mesh cleanup: removed {removed} extra copy/copies, kept {kept}.").format(
                     removed=removed,
@@ -755,6 +775,116 @@ class HPAnalysisMixin:
 
         return box.clickedButton() == skip_btn
 
+    def _reset_prep_undo_tracking(self, key):
+        setattr(self, '_prep_undo_depth_' + key, 0)
+
+    def _mark_prep_undo_step(self, key):
+        attr = '_prep_undo_depth_' + key
+        setattr(self, attr, getattr(self, attr, 0) + 1)
+
+    def _revert_prep_undo(self, key, message):
+        attr = '_prep_undo_depth_' + key
+        depth = getattr(self, attr, 0)
+        if depth <= 0:
+            return
+        setattr(self, attr, 0)
+        reverted = 0
+        for _ in range(depth):
+            try:
+                cmds.undo()
+                reverted += 1
+            except Exception as e:
+                self.log("Revert step failed: {}".format(e), "red")
+                break
+        if reverted:
+            self.refresh_left_panel()
+            if hasattr(self, 'refresh_subgroup_color_preview'):
+                self.refresh_subgroup_color_preview(reset_indices=True)
+            self.log(message, "lightblue")
+
+    def _cancel_hp_analysis(self):
+        worker = getattr(self, 'hp_worker', None)
+        if worker:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        progress = getattr(self, 'progress_dlg', None)
+        if progress:
+            try:
+                progress.close()
+            except Exception:
+                pass
+        self._revert_prep_undo('hp_analysis', "HP subgroup/mesh structure reverted to its state before Analyze HP.")
+        self.log("HP Analysis canceled.", "orange")
+
+    def _cancel_lp_matching(self):
+        worker = getattr(self, 'lp_worker', None)
+        if worker:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        progress = getattr(self, 'progress_dlg_lp', None)
+        if progress:
+            try:
+                progress.close()
+            except Exception:
+                pass
+        self._revert_prep_undo('lp_matching', "LP mesh structure reverted to its state before Assign LP Meshes.")
+        self.log("Assign LP Meshes canceled.", "orange")
+
+    def _mark_chapter_pre_checked(self, pair_id):
+        checked = getattr(self, '_hp_structure_checked_chapters', None)
+        if checked is None:
+            checked = set()
+            self._hp_structure_checked_chapters = checked
+        checked.add(pair_id)
+
+    def _chapter_is_pre_checked(self, pair_id):
+        checked = getattr(self, '_hp_structure_checked_chapters', None)
+        return bool(checked and pair_id in checked)
+
+    def run_pre_analysis_checks(self):
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            cmds.warning("No active chapter selected.")
+            return False
+
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main:
+            cmds.warning("HighPoly root not found.")
+            return False
+
+        # Each _confirm_* function returns False only for "Select" (user wants
+        # to inspect/fix meshes manually - genuinely stop here) or an
+        # explicit cancel. "Skip"/"Skip This Chapter" and in-dialog fixes
+        # (Remove Extra Copies/Separate) return True so the remaining checks
+        # still run - a fix in one category should not hide problems in the
+        # others. An unexpected exception must not look identical to "all
+        # clear", so it is caught here and reported instead of vanishing.
+        try:
+            if not self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main):
+                return False
+            self.log("Check: duplicate mesh check done, continuing...", "lightblue")
+
+            if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
+                return False
+            self.log("Check: ZBrush candidate check done, continuing...", "lightblue")
+
+            if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
+                return False
+        except Exception as exc:
+            message = "Check failed unexpectedly: {}".format(exc)
+            cmds.warning(message)
+            self.log(message, "red")
+            return False
+
+        self._mark_chapter_pre_checked(pair['id'])
+        self.log("Check: no duplicate, ZBrush or combined-mesh issues found.", "lightgreen")
+        cmds.inViewMessage(amg="Check completed: no issues found.", pos='midCenter', fade=True)
+        return True
+
     def run_hp_analysis(self, _):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
@@ -769,14 +899,31 @@ class HPAnalysisMixin:
         if not self.validate_frozen_transforms([hp_main], [hp_main], bg_l10n.text("Analyze HP")):
             return
 
-        if not self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main):
-            return
+        # Duplicate/ZBrush/combined-mesh checks moved to the standalone "Check"
+        # button (run_pre_analysis_checks) so Analyze HP is not slowed down by
+        # them on every run. If this chapter hasn't been checked yet this
+        # session, offer to run it now instead of silently skipping it.
+        if not self._chapter_is_pre_checked(pair['id']):
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle(bg_l10n.text("Structure Not Checked"))
+            box.setIcon(QtWidgets.QMessageBox.Question)
+            box.setText(bg_l10n.text("Duplicate, ZBrush and combined-mesh checks have not been run for this chapter yet."))
+            box.setInformativeText(bg_l10n.text("Run the check now, or continue Analyze HP without checking?"))
+            check_btn = box.addButton(bg_l10n.text("Check Now"), QtWidgets.QMessageBox.AcceptRole)
+            continue_btn = box.addButton(bg_l10n.text("Continue"), QtWidgets.QMessageBox.ActionRole)
+            box.addButton(QtWidgets.QMessageBox.Cancel)
+            bg_l10n.localize_widget_tree(box)
+            box.setDefaultButton(check_btn)
+            box.exec_()
 
-        if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
-            return
+            clicked = box.clickedButton()
+            if clicked == check_btn:
+                if not self.run_pre_analysis_checks():
+                    return
+            elif clicked != continue_btn:
+                return
 
-        if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
-            return
+        self._reset_prep_undo_tracking('hp_analysis')
 
         worker_params = self.gather_hp_worker_params()
         threshold_pct = worker_params['threshold_pct']
@@ -875,6 +1022,8 @@ class HPAnalysisMixin:
                     except:
                         pass
 
+        self._mark_prep_undo_step('hp_analysis')
+
         final_meshes = [m for m in final_meshes if not m.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_LP)]
         final_meshes = [m for m in final_meshes if not re.search(r'(_lp|_low)$', m.split('|')[-1], re.IGNORECASE)]
 
@@ -901,43 +1050,46 @@ class HPAnalysisMixin:
                             return True
             return False
 
-        for m in final_meshes:
-            data = bg_core.MeshDataManager.get_mesh_data(m)
-            if data:
-                current_name = m
-                is_zb = is_mesh_zbrush_main_thread(current_name, data)
-                data["is_zbrush"] = is_zb
+        with bg_core.undo_chunk("PrepareHPAnalysis_MeshCache"):
+            for m in final_meshes:
+                data = bg_core.MeshDataManager.get_mesh_data(m)
+                if data:
+                    current_name = m
+                    is_zb = is_mesh_zbrush_main_thread(current_name, data)
+                    data["is_zbrush"] = is_zb
 
-                if is_zb and not current_name.lower().endswith("_zbrush"):
+                    if is_zb and not current_name.lower().endswith("_zbrush"):
+                        if cmds.objExists(current_name):
+                            try:
+                                short_name = current_name.split('|')[-1]
+                                new_short = cmds.rename(current_name, short_name + "_Zbrush")
+                                current_name = cmds.ls(new_short, long=True)[0]
+                            except Exception as e:
+                                self.log("Failed to rename {}: {}".format(m, e), "red")
+
+                    data["name"] = current_name
+
                     if cmds.objExists(current_name):
-                        try:
-                            short_name = current_name.split('|')[-1]
-                            new_short = cmds.rename(current_name, short_name + "_Zbrush")
-                            current_name = cmds.ls(new_short, long=True)[0]
-                        except Exception as e:
-                            self.log("Failed to rename {}: {}".format(m, e), "red")
+                        bbox = cmds.xform(current_name, q=True, ws=True, bb=True)
+                        data["bbox"] = bbox
+                        dx = abs(bbox[3] - bbox[0])
+                        dy = abs(bbox[4] - bbox[1])
+                        dz = abs(bbox[5] - bbox[2])
+                        data["radius"] = math.sqrt((dx/2)**2 + (dy/2)**2 + (dz/2)**2)
+                        data["bbox_vol"] = dx * dy * dz
+                    else:
+                        data["bbox"] = [-1, -1, -1, 1, 1, 1]
+                        data["radius"] = 1.0
+                        data["bbox_vol"] = 8.0
 
-                data["name"] = current_name
+                    try:
+                        data['uuid'] = cmds.ls(current_name, uuid=True)[0]
+                    except Exception:
+                        pass
 
-                if cmds.objExists(current_name):
-                    bbox = cmds.xform(current_name, q=True, ws=True, bb=True)
-                    data["bbox"] = bbox
-                    dx = abs(bbox[3] - bbox[0])
-                    dy = abs(bbox[4] - bbox[1])
-                    dz = abs(bbox[5] - bbox[2])
-                    data["radius"] = math.sqrt((dx/2)**2 + (dy/2)**2 + (dz/2)**2)
-                    data["bbox_vol"] = dx * dy * dz
-                else:
-                    data["bbox"] = [-1, -1, -1, 1, 1, 1]
-                    data["radius"] = 1.0
-                    data["bbox_vol"] = 8.0
+                    self.hp_data_cache[current_name] = data
 
-                try:
-                    data['uuid'] = cmds.ls(current_name, uuid=True)[0]
-                except Exception:
-                    pass
-
-                self.hp_data_cache[current_name] = data
+        self._mark_prep_undo_step('hp_analysis')
 
         if not self.hp_data_cache:
             return self.log("No valid HP mesh data.", "red")
@@ -946,413 +1098,422 @@ class HPAnalysisMixin:
         if custom_mapping:
             self.log("Loaded {} custom cluster(s) from GT / manual links.".format(len(custom_mapping)), "lightblue")
 
-        final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
-        final_lp_meshes = [m for m in final_lp_meshes if not m.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_HP)]
-
-        self.lp_data_cache.clear()
         lp_prebuilt_verts_cache = {}
-        enable_lp_material_slots = bool(worker_params.get('material_slots', False))
-        material_progress_dlg = None
-        material_progress_step = [0]
 
-        def _make_material_progress(total):
-            if not enable_lp_material_slots:
-                return None
-            dlg = QtWidgets.QProgressDialog(bg_l10n.text("Analyzing LP materials..."), bg_l10n.text("Cancel"), 0, max(int(total), 1), self)
-            dlg.setWindowModality(QtCore.Qt.WindowModal)
-            dlg.setMinimumDuration(0)
-            dlg.setValue(0)
-            dlg.show()
-            QtWidgets.QApplication.processEvents()
-            return dlg
+        def _prepare_lp_data_cache_for_hp_analysis():
+            final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
+            final_lp_meshes = [m for m in final_lp_meshes if not m.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_HP)]
 
-        def _update_material_progress(label):
-            if not material_progress_dlg:
-                return False
-            material_progress_step[0] += 1
-            material_progress_dlg.setLabelText(label)
-            material_progress_dlg.setValue(min(material_progress_step[0], material_progress_dlg.maximum()))
-            QtWidgets.QApplication.processEvents()
-            return material_progress_dlg.wasCanceled()
+            self.lp_data_cache.clear()
+            enable_lp_material_slots = bool(worker_params.get('material_slots', False))
+            material_progress_dlg = None
+            material_progress_step = [0]
 
-        def _close_material_progress():
-            if material_progress_dlg:
-                material_progress_dlg.close()
+            def _make_material_progress(total):
+                if not enable_lp_material_slots:
+                    return None
+                dlg = QtWidgets.QProgressDialog(bg_l10n.text("Analyzing LP materials..."), bg_l10n.text("Cancel"), 0, max(int(total), 1), self)
+                dlg.setWindowModality(QtCore.Qt.WindowModal)
+                dlg.setMinimumDuration(0)
+                dlg.setValue(0)
+                dlg.show()
                 QtWidgets.QApplication.processEvents()
+                return dlg
 
-        def _sg_material_node(sg):
-            try:
-                nodes = cmds.listConnections("{}.surfaceShader".format(sg), source=True, destination=False) or []
-                if nodes:
-                    return nodes[0]
-            except Exception:
-                pass
-            return sg
+            def _update_material_progress(label):
+                if not material_progress_dlg:
+                    return False
+                material_progress_step[0] += 1
+                material_progress_dlg.setLabelText(label)
+                material_progress_dlg.setValue(min(material_progress_step[0], material_progress_dlg.maximum()))
+                QtWidgets.QApplication.processEvents()
+                return material_progress_dlg.wasCanceled()
 
-        def _short_node(name):
-            return str(name).split('|')[-1].split(':')[-1]
+            def _close_material_progress():
+                if material_progress_dlg:
+                    material_progress_dlg.close()
+                    QtWidgets.QApplication.processEvents()
 
-        def _lp_material_cache_key(lp_meshes):
-            entries = []
-            for mesh in lp_meshes:
-                shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
-                shape = shapes[0] if shapes else mesh
+            def _sg_material_node(sg):
                 try:
-                    shape_uuid = (cmds.ls(shape, uuid=True) or [""])[0]
+                    nodes = cmds.listConnections("{}.surfaceShader".format(sg), source=True, destination=False) or []
+                    if nodes:
+                        return nodes[0]
                 except Exception:
-                    shape_uuid = ""
+                    pass
+                return sg
+
+            def _short_node(name):
+                return str(name).split('|')[-1].split(':')[-1]
+
+            def _lp_material_cache_key(lp_meshes):
+                entries = []
+                for mesh in lp_meshes:
+                    shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+                    shape = shapes[0] if shapes else mesh
+                    try:
+                        shape_uuid = (cmds.ls(shape, uuid=True) or [""])[0]
+                    except Exception:
+                        shape_uuid = ""
+                    try:
+                        face_count = cmds.polyEvaluate(mesh, face=True)
+                    except Exception:
+                        face_count = 0
+                    sgs = []
+                    for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
+                        sgs.append((sg, _sg_material_node(sg)))
+                    entries.append((shape_uuid, int(face_count or 0), tuple(sgs)))
+                return tuple(entries)
+
+            def _connected_shader_records(lp_node, mesh_fn, dag, total_faces, include_faces):
                 try:
-                    face_count = cmds.polyEvaluate(mesh, face=True)
+                    shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
                 except Exception:
-                    face_count = 0
-                sgs = []
-                for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
-                    sgs.append((sg, _sg_material_node(sg)))
-                entries.append((shape_uuid, int(face_count or 0), tuple(sgs)))
-            return tuple(entries)
-
-        def _connected_shader_records(lp_node, mesh_fn, dag, total_faces, include_faces):
-            try:
-                shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
-            except Exception:
-                return []
-            records = []
-            for shader_index, shader_obj in enumerate(shaders):
-                try:
-                    sg = om.MFnDependencyNode(shader_obj).name()
-                except Exception:
-                    continue
-                material = _sg_material_node(sg)
-                rec = {
-                    "key": material or sg,
-                    "slot": None,
-                    "material": material,
-                    "shading_engines": [sg],
-                    "faces": []
-                }
-                if include_faces:
-                    rec["faces"] = [
-                        face_id for face_id, assigned_index in enumerate(face_shader_indices)
-                        if int(assigned_index) == shader_index and face_id < total_faces
-                    ]
-                    if not rec["faces"]:
-                        continue
-                records.append(rec)
-            return records
-
-        def _material_faces_for_sg(mesh_transform, shape, sg, total_faces):
-            members = cmds.sets(sg, q=True) or []
-            mesh_components = []
-            mesh_long = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
-            shape_long = (cmds.ls(shape, long=True) or [shape])[0]
-            for member in members:
-                for item in (cmds.ls(member, long=True) or []):
-                    if item == mesh_long or item == shape_long:
-                        return list(range(total_faces))
-                    if item.startswith(mesh_long + ".") or item.startswith(shape_long + "."):
-                        mesh_components.append(item)
-            if not mesh_components:
-                return []
-            try:
-                faces = cmds.polyListComponentConversion(mesh_components, toFace=True)
-                faces_flat = cmds.ls(faces, flatten=True, long=True) or []
-            except Exception:
-                return []
-            result = set()
-            for item in faces_flat:
-                match = re.search(r'\.f\[(\d+)\]', item)
-                if match:
-                    result.add(int(match.group(1)))
-            return sorted(result)
-
-        def _collect_lp_material_context(lp_meshes):
-            material_by_key = {}
-            sg_to_key = {}
-            for mesh in lp_meshes:
-                if _update_material_progress("Scanning LP materials: {}".format(mesh.split('|')[-1])):
-                    return None, None, None
-                shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
-                if not shapes:
-                    continue
+                    return []
                 records = []
+                for shader_index, shader_obj in enumerate(shaders):
+                    try:
+                        sg = om.MFnDependencyNode(shader_obj).name()
+                    except Exception:
+                        continue
+                    material = _sg_material_node(sg)
+                    rec = {
+                        "key": material or sg,
+                        "slot": None,
+                        "material": material,
+                        "shading_engines": [sg],
+                        "faces": []
+                    }
+                    if include_faces:
+                        rec["faces"] = [
+                            face_id for face_id, assigned_index in enumerate(face_shader_indices)
+                            if int(assigned_index) == shader_index and face_id < total_faces
+                        ]
+                        if not rec["faces"]:
+                            continue
+                    records.append(rec)
+                return records
+
+            def _material_faces_for_sg(mesh_transform, shape, sg, total_faces):
+                members = cmds.sets(sg, q=True) or []
+                mesh_components = []
+                mesh_long = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
+                shape_long = (cmds.ls(shape, long=True) or [shape])[0]
+                for member in members:
+                    for item in (cmds.ls(member, long=True) or []):
+                        if item == mesh_long or item == shape_long:
+                            return list(range(total_faces))
+                        if item.startswith(mesh_long + ".") or item.startswith(shape_long + "."):
+                            mesh_components.append(item)
+                if not mesh_components:
+                    return []
                 try:
-                    sel = om.MSelectionList()
-                    sel.add(mesh)
-                    dag = sel.getDagPath(0)
-                    if dag.hasFn(om.MFn.kTransform):
-                        dag.extendToShape()
-                    mesh_fn = om.MFnMesh(dag)
-                    records = _connected_shader_records(mesh, mesh_fn, dag, mesh_fn.numPolygons, False)
+                    faces = cmds.polyListComponentConversion(mesh_components, toFace=True)
+                    faces_flat = cmds.ls(faces, flatten=True, long=True) or []
                 except Exception:
+                    return []
+                result = set()
+                for item in faces_flat:
+                    match = re.search(r'\.f\[(\d+)\]', item)
+                    if match:
+                        result.add(int(match.group(1)))
+                return sorted(result)
+
+            def _collect_lp_material_context(lp_meshes):
+                material_by_key = {}
+                sg_to_key = {}
+                for mesh in lp_meshes:
+                    if _update_material_progress("Scanning LP materials: {}".format(mesh.split('|')[-1])):
+                        return None, None, None
+                    shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+                    if not shapes:
+                        continue
                     records = []
-                if records:
-                    for rec in records:
-                        material = rec.get("material")
-                        key = rec.get("key") or material
-                        for sg in rec.get("shading_engines") or []:
-                            sg_to_key[sg] = key
+                    try:
+                        sel = om.MSelectionList()
+                        sel.add(mesh)
+                        dag = sel.getDagPath(0)
+                        if dag.hasFn(om.MFn.kTransform):
+                            dag.extendToShape()
+                        mesh_fn = om.MFnMesh(dag)
+                        records = _connected_shader_records(mesh, mesh_fn, dag, mesh_fn.numPolygons, False)
+                    except Exception:
+                        records = []
+                    if records:
+                        for rec in records:
+                            material = rec.get("material")
+                            key = rec.get("key") or material
+                            for sg in rec.get("shading_engines") or []:
+                                sg_to_key[sg] = key
+                            material_by_key.setdefault(key, {
+                                "material": material,
+                                "shading_engines": set()
+                            })
+                            for sg in rec.get("shading_engines") or []:
+                                material_by_key[key]["shading_engines"].add(sg)
+                        continue
+                    for sg in sorted(set(cmds.listConnections(shapes[0], type='shadingEngine') or []), key=_short_node):
+                        material = _sg_material_node(sg)
+                        key = material or sg
+                        sg_to_key[sg] = key
                         material_by_key.setdefault(key, {
                             "material": material,
                             "shading_engines": set()
                         })
-                        for sg in rec.get("shading_engines") or []:
-                            material_by_key[key]["shading_engines"].add(sg)
-                    continue
-                for sg in sorted(set(cmds.listConnections(shapes[0], type='shadingEngine') or []), key=_short_node):
-                    material = _sg_material_node(sg)
-                    key = material or sg
-                    sg_to_key[sg] = key
-                    material_by_key.setdefault(key, {
-                        "material": material,
-                        "shading_engines": set()
-                    })
-                    material_by_key[key]["shading_engines"].add(sg)
-            ordered_keys = sorted(material_by_key.keys(), key=lambda k: (_short_node(material_by_key[k].get("material") or k).lower(), _short_node(k).lower()))
-            slots_by_key = {}
-            if len(ordered_keys) > 1:
-                for index, key in enumerate(ordered_keys, 1):
-                    slots_by_key[key] = "M{:02d}".format(index)
-            return material_by_key, sg_to_key, slots_by_key
+                        material_by_key[key]["shading_engines"].add(sg)
+                ordered_keys = sorted(material_by_key.keys(), key=lambda k: (_short_node(material_by_key[k].get("material") or k).lower(), _short_node(k).lower()))
+                slots_by_key = {}
+                if len(ordered_keys) > 1:
+                    for index, key in enumerate(ordered_keys, 1):
+                        slots_by_key[key] = "M{:02d}".format(index)
+                return material_by_key, sg_to_key, slots_by_key
 
-        lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = {}, {}, {}
-        use_lp_material_slots = False
-        material_cache_key = None
-        material_cached_records = None
-        material_cache = getattr(self, '_lp_material_analysis_cache', None)
-        if material_cache is None:
-            material_cache = {}
-            self._lp_material_analysis_cache = material_cache
+            lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = {}, {}, {}
+            use_lp_material_slots = False
+            material_cache_key = None
+            material_cached_records = None
+            material_cache = getattr(self, '_lp_material_analysis_cache', None)
+            if material_cache is None:
+                material_cache = {}
+                self._lp_material_analysis_cache = material_cache
 
-        if enable_lp_material_slots:
-            material_cache_key = _lp_material_cache_key(final_lp_meshes)
-            material_cached_records = material_cache.get(material_cache_key)
-            if material_cached_records:
-                use_lp_material_slots = True
-                for slot in material_cached_records.get("slots", []):
-                    lp_material_slots_by_key[slot] = slot
-            else:
-                material_progress_dlg = _make_material_progress((len(final_lp_meshes) * 2) + 2)
-                lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = _collect_lp_material_context(final_lp_meshes)
-                if material_progress_dlg and material_progress_dlg.wasCanceled():
-                    _close_material_progress()
-                    return self.log("Analyze HP material scan canceled.", "orange")
-                use_lp_material_slots = bool(lp_material_slots_by_key)
+            if enable_lp_material_slots:
+                material_cache_key = _lp_material_cache_key(final_lp_meshes)
+                material_cached_records = material_cache.get(material_cache_key)
+                if material_cached_records:
+                    use_lp_material_slots = True
+                    for slot in material_cached_records.get("slots", []):
+                        lp_material_slots_by_key[slot] = slot
+                else:
+                    material_progress_dlg = _make_material_progress((len(final_lp_meshes) * 2) + 2)
+                    lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = _collect_lp_material_context(final_lp_meshes)
+                    if material_progress_dlg and material_progress_dlg.wasCanceled():
+                        _close_material_progress()
+                        self.log("Analyze HP material scan canceled.", "orange")
+                        return True
+                    use_lp_material_slots = bool(lp_material_slots_by_key)
 
-        def _lp_material_records(lp_node, total_faces, mesh_fn=None, dag=None):
-            shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
-            if not shapes:
-                return []
-            shape = shapes[0]
-            records_by_key = {}
-            fast_records = _connected_shader_records(lp_node, mesh_fn, dag, total_faces, True) if mesh_fn and dag else []
-            if fast_records:
-                for rec in fast_records:
-                    key = rec.get("key")
-                    if key not in lp_material_slots_by_key:
+            def _lp_material_records(lp_node, total_faces, mesh_fn=None, dag=None):
+                shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
+                if not shapes:
+                    return []
+                shape = shapes[0]
+                records_by_key = {}
+                fast_records = _connected_shader_records(lp_node, mesh_fn, dag, total_faces, True) if mesh_fn and dag else []
+                if fast_records:
+                    for rec in fast_records:
+                        key = rec.get("key")
+                        if key not in lp_material_slots_by_key:
+                            continue
+                        rec["slot"] = lp_material_slots_by_key.get(key)
+                        records_by_key.setdefault(key, {
+                            "key": key,
+                            "slot": rec.get("slot"),
+                            "material": rec.get("material"),
+                            "shading_engines": set(),
+                            "faces": set()
+                        })
+                        records_by_key[key]["shading_engines"].update(rec.get("shading_engines") or [])
+                        records_by_key[key]["faces"].update(rec.get("faces") or [])
+                    records = []
+                    for key, rec in records_by_key.items():
+                        rec["faces"] = sorted(rec["faces"])
+                        rec["shading_engines"] = sorted(rec["shading_engines"], key=_short_node)
+                        records.append(rec)
+                    return sorted(records, key=lambda r: (r.get("slot") or "M00", _short_node(r.get("material") or r.get("key")).lower()))
+                for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
+                    key = lp_sg_to_material_key.get(sg) or _sg_material_node(sg) or sg
+                    faces = _material_faces_for_sg(lp_node, shape, sg, total_faces)
+                    if not faces:
                         continue
-                    rec["slot"] = lp_material_slots_by_key.get(key)
-                    records_by_key.setdefault(key, {
+                    info = lp_materials_by_key.get(key, {})
+                    rec = records_by_key.setdefault(key, {
                         "key": key,
-                        "slot": rec.get("slot"),
-                        "material": rec.get("material"),
+                        "slot": lp_material_slots_by_key.get(key),
+                        "material": info.get("material") or _sg_material_node(sg),
                         "shading_engines": set(),
                         "faces": set()
                     })
-                    records_by_key[key]["shading_engines"].update(rec.get("shading_engines") or [])
-                    records_by_key[key]["faces"].update(rec.get("faces") or [])
+                    rec["shading_engines"].add(sg)
+                    rec["faces"].update(faces)
                 records = []
                 for key, rec in records_by_key.items():
                     rec["faces"] = sorted(rec["faces"])
                     rec["shading_engines"] = sorted(rec["shading_engines"], key=_short_node)
                     records.append(rec)
                 return sorted(records, key=lambda r: (r.get("slot") or "M00", _short_node(r.get("material") or r.get("key")).lower()))
-            for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
-                key = lp_sg_to_material_key.get(sg) or _sg_material_node(sg) or sg
-                faces = _material_faces_for_sg(lp_node, shape, sg, total_faces)
-                if not faces:
-                    continue
-                info = lp_materials_by_key.get(key, {})
-                rec = records_by_key.setdefault(key, {
-                    "key": key,
-                    "slot": lp_material_slots_by_key.get(key),
-                    "material": info.get("material") or _sg_material_node(sg),
-                    "shading_engines": set(),
-                    "faces": set()
-                })
-                rec["shading_engines"].add(sg)
-                rec["faces"].update(faces)
-            records = []
-            for key, rec in records_by_key.items():
-                rec["faces"] = sorted(rec["faces"])
-                rec["shading_engines"] = sorted(rec["shading_engines"], key=_short_node)
-                records.append(rec)
-            return sorted(records, key=lambda r: (r.get("slot") or "M00", _short_node(r.get("material") or r.get("key")).lower()))
 
-        def build_virtual_lp_shells_for_hp_worker(lp_node):
-            """Create analysis-only LP shell records for combined LP meshes.
-            The Maya scene is not split; only worker cache gets virtual shell keys.
-            """
-            try:
-                sel = om.MSelectionList()
-                sel.add(lp_node)
-                dag = sel.getDagPath(0)
-                if dag.hasFn(om.MFn.kTransform):
-                    dag.extendToShape()
+            def build_virtual_lp_shells_for_hp_worker(lp_node):
+                """Create analysis-only LP shell records for combined LP meshes.
+                The Maya scene is not split; only worker cache gets virtual shell keys.
+                """
+                try:
+                    sel = om.MSelectionList()
+                    sel.add(lp_node)
+                    dag = sel.getDagPath(0)
+                    if dag.hasFn(om.MFn.kTransform):
+                        dag.extendToShape()
 
-                mesh_fn = om.MFnMesh(dag)
-                points = mesh_fn.getPoints(om.MSpace.kWorld)
-                counts, connects = mesh_fn.getVertices()
-                material_records = _lp_material_records(lp_node, len(counts), mesh_fn, dag) if use_lp_material_slots else []
-                face_material = {}
-                if material_records:
-                    for rec in material_records:
-                        for face_id in rec.get("faces", []):
-                            face_material.setdefault(face_id, rec)
+                    mesh_fn = om.MFnMesh(dag)
+                    points = mesh_fn.getPoints(om.MSpace.kWorld)
+                    counts, connects = mesh_fn.getVertices()
+                    material_records = _lp_material_records(lp_node, len(counts), mesh_fn, dag) if use_lp_material_slots else []
+                    face_material = {}
+                    if material_records:
+                        for rec in material_records:
+                            for face_id in rec.get("faces", []):
+                                face_material.setdefault(face_id, rec)
 
-                face_vertices = []
-                vertex_to_faces = {}
-                idx = 0
-                for face_id, count in enumerate(counts):
-                    verts = list(connects[idx:idx + count])
-                    idx += count
-                    face_vertices.append(verts)
-                    for v in verts:
-                        vertex_to_faces.setdefault(v, []).append(face_id)
+                    face_vertices = []
+                    vertex_to_faces = {}
+                    idx = 0
+                    for face_id, count in enumerate(counts):
+                        verts = list(connects[idx:idx + count])
+                        idx += count
+                        face_vertices.append(verts)
+                        for v in verts:
+                            vertex_to_faces.setdefault(v, []).append(face_id)
 
-                visited_faces = set()
-                shells = []
-                shell_index = 0
+                    visited_faces = set()
+                    shells = []
+                    shell_index = 0
 
-                for start_face in range(len(face_vertices)):
-                    if start_face in visited_faces:
+                    for start_face in range(len(face_vertices)):
+                        if start_face in visited_faces:
+                            continue
+
+                        material_rec = face_material.get(start_face)
+                        material_key = material_rec.get("key") if material_rec else None
+                        stack = [start_face]
+                        visited_faces.add(start_face)
+                        shell_faces = []
+                        shell_verts = set()
+
+                        while stack:
+                            f = stack.pop()
+                            shell_faces.append(f)
+                            for v in face_vertices[f]:
+                                shell_verts.add(v)
+                                for nf in vertex_to_faces.get(v, []):
+                                    next_rec = face_material.get(nf)
+                                    next_key = next_rec.get("key") if next_rec else None
+                                    if nf not in visited_faces and (not use_lp_material_slots or next_key == material_key):
+                                        visited_faces.add(nf)
+                                        stack.append(nf)
+
+                        if not shell_verts:
+                            continue
+
+                        xs = [points[v].x for v in shell_verts]
+                        ys = [points[v].y for v in shell_verts]
+                        zs = [points[v].z for v in shell_verts]
+                        mn = [min(xs), min(ys), min(zs)]
+                        mx = [max(xs), max(ys), max(zs)]
+                        size = [mx[i] - mn[i] for i in range(3)]
+                        center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
+                        bbox_vol = max(size[0] * size[1] * size[2], 1e-6)
+                        diag = math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2])
+
+                        shell_key = "{}::shell_{:03d}".format(lp_node, shell_index)
+                        material_slot = material_rec.get("slot") if material_rec else None
+                        if material_slot:
+                            shell_key = "{}::{}".format(shell_key, material_slot)
+                        verts_flat = []
+                        for v in shell_verts:
+                            pnt = points[v]
+                            verts_flat.extend([pnt.x, pnt.y, pnt.z])
+                        if material_slot and shell_faces:
+                            max_face_samples = 1500
+                            face_step = max(1, int(len(shell_faces) / float(max_face_samples)))
+                            for face_id in shell_faces[::face_step]:
+                                verts = face_vertices[face_id]
+                                if not verts:
+                                    continue
+                                acc_x = acc_y = acc_z = 0.0
+                                for v in verts:
+                                    pnt = points[v]
+                                    acc_x += pnt.x
+                                    acc_y += pnt.y
+                                    acc_z += pnt.z
+                                inv = 1.0 / float(len(verts))
+                                verts_flat.extend([acc_x * inv, acc_y * inv, acc_z * inv])
+
+                        shell_data = {
+                            "name": shell_key,
+                            "node": shell_key,
+                            "real_node": lp_node,
+                            "is_virtual_lp_shell": True,
+                            "min": mn,
+                            "max": mx,
+                            "bbox": [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]],
+                            "size": size,
+                            "center": center,
+                            "diag": diag,
+                            "radius": diag * 0.5,
+                            "bbox_vol": bbox_vol,
+                            "vtx": len(shell_verts),
+                            "edges": 0,
+                            "faces": len(shell_faces),
+                            "hash": "empty",
+                            "uv_count": 0,
+                            "uv_shell_count": 0,
+                            "uv_signature": "empty",
+                            "variance": 999.0,
+                        }
+                        if material_slot:
+                            shell_data["material_slot"] = material_slot
+                            shell_data["material_key"] = material_rec.get("key")
+                            shell_data["material_name"] = _short_node(material_rec.get("material") or material_rec.get("key"))
+                            shell_data["material_shading_engines"] = list(material_rec.get("shading_engines") or [])
+                        shells.append((shell_key, shell_data, verts_flat))
+                        shell_index += 1
+
+                    return shells
+                except Exception as e:
+                    self.log("LP shell cache failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
+                    return []
+
+            computed_material_records = []
+            if material_cached_records:
+                for shell_key, shell_data, shell_verts in material_cached_records.get("records", []):
+                    self.lp_data_cache[shell_key] = dict(shell_data)
+                    lp_prebuilt_verts_cache[shell_key] = list(shell_verts)
+                self.log("Analyze HP: reused cached LP material slots.", "lightblue")
+            else:
+                for m in final_lp_meshes:
+                    if use_lp_material_slots and _update_material_progress("Building LP material cache: {}".format(m.split('|')[-1])):
+                        _close_material_progress()
+                        self.log("Analyze HP material scan canceled.", "orange")
+                        return True
+                    shell_records = build_virtual_lp_shells_for_hp_worker(m)
+                    if shell_records and (len(shell_records) > 1 or use_lp_material_slots):
+                        for shell_key, shell_data, shell_verts in shell_records:
+                            self.lp_data_cache[shell_key] = shell_data
+                            lp_prebuilt_verts_cache[shell_key] = shell_verts
+                            if use_lp_material_slots:
+                                computed_material_records.append((shell_key, dict(shell_data), list(shell_verts)))
                         continue
 
-                    material_rec = face_material.get(start_face)
-                    material_key = material_rec.get("key") if material_rec else None
-                    stack = [start_face]
-                    visited_faces.add(start_face)
-                    shell_faces = []
-                    shell_verts = set()
+                    data = bg_core.MeshDataManager.get_mesh_data(m)
+                    if data:
+                        if cmds.objExists(m):
+                            data["bbox"] = cmds.xform(m, q=True, ws=True, bb=True)
+                        self.lp_data_cache[m] = data
 
-                    while stack:
-                        f = stack.pop()
-                        shell_faces.append(f)
-                        for v in face_vertices[f]:
-                            shell_verts.add(v)
-                            for nf in vertex_to_faces.get(v, []):
-                                next_rec = face_material.get(nf)
-                                next_key = next_rec.get("key") if next_rec else None
-                                if nf not in visited_faces and (not use_lp_material_slots or next_key == material_key):
-                                    visited_faces.add(nf)
-                                    stack.append(nf)
+            if use_lp_material_slots and computed_material_records and material_cache_key:
+                material_cache[material_cache_key] = {
+                    "records": computed_material_records,
+                    "slots": sorted(set([data.get("material_slot") for _key, data, _verts in computed_material_records if data.get("material_slot")]))
+                }
 
-                    if not shell_verts:
-                        continue
-
-                    xs = [points[v].x for v in shell_verts]
-                    ys = [points[v].y for v in shell_verts]
-                    zs = [points[v].z for v in shell_verts]
-                    mn = [min(xs), min(ys), min(zs)]
-                    mx = [max(xs), max(ys), max(zs)]
-                    size = [mx[i] - mn[i] for i in range(3)]
-                    center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
-                    bbox_vol = max(size[0] * size[1] * size[2], 1e-6)
-                    diag = math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2])
-
-                    shell_key = "{}::shell_{:03d}".format(lp_node, shell_index)
-                    material_slot = material_rec.get("slot") if material_rec else None
-                    if material_slot:
-                        shell_key = "{}::{}".format(shell_key, material_slot)
-                    verts_flat = []
-                    for v in shell_verts:
-                        pnt = points[v]
-                        verts_flat.extend([pnt.x, pnt.y, pnt.z])
-                    if material_slot and shell_faces:
-                        max_face_samples = 1500
-                        face_step = max(1, int(len(shell_faces) / float(max_face_samples)))
-                        for face_id in shell_faces[::face_step]:
-                            verts = face_vertices[face_id]
-                            if not verts:
-                                continue
-                            acc_x = acc_y = acc_z = 0.0
-                            for v in verts:
-                                pnt = points[v]
-                                acc_x += pnt.x
-                                acc_y += pnt.y
-                                acc_z += pnt.z
-                            inv = 1.0 / float(len(verts))
-                            verts_flat.extend([acc_x * inv, acc_y * inv, acc_z * inv])
-
-                    shell_data = {
-                        "name": shell_key,
-                        "node": shell_key,
-                        "real_node": lp_node,
-                        "is_virtual_lp_shell": True,
-                        "min": mn,
-                        "max": mx,
-                        "bbox": [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]],
-                        "size": size,
-                        "center": center,
-                        "diag": diag,
-                        "radius": diag * 0.5,
-                        "bbox_vol": bbox_vol,
-                        "vtx": len(shell_verts),
-                        "edges": 0,
-                        "faces": len(shell_faces),
-                        "hash": "empty",
-                        "uv_count": 0,
-                        "uv_shell_count": 0,
-                        "uv_signature": "empty",
-                        "variance": 999.0,
-                    }
-                    if material_slot:
-                        shell_data["material_slot"] = material_slot
-                        shell_data["material_key"] = material_rec.get("key")
-                        shell_data["material_name"] = _short_node(material_rec.get("material") or material_rec.get("key"))
-                        shell_data["material_shading_engines"] = list(material_rec.get("shading_engines") or [])
-                    shells.append((shell_key, shell_data, verts_flat))
-                    shell_index += 1
-
-                return shells
-            except Exception as e:
-                self.log("LP shell cache failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
-                return []
-
-        computed_material_records = []
-        if material_cached_records:
-            for shell_key, shell_data, shell_verts in material_cached_records.get("records", []):
-                self.lp_data_cache[shell_key] = dict(shell_data)
-                lp_prebuilt_verts_cache[shell_key] = list(shell_verts)
-            self.log("Analyze HP: reused cached LP material slots.", "lightblue")
-        else:
-            for m in final_lp_meshes:
-                if use_lp_material_slots and _update_material_progress("Building LP material cache: {}".format(m.split('|')[-1])):
-                    _close_material_progress()
-                    return self.log("Analyze HP material scan canceled.", "orange")
-                shell_records = build_virtual_lp_shells_for_hp_worker(m)
-                if shell_records and (len(shell_records) > 1 or use_lp_material_slots):
-                    for shell_key, shell_data, shell_verts in shell_records:
-                        self.lp_data_cache[shell_key] = shell_data
-                        lp_prebuilt_verts_cache[shell_key] = shell_verts
-                        if use_lp_material_slots:
-                            computed_material_records.append((shell_key, dict(shell_data), list(shell_verts)))
-                    continue
-
-                data = bg_core.MeshDataManager.get_mesh_data(m)
-                if data:
-                    if cmds.objExists(m):
-                        data["bbox"] = cmds.xform(m, q=True, ws=True, bb=True)
-                    self.lp_data_cache[m] = data
-
-        if use_lp_material_slots and computed_material_records and material_cache_key:
-            material_cache[material_cache_key] = {
-                "records": computed_material_records,
-                "slots": sorted(set([data.get("material_slot") for _key, data, _verts in computed_material_records if data.get("material_slot")]))
-            }
-
-        if use_lp_material_slots:
-            self.log("Analyze HP: detected {} LP material slot(s) for grouping.".format(len(lp_material_slots_by_key)), "lightblue")
-        _close_material_progress()
+            if use_lp_material_slots:
+                self.log("Analyze HP: detected {} LP material slot(s) for grouping.".format(len(lp_material_slots_by_key)), "lightblue")
+            _close_material_progress()
+        lp_prep_canceled = _prepare_lp_data_cache_for_hp_analysis()
+        self._mark_prep_undo_step('hp_analysis')
+        if lp_prep_canceled:
+            self._cancel_hp_analysis()
+            return
 
         # Progress dialog
         self.progress_dlg = QtWidgets.QProgressDialog(bg_l10n.text("Extracting Data & Fingerprinting..."), bg_l10n.text("Cancel"), 0, 100, self)
@@ -1622,7 +1783,8 @@ class HPAnalysisMixin:
                 maya_main_window.setEnabled(True)
 
         if self.progress_dlg.wasCanceled():
-            return self.log("HP Analysis canceled.", "orange")
+            self._cancel_hp_analysis()
+            return
 
         self.progress_dlg.setLabelText(bg_l10n.text("Starting Multithreaded Processing..."))
 
@@ -1646,10 +1808,13 @@ class HPAnalysisMixin:
         self.hp_worker.progress_value.connect(self.progress_dlg.setValue)
         self.hp_worker.progress_text.connect(self.progress_dlg.setLabelText)
         self.hp_worker.finished.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair))
-        self.progress_dlg.canceled.connect(self.hp_worker.stop)
+        self.progress_dlg.canceled.connect(self._cancel_hp_analysis)
         self.hp_worker.start()
 
     def on_hp_finished(self, groups, logs, hp_main, pair):
+        # Analysis completed and we're about to commit the new structure -
+        # the pre-analysis prep is no longer something Cancel should revert.
+        self._reset_prep_undo_tracking('hp_analysis')
         self.progress_dlg.close()
         worker = getattr(self, 'hp_worker', None)
         summary_lines = list(getattr(worker, 'summary_lines', []) or [])
@@ -1881,7 +2046,9 @@ class LPMatchingMixin:
         if not self.validate_frozen_transforms([hp_main, lp_main], [hp_main, lp_main], bg_l10n.text("Assign LP Meshes")):
             return
 
+        self._reset_prep_undo_tracking('lp_matching')
         final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
+        self._mark_prep_undo_step('lp_matching')
         final_lp_meshes = [m for m in final_lp_meshes if not m.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_HP)]
         if not final_lp_meshes:
             return self.log("No valid LP meshes found.", "red")
@@ -2137,7 +2304,8 @@ class LPMatchingMixin:
                 maya_main_window.setEnabled(True)
 
         if self.progress_dlg_lp.wasCanceled():
-            return self.log("Matching canceled during geometry caching.", "orange")
+            self._cancel_lp_matching()
+            return
 
         self.progress_dlg_lp.setLabelText(bg_l10n.text("Initializing C++ Matching Kernel..."))
         self.progress_dlg_lp.setMaximum(100)
@@ -2157,12 +2325,13 @@ class LPMatchingMixin:
         self.lp_worker.progress_value.connect(self.progress_dlg_lp.setValue)
         self.lp_worker.progress_text.connect(self.progress_dlg_lp.setLabelText)
         self.lp_worker.finished.connect(lambda matches, groups=hp_groups, hvc=hp_verts_cache, lf=lp_verts_cache_fast, lfull=lp_verts_cache_full: self.on_lp_finished(matches, lp_main, groups, hvc, lf, lfull))
-        self.progress_dlg_lp.canceled.connect(self.lp_worker.stop)
+        self.progress_dlg_lp.canceled.connect(self._cancel_lp_matching)
 
         self.lp_worker.start()
 
     def on_lp_finished(self, matches, lp_main, hp_groups=None, hp_verts_cache=None, lp_verts_cache_fast=None, lp_verts_cache_full=None):
         # ... (Код завершения остается абсолютно без изменений) ...
+        self._reset_prep_undo_tracking('lp_matching')
         self.progress_dlg_lp.close()
         total_matched = 0
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -2325,6 +2494,17 @@ class FinalViewMixin:
         finally:
             if not is_batch:
                 cmds.refresh(suspend=False)
+
+                def safe_refresh():
+                    try:
+                        cmds.refresh()
+                    except Exception:
+                        pass
+
+                # Даём Maya 100 мс на укладку памяти перед отрисовкой, так же
+                # как в toggle_preview_smoothing, чтобы точечное изменение
+                # уровня сглаживания одного меша не конфликтовало с Maya.
+                QtCore.QTimer.singleShot(100, safe_refresh)
 
     def set_final_low_visibility(self, base_name, visible):
         global_lp_root = "LP_Combine_BG"
@@ -2852,8 +3032,6 @@ class ExportMixin:
         cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
 
     def export_active_lp_only(self):
-        with self.suspend_isolation():
-            self.log("Exporting Active LP Only (Isolation Disabled)...", "lightblue")
         if not self.active_root_id:
             cmds.warning("No active chapter to export.")
             return
@@ -2866,15 +3044,15 @@ class ExportMixin:
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
         with self.suspend_subgroup_color_preview():
-            if self._export_lp_for_pair(pair, export_dir):
-                cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
-            else:
-                cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
+            with self.suspend_isolation():
+                self.log("Exporting Active LP Only (Isolation Disabled)...", "lightblue")
+                if self._export_lp_for_pair(pair, export_dir):
+                    cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
+                else:
+                    cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
         cmds.select(clear=True)
 
     def batch_export_all_lp_only(self):
-        with self.suspend_isolation():
-            self.log("Batch Exporting All LP (Isolation Disabled)...", "lightblue")
         if not self.root_pairs:
             cmds.warning("Chapter list is empty.")
             return
@@ -2892,9 +3070,11 @@ class ExportMixin:
         self.disable_preview_smoothing_for_export()
         success_count = 0
         with self.suspend_subgroup_color_preview():
-            for pair in self.root_pairs:
-                if self._export_lp_for_pair(pair, export_dir):
-                    success_count += 1
+            with self.suspend_isolation():
+                self.log("Batch Exporting All LP (Isolation Disabled)...", "lightblue")
+                for pair in self.root_pairs:
+                    if self._export_lp_for_pair(pair, export_dir):
+                        success_count += 1
         cmds.inViewMessage(amg="Batch LP export completed! Successful: {} chapters".format(success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
@@ -4440,448 +4620,450 @@ class SceneInteractionMixin:
         QtWidgets.QApplication.processEvents()
 
         try:
-            with bg_core.undo_chunk("CreateByMaterial"):
-                progress.setLabelText(bg_l10n.text("Preparing source meshes..."))
-                progress.setValue(5)
-                QtWidgets.QApplication.processEvents()
-
-                hp_meshes = self.prepare_meshes(hp_source, flatten=True)
-                lp_meshes = self.prepare_meshes(lp_source, flatten=True)
-                hp_meshes = [m for m in hp_meshes if m and cmds.objExists(m)]
-                lp_meshes = [m for m in lp_meshes if m and cmds.objExists(m)]
-
-                if not lp_meshes:
-                    self.log("Create by Mat: no LP meshes found.", "red")
-                    return
-                if not hp_meshes:
-                    self.log("Create by Mat: no HP meshes found.", "red")
-                    return
-
-                buckets_by_signature = {}
-                all_lp_proxies = []
-                total_lp = max(len(lp_meshes), 1)
-                for index, lp_node in enumerate(lp_meshes):
-                    if progress.wasCanceled():
-                        self.log("Create by Mat canceled.", "orange")
-                        return
-                    progress.setLabelText(bg_l10n.text("Scanning LP materials: {name}").format(name=lp_node.split('|')[-1]))
-                    progress.setValue(5 + int((index / float(total_lp)) * 25))
+            def _create_root_pairs_by_material_body():
+                with bg_core.undo_chunk("CreateByMaterial"):
+                    progress.setLabelText(bg_l10n.text("Preparing source meshes..."))
+                    progress.setValue(5)
                     QtWidgets.QApplication.processEvents()
 
-                    signature, labels = self._create_by_mat_material_signature(lp_node)
-                    bucket = buckets_by_signature.setdefault(signature, {
-                        "labels": labels,
-                        "lp_meshes": [],
-                        "lp_proxies": [],
-                        "hp_meshes": []
-                    })
-                    bucket["lp_meshes"].append(lp_node)
-                    proxies = self._create_by_mat_lp_proxy_records(lp_node, signature, labels)
-                    for proxy in proxies:
-                        proxy["bucket"] = bucket
-                        bucket["lp_proxies"].append(proxy)
-                        all_lp_proxies.append(proxy)
+                    hp_meshes = self.prepare_meshes(hp_source, flatten=True)
+                    lp_meshes = self.prepare_meshes(lp_source, flatten=True)
+                    hp_meshes = [m for m in hp_meshes if m and cmds.objExists(m)]
+                    lp_meshes = [m for m in lp_meshes if m and cmds.objExists(m)]
 
-                if not buckets_by_signature:
-                    self.log("Create by Mat: LP materials were not detected.", "red")
-                    return
-                self.log("Create by Mat: built {} LP match proxy region(s).".format(len(all_lp_proxies)), "lightblue")
-
-                ordered_buckets = []
-                used_bases = set()
-                for signature, bucket in sorted(buckets_by_signature.items(), key=lambda item: " ".join(item[1].get("labels", [])).lower()):
-                    labels = bucket.get("labels") or ["Material"]
-                    raw_base = "_".join([self._create_by_mat_short_name(label) for label in labels])
-                    bucket["base"] = self._create_by_mat_safe_base(raw_base, used_bases)
-                    bucket["signature"] = signature
-                    ordered_buckets.append(bucket)
-
-                container_count = self._create_by_mat_mark_container_proxies(all_lp_proxies)
-                if container_count:
-                    self.log("Create by Mat: detected {} large multi-material LP container(s).".format(container_count), "lightblue")
-
-                lp_diags = sorted([
-                    float((proxy.get("data") or {}).get("diag", 0.0) or 0.0)
-                    for proxy in all_lp_proxies
-                    if float((proxy.get("data") or {}).get("diag", 0.0) or 0.0) > 0.0
-                ])
-                hp_scene_diag_values = []
-                for hp_node in hp_meshes:
-                    hp_data = self._create_by_mat_mesh_data(hp_node)
-                    if hp_data:
-                        hp_scene_diag_values.append(float(hp_data.get("diag", 0.0) or 0.0))
-                scene_diag_values = sorted([v for v in (lp_diags + hp_scene_diag_values) if v > 0.0])
-                if scene_diag_values:
-                    mid = len(scene_diag_values) // 2
-                    scene_diag = scene_diag_values[mid] if len(scene_diag_values) % 2 else (scene_diag_values[mid - 1] + scene_diag_values[mid]) * 0.5
-                else:
-                    scene_diag = 1.0
-                if hp_scene_diag_values:
-                    hp_diags_sorted = sorted([v for v in hp_scene_diag_values if v > 0.0])
-                    mid = len(hp_diags_sorted) // 2
-                    median_hp_diag = hp_diags_sorted[mid] if len(hp_diags_sorted) % 2 else (hp_diags_sorted[mid - 1] + hp_diags_sorted[mid]) * 0.5
-                else:
-                    median_hp_diag = scene_diag
-
-                progress.setLabelText(bg_l10n.text("Resolving HP ownership from LP chapters..."))
-                progress.setValue(35)
-                QtWidgets.QApplication.processEvents()
-
-                low_confidence = 0
-                review_hp_meshes = []
-                review_examples = []
-                hp_records = {}
-                direct_count = 0
-                container_direct_count = 0
-                total_hp = max(len(hp_meshes), 1)
-                for index, hp_node in enumerate(hp_meshes):
-                    if progress.wasCanceled():
-                        self.log("Create by Mat canceled.", "orange")
+                    if not lp_meshes:
+                        self.log("Create by Mat: no LP meshes found.", "red")
                         return
-                    progress.setValue(35 + int((index / float(total_hp)) * 22))
-                    QtWidgets.QApplication.processEvents()
-
-                    hp_data = self._create_by_mat_mesh_data(hp_node)
-                    if not hp_data:
-                        continue
-                    quick_scored = []
-                    for proxy in all_lp_proxies:
-                        metrics = self._create_by_mat_hp_proxy_quick_score(hp_data, proxy)
-                        if metrics:
-                            quick_scored.append(metrics)
-                    hp_records[hp_node] = {
-                        "data": hp_data,
-                        "bucket": None,
-                        "score": 0.0,
-                        "strong": False,
-                        "source": "unassigned",
-                        "has_overlap": False
-                    }
-                    if not quick_scored:
-                        continue
-                    quick_scored.sort(key=lambda item: item.get("quick_score", -1e18), reverse=True)
-                    scored = []
-                    for quick in quick_scored[:48]:
-                        metrics = self._create_by_mat_hp_owner_score(hp_data, quick.get("proxy"), scene_diag)
-                        scored.append(metrics)
-                    if not scored:
-                        continue
-                    scored.sort(key=lambda item: item.get("score", -1e18), reverse=True)
-                    non_container = [candidate for candidate in scored if candidate.get("confident") and not (candidate.get("proxy") or {}).get("is_container")]
-                    container = [candidate for candidate in scored if candidate.get("confident") and (candidate.get("proxy") or {}).get("is_container")]
-                    best = non_container[0] if non_container else None
-                    if best is None and container:
-                        best = container[0]
-                    if best is None:
-                        continue
-                    best_bucket = (best.get("proxy") or {}).get("bucket")
-                    if best_bucket is None:
-                        continue
-                    hp_records[hp_node].update({
-                        "bucket": best_bucket,
-                        "score": float(best.get("score", 0.0) or 0.0),
-                        "strong": bool(best.get("strong")),
-                        "source": "container" if (best.get("proxy") or {}).get("is_container") else "lp",
-                        "has_overlap": bool(best.get("has_overlap"))
-                    })
-                    direct_count += 1
-                    if not best.get("has_overlap"):
-                        low_confidence += 1
-                    if (best.get("proxy") or {}).get("is_container"):
-                        container_direct_count += 1
-
-                progress.setLabelText(bg_l10n.text("Attaching HP floaters to large owners..."))
-                progress.setValue(58)
-                QtWidgets.QApplication.processEvents()
-
-                assigned_items = [(hp, rec) for hp, rec in hp_records.items() if rec.get("bucket") is not None]
-                stable_parents = [
-                    (hp, rec) for hp, rec in assigned_items
-                    if rec.get("strong") and float(rec.get("data", {}).get("diag", 0.0) or 0.0) >= median_hp_diag * 0.35
-                ]
-                floater_reassigned = 0
-                floater_assigned = 0
-                floater_tests = 0
-                total_records = max(len(hp_records), 1)
-                for index, (hp_node, rec) in enumerate(list(hp_records.items())):
-                    if progress.wasCanceled():
-                        self.log("Create by Mat canceled.", "orange")
+                    if not hp_meshes:
+                        self.log("Create by Mat: no HP meshes found.", "red")
                         return
-                    if index % max(1, total_records // 20) == 0:
-                        progress.setValue(58 + int((index / float(total_records)) * 12))
+
+                    buckets_by_signature = {}
+                    all_lp_proxies = []
+                    total_lp = max(len(lp_meshes), 1)
+                    for index, lp_node in enumerate(lp_meshes):
+                        if progress.wasCanceled():
+                            self.log("Create by Mat canceled.", "orange")
+                            return
+                        progress.setLabelText(bg_l10n.text("Scanning LP materials: {name}").format(name=lp_node.split('|')[-1]))
+                        progress.setValue(5 + int((index / float(total_lp)) * 25))
                         QtWidgets.QApplication.processEvents()
 
-                    hp_data = rec.get("data") or {}
-                    hp_diag = float(hp_data.get("diag", 0.0) or 0.0)
-                    if rec.get("strong") and rec.get("source") == "lp" and hp_diag >= median_hp_diag * 0.70:
-                        continue
+                        signature, labels = self._create_by_mat_material_signature(lp_node)
+                        bucket = buckets_by_signature.setdefault(signature, {
+                            "labels": labels,
+                            "lp_meshes": [],
+                            "lp_proxies": [],
+                            "hp_meshes": []
+                        })
+                        bucket["lp_meshes"].append(lp_node)
+                        proxies = self._create_by_mat_lp_proxy_records(lp_node, signature, labels)
+                        for proxy in proxies:
+                            proxy["bucket"] = bucket
+                            bucket["lp_proxies"].append(proxy)
+                            all_lp_proxies.append(proxy)
 
-                    best_parent = None
-                    best_parent_score = None
-                    for parent_hp, parent_rec in stable_parents:
-                        if parent_hp == hp_node:
-                            continue
-                        parent_bucket = parent_rec.get("bucket")
-                        if parent_bucket is None:
-                            continue
-                        parent_data = parent_rec.get("data") or {}
-                        floater_tests += 1
-                        parent_score = self._create_by_mat_hp_parent_score(hp_data, parent_data, scene_diag)
-                        if not parent_score:
-                            continue
-                        if best_parent_score is None or parent_score.get("score", 0.0) > best_parent_score.get("score", 0.0):
-                            best_parent = parent_rec
-                            best_parent_score = parent_score
-
-                    if not best_parent or not best_parent_score:
-                        continue
-                    parent_score_value = float(best_parent_score.get("score", 0.0) or 0.0)
-                    current_score = float(rec.get("score", 0.0) or 0.0)
-                    can_relink = (
-                        rec.get("bucket") is None or
-                        not rec.get("strong") or
-                        rec.get("source") == "container" or
-                        current_score < 75.0
-                    )
-                    if not can_relink:
-                        continue
-                    if parent_score_value < 72.0 and rec.get("bucket") is not None:
-                        continue
-                    if parent_score_value < 54.0:
-                        continue
-                    old_bucket = rec.get("bucket")
-                    rec["bucket"] = best_parent.get("bucket")
-                    rec["source"] = "floater"
-                    rec["strong"] = False
-                    rec["score"] = max(current_score, parent_score_value)
-                    if old_bucket is None:
-                        floater_assigned += 1
-                    elif old_bucket is not rec["bucket"]:
-                        floater_reassigned += 1
-
-                progress.setLabelText(bg_l10n.text("Checking LP meshes for missing HP..."))
-                progress.setValue(70)
-                QtWidgets.QApplication.processEvents()
-
-                lp_audit_checked = 0
-                lp_audit_candidates = 0
-                lp_audit_assigned = 0
-                lp_audit_reassigned = 0
-                lp_audit_container_conflicts = 0
-                audit_best_by_hp = {}
-                audit_proxies = sorted(
-                    [proxy for proxy in all_lp_proxies if proxy.get("bucket") is not None],
-                    key=lambda proxy: (
-                        1 if proxy.get("is_container") else 0,
-                        float((proxy.get("data") or {}).get("volume", 0.0) or 0.0)
-                    )
-                )
-                total_audit = max(len(audit_proxies), 1)
-
-                for index, proxy in enumerate(audit_proxies):
-                    if progress.wasCanceled():
-                        self.log("Create by Mat canceled.", "orange")
+                    if not buckets_by_signature:
+                        self.log("Create by Mat: LP materials were not detected.", "red")
                         return
-                    if index % max(1, total_audit // 20) == 0:
-                        progress.setValue(70 + int((index / float(total_audit)) * 10))
-                        QtWidgets.QApplication.processEvents()
+                    self.log("Create by Mat: built {} LP match proxy region(s).".format(len(all_lp_proxies)), "lightblue")
 
-                    target_bucket = proxy.get("bucket")
-                    if target_bucket is None:
-                        continue
-                    lp_audit_checked += 1
-                    quick_candidates = []
-                    for hp_node, rec in hp_records.items():
-                        if rec.get("bucket") is target_bucket:
-                            continue
-                        hp_data = rec.get("data") or {}
-                        quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
-                        if quick is None:
-                            continue
-                        quick_candidates.append((quick, hp_node, rec))
-                    if not quick_candidates:
-                        continue
-                    quick_candidates.sort(key=lambda item: item[0], reverse=True)
+                    ordered_buckets = []
+                    used_bases = set()
+                    for signature, bucket in sorted(buckets_by_signature.items(), key=lambda item: " ".join(item[1].get("labels", [])).lower()):
+                        labels = bucket.get("labels") or ["Material"]
+                        raw_base = "_".join([self._create_by_mat_short_name(label) for label in labels])
+                        bucket["base"] = self._create_by_mat_safe_base(raw_base, used_bases)
+                        bucket["signature"] = signature
+                        ordered_buckets.append(bucket)
 
-                    for _quick, hp_node, rec in quick_candidates[:24]:
-                        result = self._create_by_mat_lp_hp_audit_score(proxy, rec.get("data") or {}, scene_diag)
-                        if not result or not result.get("strong"):
-                            continue
-                        lp_audit_candidates += 1
-                        current = audit_best_by_hp.get(hp_node)
-                        result_score = float(result.get("score", 0.0) or 0.0)
-                        if current is None or result_score > float(current.get("score", 0.0) or 0.0):
-                            audit_best_by_hp[hp_node] = {
-                                "score": result_score,
-                                "target_bucket": target_bucket,
-                                "proxy": proxy,
-                                "result": result
-                            }
+                    container_count = self._create_by_mat_mark_container_proxies(all_lp_proxies)
+                    if container_count:
+                        self.log("Create by Mat: detected {} large multi-material LP container(s).".format(container_count), "lightblue")
 
-                for hp_node, candidate in audit_best_by_hp.items():
-                    rec = hp_records.get(hp_node)
-                    if not rec:
-                        continue
-                    target_bucket = candidate.get("target_bucket")
-                    current_bucket = rec.get("bucket")
-                    if target_bucket is None or current_bucket is target_bucket:
-                        continue
-
-                    target_proxy = candidate.get("proxy") or {}
-                    candidate_score = float(candidate.get("score", 0.0) or 0.0)
-                    current_score = self._create_by_mat_best_bucket_lp_audit_score(current_bucket, rec.get("data") or {}, scene_diag)
-
-                    if target_proxy.get("is_container"):
-                        lp_audit_container_conflicts += 1
-                        continue
-
-                    source = rec.get("source")
-                    needs_repair = (
-                        current_bucket is None or
-                        source in ("container", "unassigned") or
-                        not rec.get("strong") or
-                        candidate_score >= current_score + 85.0 or
-                        (current_score <= 1.0 and candidate_score >= 260.0)
-                    )
-                    if not needs_repair:
-                        continue
-
-                    old_bucket = current_bucket
-                    rec["bucket"] = target_bucket
-                    rec["source"] = "lp_audit"
-                    rec["strong"] = False
-                    rec["score"] = max(float(rec.get("score", 0.0) or 0.0), candidate_score)
-                    if old_bucket is None:
-                        lp_audit_assigned += 1
+                    lp_diags = sorted([
+                        float((proxy.get("data") or {}).get("diag", 0.0) or 0.0)
+                        for proxy in all_lp_proxies
+                        if float((proxy.get("data") or {}).get("diag", 0.0) or 0.0) > 0.0
+                    ])
+                    hp_scene_diag_values = []
+                    for hp_node in hp_meshes:
+                        hp_data = self._create_by_mat_mesh_data(hp_node)
+                        if hp_data:
+                            hp_scene_diag_values.append(float(hp_data.get("diag", 0.0) or 0.0))
+                    scene_diag_values = sorted([v for v in (lp_diags + hp_scene_diag_values) if v > 0.0])
+                    if scene_diag_values:
+                        mid = len(scene_diag_values) // 2
+                        scene_diag = scene_diag_values[mid] if len(scene_diag_values) % 2 else (scene_diag_values[mid - 1] + scene_diag_values[mid]) * 0.5
                     else:
-                        lp_audit_reassigned += 1
+                        scene_diag = 1.0
+                    if hp_scene_diag_values:
+                        hp_diags_sorted = sorted([v for v in hp_scene_diag_values if v > 0.0])
+                        mid = len(hp_diags_sorted) // 2
+                        median_hp_diag = hp_diags_sorted[mid] if len(hp_diags_sorted) % 2 else (hp_diags_sorted[mid - 1] + hp_diags_sorted[mid]) * 0.5
+                    else:
+                        median_hp_diag = scene_diag
 
-                for hp_node, rec in hp_records.items():
-                    bucket = rec.get("bucket")
-                    if bucket is None:
-                        review_hp_meshes.append(hp_node)
-                        if len(review_examples) < 8:
-                            review_examples.append("{} -> no LP owner".format(hp_node.split('|')[-1]))
-                        continue
-                    bucket.setdefault("hp_meshes", []).append(hp_node)
-
-                if review_hp_meshes:
-                    review_base = self._create_by_mat_safe_base("Review_Unmatched", used_bases)
-                    review_bucket = {
-                        "labels": ["Review_Unmatched"],
-                        "lp_meshes": [],
-                        "lp_proxies": [],
-                        "hp_meshes": review_hp_meshes,
-                        "base": review_base,
-                        "signature": ("Review_Unmatched",),
-                        "is_review": True
-                    }
-                    ordered_buckets.append(review_bucket)
-
-                book_name = self._create_by_mat_next_book_name()
-                new_pairs = []
-                progress.setLabelText(bg_l10n.text("Creating material chapters..."))
-                progress.setValue(82)
-                QtWidgets.QApplication.processEvents()
-
-                total_buckets = max(len(ordered_buckets), 1)
-                for index, bucket in enumerate(ordered_buckets):
-                    if progress.wasCanceled():
-                        self.log("Create by Mat canceled.", "orange")
-                        return
-                    progress.setValue(82 + int((index / float(total_buckets)) * 15))
+                    progress.setLabelText(bg_l10n.text("Resolving HP ownership from LP chapters..."))
+                    progress.setValue(35)
                     QtWidgets.QApplication.processEvents()
 
-                    base = bucket["base"]
-                    hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP, parent=hp_source)
-                    lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP, parent=lp_source)
-                    hp_root = (cmds.ls(hp_root, long=True) or [hp_root])[0]
-                    lp_root = (cmds.ls(lp_root, long=True) or [lp_root])[0]
+                    low_confidence = 0
+                    review_hp_meshes = []
+                    review_examples = []
+                    hp_records = {}
+                    direct_count = 0
+                    container_direct_count = 0
+                    total_hp = max(len(hp_meshes), 1)
+                    for index, hp_node in enumerate(hp_meshes):
+                        if progress.wasCanceled():
+                            self.log("Create by Mat canceled.", "orange")
+                            return
+                        progress.setValue(35 + int((index / float(total_hp)) * 22))
+                        QtWidgets.QApplication.processEvents()
 
-                    lp_to_move = [node for node in bucket.get("lp_meshes", []) if node and cmds.objExists(node)]
-                    hp_to_move = [node for node in bucket.get("hp_meshes", []) if node and cmds.objExists(node)]
-                    if lp_to_move:
-                        cmds.parent(lp_to_move, lp_root, absolute=True)
-                    if hp_to_move:
-                        cmds.parent(hp_to_move, hp_root, absolute=True)
+                        hp_data = self._create_by_mat_mesh_data(hp_node)
+                        if not hp_data:
+                            continue
+                        quick_scored = []
+                        for proxy in all_lp_proxies:
+                            metrics = self._create_by_mat_hp_proxy_quick_score(hp_data, proxy)
+                            if metrics:
+                                quick_scored.append(metrics)
+                        hp_records[hp_node] = {
+                            "data": hp_data,
+                            "bucket": None,
+                            "score": 0.0,
+                            "strong": False,
+                            "source": "unassigned",
+                            "has_overlap": False
+                        }
+                        if not quick_scored:
+                            continue
+                        quick_scored.sort(key=lambda item: item.get("quick_score", -1e18), reverse=True)
+                        scored = []
+                        for quick in quick_scored[:48]:
+                            metrics = self._create_by_mat_hp_owner_score(hp_data, quick.get("proxy"), scene_diag)
+                            scored.append(metrics)
+                        if not scored:
+                            continue
+                        scored.sort(key=lambda item: item.get("score", -1e18), reverse=True)
+                        non_container = [candidate for candidate in scored if candidate.get("confident") and not (candidate.get("proxy") or {}).get("is_container")]
+                        container = [candidate for candidate in scored if candidate.get("confident") and (candidate.get("proxy") or {}).get("is_container")]
+                        best = non_container[0] if non_container else None
+                        if best is None and container:
+                            best = container[0]
+                        if best is None:
+                            continue
+                        best_bucket = (best.get("proxy") or {}).get("bucket")
+                        if best_bucket is None:
+                            continue
+                        hp_records[hp_node].update({
+                            "bucket": best_bucket,
+                            "score": float(best.get("score", 0.0) or 0.0),
+                            "strong": bool(best.get("strong")),
+                            "source": "container" if (best.get("proxy") or {}).get("is_container") else "lp",
+                            "has_overlap": bool(best.get("has_overlap"))
+                        })
+                        direct_count += 1
+                        if not best.get("has_overlap"):
+                            low_confidence += 1
+                        if (best.get("proxy") or {}).get("is_container"):
+                            container_direct_count += 1
 
-                    pair = {
-                        "id": str(uuid.uuid4()),
-                        "base": base,
-                        "hp_uuid": cmds.ls(hp_root, uuid=True)[0],
-                        "lp_uuid": cmds.ls(lp_root, uuid=True)[0],
-                        "locked": [],
-                        "book": book_name,
-                        "final_smooth_states": {}
-                    }
-                    new_pairs.append(pair)
+                    progress.setLabelText(bg_l10n.text("Attaching HP floaters to large owners..."))
+                    progress.setValue(58)
+                    QtWidgets.QApplication.processEvents()
 
-                self.root_pairs.extend(new_pairs)
-                if hasattr(self.core, 'root_pairs'):
-                    self.core.root_pairs = self.root_pairs
-                if hasattr(self.core, '_node_cache'):
-                    self.core._node_cache.clear()
-                bg_core.BakeSessionModel.save(self.root_pairs)
+                    assigned_items = [(hp, rec) for hp, rec in hp_records.items() if rec.get("bucket") is not None]
+                    stable_parents = [
+                        (hp, rec) for hp, rec in assigned_items
+                        if rec.get("strong") and float(rec.get("data", {}).get("diag", 0.0) or 0.0) >= median_hp_diag * 0.35
+                    ]
+                    floater_reassigned = 0
+                    floater_assigned = 0
+                    floater_tests = 0
+                    total_records = max(len(hp_records), 1)
+                    for index, (hp_node, rec) in enumerate(list(hp_records.items())):
+                        if progress.wasCanceled():
+                            self.log("Create by Mat canceled.", "orange")
+                            return
+                        if index % max(1, total_records // 20) == 0:
+                            progress.setValue(58 + int((index / float(total_records)) * 12))
+                            QtWidgets.QApplication.processEvents()
 
-                self.picked_hp, self.picked_lp = None, None
-                self.le_picked_hp.clear()
-                self.le_picked_lp.clear()
-                self.active_material_visibility_filter = None
+                        hp_data = rec.get("data") or {}
+                        hp_diag = float(hp_data.get("diag", 0.0) or 0.0)
+                        if rec.get("strong") and rec.get("source") == "lp" and hp_diag >= median_hp_diag * 0.70:
+                            continue
 
-                if new_pairs:
-                    self.activate_root(new_pairs[0])
-                else:
-                    self.refresh_right_panel()
-                    self.refresh_left_panel()
+                        best_parent = None
+                        best_parent_score = None
+                        for parent_hp, parent_rec in stable_parents:
+                            if parent_hp == hp_node:
+                                continue
+                            parent_bucket = parent_rec.get("bucket")
+                            if parent_bucket is None:
+                                continue
+                            parent_data = parent_rec.get("data") or {}
+                            floater_tests += 1
+                            parent_score = self._create_by_mat_hp_parent_score(hp_data, parent_data, scene_diag)
+                            if not parent_score:
+                                continue
+                            if best_parent_score is None or parent_score.get("score", 0.0) > best_parent_score.get("score", 0.0):
+                                best_parent = parent_rec
+                                best_parent_score = parent_score
 
-                message = "Create by Mat: created {} chapter(s) in {}.".format(len(new_pairs), book_name)
-                self.log(message, "lightgreen")
-                self.log(
-                    "Create by Mat HP ownership: direct={}, container_fallback={}, floater_assigned={}, floater_reassigned={}, lp_audit_assigned={}, lp_audit_reassigned={}, review={}.".format(
-                        direct_count,
-                        container_direct_count,
-                        floater_assigned,
-                        floater_reassigned,
-                        lp_audit_assigned,
-                        lp_audit_reassigned,
-                        len(review_hp_meshes)
-                    ),
-                    "lightblue"
-                )
-                self.log(
-                    "Create by Mat LP audit: checked={}, candidates={}, container_conflicts={}.".format(
-                        lp_audit_checked,
-                        lp_audit_candidates,
-                        lp_audit_container_conflicts
-                    ),
-                    "lightblue"
-                )
-                if low_confidence:
-                    self.log("Create by Mat: {} HP mesh(es) assigned by close LP proxy without bbox overlap.".format(low_confidence), "orange")
-                if review_hp_meshes:
-                    self.log("Create by Mat: {} HP mesh(es) moved to Review_Unmatched for manual check.".format(len(review_hp_meshes)), "orange")
-                    if review_examples:
-                        self.log("Create by Mat review examples: {}".format("; ".join(review_examples)), "orange")
-                if hasattr(self, 'record_user_action'):
-                    self.record_user_action(
-                        "Create by Mat",
-                        "chapters={} | book={} | direct_hp={} | container_hp={} | floater_assigned={} | floater_reassigned={} | lp_audit_assigned={} | lp_audit_reassigned={} | lp_audit_checked={} | lp_audit_candidates={} | lp_audit_container_conflicts={} | low_confidence_hp={} | review_hp={}".format(
-                            len(new_pairs),
-                            book_name,
+                        if not best_parent or not best_parent_score:
+                            continue
+                        parent_score_value = float(best_parent_score.get("score", 0.0) or 0.0)
+                        current_score = float(rec.get("score", 0.0) or 0.0)
+                        can_relink = (
+                            rec.get("bucket") is None or
+                            not rec.get("strong") or
+                            rec.get("source") == "container" or
+                            current_score < 75.0
+                        )
+                        if not can_relink:
+                            continue
+                        if parent_score_value < 72.0 and rec.get("bucket") is not None:
+                            continue
+                        if parent_score_value < 54.0:
+                            continue
+                        old_bucket = rec.get("bucket")
+                        rec["bucket"] = best_parent.get("bucket")
+                        rec["source"] = "floater"
+                        rec["strong"] = False
+                        rec["score"] = max(current_score, parent_score_value)
+                        if old_bucket is None:
+                            floater_assigned += 1
+                        elif old_bucket is not rec["bucket"]:
+                            floater_reassigned += 1
+
+                    progress.setLabelText(bg_l10n.text("Checking LP meshes for missing HP..."))
+                    progress.setValue(70)
+                    QtWidgets.QApplication.processEvents()
+
+                    lp_audit_checked = 0
+                    lp_audit_candidates = 0
+                    lp_audit_assigned = 0
+                    lp_audit_reassigned = 0
+                    lp_audit_container_conflicts = 0
+                    audit_best_by_hp = {}
+                    audit_proxies = sorted(
+                        [proxy for proxy in all_lp_proxies if proxy.get("bucket") is not None],
+                        key=lambda proxy: (
+                            1 if proxy.get("is_container") else 0,
+                            float((proxy.get("data") or {}).get("volume", 0.0) or 0.0)
+                        )
+                    )
+                    total_audit = max(len(audit_proxies), 1)
+
+                    for index, proxy in enumerate(audit_proxies):
+                        if progress.wasCanceled():
+                            self.log("Create by Mat canceled.", "orange")
+                            return
+                        if index % max(1, total_audit // 20) == 0:
+                            progress.setValue(70 + int((index / float(total_audit)) * 10))
+                            QtWidgets.QApplication.processEvents()
+
+                        target_bucket = proxy.get("bucket")
+                        if target_bucket is None:
+                            continue
+                        lp_audit_checked += 1
+                        quick_candidates = []
+                        for hp_node, rec in hp_records.items():
+                            if rec.get("bucket") is target_bucket:
+                                continue
+                            hp_data = rec.get("data") or {}
+                            quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
+                            if quick is None:
+                                continue
+                            quick_candidates.append((quick, hp_node, rec))
+                        if not quick_candidates:
+                            continue
+                        quick_candidates.sort(key=lambda item: item[0], reverse=True)
+
+                        for _quick, hp_node, rec in quick_candidates[:24]:
+                            result = self._create_by_mat_lp_hp_audit_score(proxy, rec.get("data") or {}, scene_diag)
+                            if not result or not result.get("strong"):
+                                continue
+                            lp_audit_candidates += 1
+                            current = audit_best_by_hp.get(hp_node)
+                            result_score = float(result.get("score", 0.0) or 0.0)
+                            if current is None or result_score > float(current.get("score", 0.0) or 0.0):
+                                audit_best_by_hp[hp_node] = {
+                                    "score": result_score,
+                                    "target_bucket": target_bucket,
+                                    "proxy": proxy,
+                                    "result": result
+                                }
+
+                    for hp_node, candidate in audit_best_by_hp.items():
+                        rec = hp_records.get(hp_node)
+                        if not rec:
+                            continue
+                        target_bucket = candidate.get("target_bucket")
+                        current_bucket = rec.get("bucket")
+                        if target_bucket is None or current_bucket is target_bucket:
+                            continue
+
+                        target_proxy = candidate.get("proxy") or {}
+                        candidate_score = float(candidate.get("score", 0.0) or 0.0)
+                        current_score = self._create_by_mat_best_bucket_lp_audit_score(current_bucket, rec.get("data") or {}, scene_diag)
+
+                        if target_proxy.get("is_container"):
+                            lp_audit_container_conflicts += 1
+                            continue
+
+                        source = rec.get("source")
+                        needs_repair = (
+                            current_bucket is None or
+                            source in ("container", "unassigned") or
+                            not rec.get("strong") or
+                            candidate_score >= current_score + 85.0 or
+                            (current_score <= 1.0 and candidate_score >= 260.0)
+                        )
+                        if not needs_repair:
+                            continue
+
+                        old_bucket = current_bucket
+                        rec["bucket"] = target_bucket
+                        rec["source"] = "lp_audit"
+                        rec["strong"] = False
+                        rec["score"] = max(float(rec.get("score", 0.0) or 0.0), candidate_score)
+                        if old_bucket is None:
+                            lp_audit_assigned += 1
+                        else:
+                            lp_audit_reassigned += 1
+
+                    for hp_node, rec in hp_records.items():
+                        bucket = rec.get("bucket")
+                        if bucket is None:
+                            review_hp_meshes.append(hp_node)
+                            if len(review_examples) < 8:
+                                review_examples.append("{} -> no LP owner".format(hp_node.split('|')[-1]))
+                            continue
+                        bucket.setdefault("hp_meshes", []).append(hp_node)
+
+                    if review_hp_meshes:
+                        review_base = self._create_by_mat_safe_base("Review_Unmatched", used_bases)
+                        review_bucket = {
+                            "labels": ["Review_Unmatched"],
+                            "lp_meshes": [],
+                            "lp_proxies": [],
+                            "hp_meshes": review_hp_meshes,
+                            "base": review_base,
+                            "signature": ("Review_Unmatched",),
+                            "is_review": True
+                        }
+                        ordered_buckets.append(review_bucket)
+
+                    book_name = self._create_by_mat_next_book_name()
+                    new_pairs = []
+                    progress.setLabelText(bg_l10n.text("Creating material chapters..."))
+                    progress.setValue(82)
+                    QtWidgets.QApplication.processEvents()
+
+                    total_buckets = max(len(ordered_buckets), 1)
+                    for index, bucket in enumerate(ordered_buckets):
+                        if progress.wasCanceled():
+                            self.log("Create by Mat canceled.", "orange")
+                            return
+                        progress.setValue(82 + int((index / float(total_buckets)) * 15))
+                        QtWidgets.QApplication.processEvents()
+
+                        base = bucket["base"]
+                        hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP, parent=hp_source)
+                        lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP, parent=lp_source)
+                        hp_root = (cmds.ls(hp_root, long=True) or [hp_root])[0]
+                        lp_root = (cmds.ls(lp_root, long=True) or [lp_root])[0]
+
+                        lp_to_move = [node for node in bucket.get("lp_meshes", []) if node and cmds.objExists(node)]
+                        hp_to_move = [node for node in bucket.get("hp_meshes", []) if node and cmds.objExists(node)]
+                        if lp_to_move:
+                            cmds.parent(lp_to_move, lp_root, absolute=True)
+                        if hp_to_move:
+                            cmds.parent(hp_to_move, hp_root, absolute=True)
+
+                        pair = {
+                            "id": str(uuid.uuid4()),
+                            "base": base,
+                            "hp_uuid": cmds.ls(hp_root, uuid=True)[0],
+                            "lp_uuid": cmds.ls(lp_root, uuid=True)[0],
+                            "locked": [],
+                            "book": book_name,
+                            "final_smooth_states": {}
+                        }
+                        new_pairs.append(pair)
+
+                    self.root_pairs.extend(new_pairs)
+                    if hasattr(self.core, 'root_pairs'):
+                        self.core.root_pairs = self.root_pairs
+                    if hasattr(self.core, '_node_cache'):
+                        self.core._node_cache.clear()
+                    bg_core.BakeSessionModel.save(self.root_pairs)
+
+                    self.picked_hp, self.picked_lp = None, None
+                    self.le_picked_hp.clear()
+                    self.le_picked_lp.clear()
+                    self.active_material_visibility_filter = None
+
+                    if new_pairs:
+                        self.activate_root(new_pairs[0])
+                    else:
+                        self.refresh_right_panel()
+                        self.refresh_left_panel()
+
+                    message = "Create by Mat: created {} chapter(s) in {}.".format(len(new_pairs), book_name)
+                    self.log(message, "lightgreen")
+                    self.log(
+                        "Create by Mat HP ownership: direct={}, container_fallback={}, floater_assigned={}, floater_reassigned={}, lp_audit_assigned={}, lp_audit_reassigned={}, review={}.".format(
                             direct_count,
                             container_direct_count,
                             floater_assigned,
                             floater_reassigned,
                             lp_audit_assigned,
                             lp_audit_reassigned,
+                            len(review_hp_meshes)
+                        ),
+                        "lightblue"
+                    )
+                    self.log(
+                        "Create by Mat LP audit: checked={}, candidates={}, container_conflicts={}.".format(
                             lp_audit_checked,
                             lp_audit_candidates,
-                            lp_audit_container_conflicts,
-                            low_confidence,
-                            len(review_hp_meshes)
-                        )
+                            lp_audit_container_conflicts
+                        ),
+                        "lightblue"
                     )
-                cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
+                    if low_confidence:
+                        self.log("Create by Mat: {} HP mesh(es) assigned by close LP proxy without bbox overlap.".format(low_confidence), "orange")
+                    if review_hp_meshes:
+                        self.log("Create by Mat: {} HP mesh(es) moved to Review_Unmatched for manual check.".format(len(review_hp_meshes)), "orange")
+                        if review_examples:
+                            self.log("Create by Mat review examples: {}".format("; ".join(review_examples)), "orange")
+                    if hasattr(self, 'record_user_action'):
+                        self.record_user_action(
+                            "Create by Mat",
+                            "chapters={} | book={} | direct_hp={} | container_hp={} | floater_assigned={} | floater_reassigned={} | lp_audit_assigned={} | lp_audit_reassigned={} | lp_audit_checked={} | lp_audit_candidates={} | lp_audit_container_conflicts={} | low_confidence_hp={} | review_hp={}".format(
+                                len(new_pairs),
+                                book_name,
+                                direct_count,
+                                container_direct_count,
+                                floater_assigned,
+                                floater_reassigned,
+                                lp_audit_assigned,
+                                lp_audit_reassigned,
+                                lp_audit_checked,
+                                lp_audit_candidates,
+                                lp_audit_container_conflicts,
+                                low_confidence,
+                                len(review_hp_meshes)
+                            )
+                        )
+                    cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
+            _create_root_pairs_by_material_body()
         finally:
             try:
                 progress.close()

@@ -84,14 +84,13 @@ class GTWidget(QtWidgets.QWidget):
         layout.addLayout(set_layout)
 
         match_btns_layout = QtWidgets.QHBoxLayout()
-        self.match_btn = QtWidgets.QPushButton("Find LP Groups")
+        self.match_btn = QtWidgets.QPushButton("Find Groups")
         self.match_btn.setStyleSheet("background-color: #d18c15; color: #1e1e1e; font-weight: bold;")
         self.match_btn.clicked.connect(self.process_batch_match)
         match_btns_layout.addWidget(self.match_btn)
 
-        self.relocate_btn = QtWidgets.QPushButton("Relocate HP")
+        self.relocate_btn = QtWidgets.QPushButton("Relocate")
         self.relocate_btn.setStyleSheet("background-color: #5c85d6; color: white; font-weight: bold;")
-        self.relocate_btn.setToolTip("Move linked HP meshes into the best existing HP subgroup. Does not create new subgroups.")
         self.relocate_btn.clicked.connect(self.relocate_hp)
         match_btns_layout.addWidget(self.relocate_btn)
         layout.addLayout(match_btns_layout)
