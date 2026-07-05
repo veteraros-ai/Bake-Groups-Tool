@@ -63,7 +63,23 @@ class TOCNameDelegate(QtWidgets.QStyledItemDelegate):
         super(TOCNameDelegate, self).updateEditorGeometry(editor, option, index)
 
 
-class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow,
+class _CooperativeInitTerminator(object):
+    # Some PySide6 builds (confirmed on Maya 2025; not on Maya 2024/PySide2
+    # or Maya 2027's PySide6 build) have QMainWindow.__init__ cooperatively
+    # forward its leftover kwargs (including "parent") via super().__init__()
+    # instead of just consuming them. HPAnalysisMixin/LPMatchingMixin/etc.
+    # below have no __init__ of their own, so Python's MRO lookup skips
+    # straight past them to object.__init__(), which only accepts self and
+    # raises "TypeError: object.__init__() takes exactly one argument".
+    # This class sits right after QtWidgets.QMainWindow in the MRO and
+    # simply absorbs whatever gets forwarded, without forwarding further -
+    # cheap insurance that does nothing on Maya versions where the crash
+    # never happens in the first place.
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _CooperativeInitTerminator,
                     HPAnalysisMixin, LPMatchingMixin, FinalViewMixin,
                     ExportMixin, GroupManagementMixin, SceneInteractionMixin, TOCMixin):
     def __init__(self, parent=None):
