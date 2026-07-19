@@ -515,6 +515,13 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.check_btn = QtWidgets.QPushButton(bg_l10n.text("Check"))
         self.check_btn.clicked.connect(self.check_requested.emit)
         buttons.addWidget(self.check_btn)
+
+        # Quick access to the PureRef manual - hidden if it isn't bundled.
+        self.manual_btn = QtWidgets.QPushButton(bg_l10n.text("Show manual"))
+        self.manual_btn.clicked.connect(lambda: open_manual_folder())
+        if resolve_manual_file() is None:
+            self.manual_btn.hide()
+        buttons.addWidget(self.manual_btn)
         buttons.addStretch(1)
 
         self.release_btn = QtWidgets.QPushButton(bg_l10n.text("Release Notes"))
@@ -779,6 +786,37 @@ def open_url(url):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
+def resolve_manual_file():
+    """Locate the PureRef manual (a .pur inside a 'Manual' folder) near the
+    install. Returns the full path to the .pur file, or None if not present."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    bases = [here, os.path.dirname(here), os.path.dirname(os.path.dirname(here))]
+    for base in bases:
+        mdir = os.path.join(base, "Manual")
+        if not os.path.isdir(mdir):
+            continue
+        exact = os.path.join(mdir, "Manual.pur")
+        if os.path.isfile(exact):
+            return exact
+        try:
+            purs = [f for f in os.listdir(mdir) if f.lower().endswith(".pur")]
+        except Exception:
+            purs = []
+        if purs:
+            return os.path.join(mdir, purs[0])
+    return None
+
+
+def open_manual_folder():
+    """Open the folder holding the PureRef manual in the OS file manager.
+    Returns True if a manual was found and its folder was opened."""
+    manual = resolve_manual_file()
+    if not manual:
+        return False
+    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(manual)))
+    return True
+
+
 def _wire_update_dialog(dialog):
     dialog.release_notes_requested.connect(
         lambda: open_url(dialog.update_info.get("releases_url") or bg_version.RELEASES_URL)
@@ -826,3 +864,123 @@ def open_updates_window(parent, on_check_requested):
     dialog.raise_()
     dialog.activateWindow()
     return dialog
+
+
+class ManualPromptDialog(QtWidgets.QDialog):
+    """Small prompt offering to open the folder that holds the PureRef manual.
+    Styled like the update dialog. exec_() returns one of OPEN / LATER / NEVER."""
+    OPEN = 10
+    LATER = 11
+    NEVER = 12
+
+    def __init__(self, parent=None):
+        super(ManualPromptDialog, self).__init__(parent)
+        self.setObjectName("BakeGroupsManualDialog")
+        self.setWindowTitle(bg_l10n.text("Bake Groups Manual"))
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self.setMaximumWidth(520)
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(14)
+
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(14)
+        icon = QtWidgets.QLabel()
+        icon.setFixedSize(52, 52)
+        icon.setObjectName("UpdateIcon")
+        icon.setAlignment(QtCore.Qt.AlignCenter)
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Bake_Group.png")
+        pixmap = QtGui.QPixmap(icon_path)
+        if pixmap.isNull():
+            icon.setText("BG")
+        else:
+            icon.setPixmap(pixmap.scaled(40, 40, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        header.addWidget(icon)
+
+        title_col = QtWidgets.QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QtWidgets.QLabel(bg_l10n.text("Bake Groups Manual"))
+        title.setObjectName("UpdateTitle")
+        subtitle = QtWidgets.QLabel(bg_l10n.text("Illustrated guide (PureRef)"))
+        subtitle.setObjectName("UpdateAuthor")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        title_col.addStretch(1)
+        header.addLayout(title_col, 1)
+        layout.addLayout(header)
+
+        message = QtWidgets.QLabel(bg_l10n.text("Do you want to view the manual in the PureRef file?"))
+        message.setObjectName("UpdateMessage")
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        body = QtWidgets.QLabel(bg_l10n.text("This opens the folder with the .pur file - open it in PureRef to read the guide."))
+        body.setObjectName("UpdateBody")
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        buttons = QtWidgets.QHBoxLayout()
+        never_btn = QtWidgets.QPushButton(bg_l10n.text("Don't show again"))
+        later_btn = QtWidgets.QPushButton(bg_l10n.text("Show later"))
+        open_btn = QtWidgets.QPushButton(bg_l10n.text("Open folder"))
+        open_btn.setObjectName("PrimaryButton")
+        never_btn.clicked.connect(lambda: self.done(self.NEVER))
+        later_btn.clicked.connect(lambda: self.done(self.LATER))
+        open_btn.clicked.connect(lambda: self.done(self.OPEN))
+        buttons.addWidget(never_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(later_btn)
+        buttons.addWidget(open_btn)
+        layout.addLayout(buttons)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QDialog#BakeGroupsManualDialog {
+                background-color: #242424;
+                color: #d7d7d7;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 12px;
+            }
+            QLabel#UpdateIcon {
+                background-color: #202f32;
+                border: 1px solid #3c7478;
+                border-radius: 8px;
+                color: #7de0d9;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QLabel#UpdateTitle { color: #f2f2f2; font-size: 20px; font-weight: 700; }
+            QLabel#UpdateAuthor { color: #8da7aa; font-size: 11px; }
+            QLabel#UpdateMessage { color: #ffffff; font-size: 16px; font-weight: 650; }
+            QLabel#UpdateBody { color: #b9b9b9; line-height: 145%; }
+            QPushButton {
+                background-color: #333333;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                color: #dddddd;
+                min-width: 92px;
+                padding: 7px 10px;
+            }
+            QPushButton:hover { background-color: #3d3d3d; border-color: #666666; }
+            QPushButton#PrimaryButton {
+                background-color: #2c7775;
+                border-color: #3baaa5;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            QPushButton#PrimaryButton:hover { background-color: #318a87; }
+        """)
+
+
+def show_manual_prompt(parent=None):
+    """Show the manual prompt modally. Returns ManualPromptDialog.OPEN / LATER /
+    NEVER."""
+    dialog = ManualPromptDialog(parent)
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog.exec_()

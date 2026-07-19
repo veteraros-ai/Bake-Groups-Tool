@@ -44,6 +44,7 @@ class BakeConfig(object):
         QListWidget::item, QTreeWidget::item { padding: 4px; border-bottom: 1px solid #333; }
         QListWidget::item:hover, QTreeWidget::item:hover { background-color: #3A3A3A; }
         QListWidget::item:selected, QTreeWidget::item:selected { background-color: #d18c15; color: black; font-weight: bold; }
+        QToolTip { color: #f0f0f0; background-color: #2a2a2a; border: 1px solid #555555; padding: 4px; }
     """
     STYLE_FRAME = "background-color: #2D2D30; border: 1px solid #444; border-radius: 2px;"
     STYLE_BTN_VIS_ON = "background-color: #395373; border: 1px solid #111; font-weight: bold;"
@@ -149,6 +150,19 @@ class BakeSessionModel(object):
                 p['locked'] = []
             if 'final_smooth_states' not in p or not isinstance(p.get('final_smooth_states'), dict):
                 p['final_smooth_states'] = {}
+            # Per-subgroup cage max-offset overrides (empty = use global default).
+            if 'cage_overrides' not in p or not isinstance(p.get('cage_overrides'), dict):
+                p['cage_overrides'] = {}
+            # Global cage settings for this chapter (percent of bbox diagonal).
+            if 'cage_settings' not in p or not isinstance(p.get('cage_settings'), dict):
+                p['cage_settings'] = {}
+            cs = p['cage_settings']
+            cs.setdefault('inflate', 5.0)   # step 1: uniform inflation (% diag)
+            cs.setdefault('gap', 0.5)       # kept gap between fitted cage and HP
+            cs.setdefault('unit', 'percent')
+            cs.setdefault('fitted', False)  # False = inflate mode, True = fitted
+            cs.setdefault('display_mode', 'solid')  # 'wire' | 'solid' cage look
+            cs.setdefault('export_enabled', True)   # cage rides along with chapter export
             seen_ids.add(p['id'])
             
         return data
@@ -290,6 +304,50 @@ class StatsUtils(object):
         m = n // 2
         if n % 2 == 0: return (s_data[m - 1] + s_data[m]) / 2.0
         else: return float(s_data[m])
+
+# ==========================================
+# ANALYZE HP DENSITY CAP (Optimal / Speed modes)
+# ==========================================
+# get_world_vertices() extracts full-resolution world verts at density_pct=100.
+# For multi-million-vert ZBrush sculpts that is the main Analyze HP freeze, and
+# the HP worker subsamples those verts down to ~700 points in most hot paths
+# anyway, so full resolution buys little matching precision on very dense meshes.
+# density_pct_for() decides how much to decimate based on the chosen mode.
+#
+# Optimal: full resolution below OPTIMAL_CAP_THRESHOLD (normal meshes are
+#          untouched -> identical to legacy behavior); above it, decimate toward
+#          a still-generous OPTIMAL_CAP_TARGET point budget.
+# Speed:   lower threshold + tighter target for maximum first-run speed.
+DENSITY_MODE_OPTIMAL = "optimal"
+DENSITY_MODE_SPEED = "speed"
+
+OPTIMAL_CAP_THRESHOLD = 500000   # verts; below this Optimal keeps full resolution
+OPTIMAL_CAP_TARGET = 200000      # verts; Optimal decimates dense meshes toward this
+SPEED_CAP_THRESHOLD = 120000     # verts; Speed starts capping much earlier
+SPEED_CAP_TARGET = 60000         # verts; Speed decimates toward this
+
+
+def density_pct_for(vert_count, mode=DENSITY_MODE_OPTIMAL):
+    """Return the density_pct to pass to get_world_vertices for a mesh of
+    vert_count vertices under the given mode. Returns 100.0 (full resolution)
+    when the mesh is below the mode's threshold, so normal-density meshes are
+    never decimated. Never returns below a small floor so tiny meshes stay intact."""
+    try:
+        vert_count = int(vert_count or 0)
+    except Exception:
+        return 100.0
+    if vert_count <= 0:
+        return 100.0
+    if mode == DENSITY_MODE_SPEED:
+        threshold, target = SPEED_CAP_THRESHOLD, SPEED_CAP_TARGET
+    else:
+        threshold, target = OPTIMAL_CAP_THRESHOLD, OPTIMAL_CAP_TARGET
+    if vert_count <= threshold:
+        return 100.0
+    pct = (float(target) / float(vert_count)) * 100.0
+    # Keep a floor so even huge meshes retain a usable point cloud.
+    return max(2.0, min(100.0, pct))
+
 
 class GeoMatcher(object):
     @staticmethod

@@ -149,6 +149,7 @@ modules_to_reload = [
     'bg_worker_hp',
     'bg_worker_lp',
     'bg_gt_matcher',
+    'bg_cage',
     'bg_final_export',
     'bg_ui_widgets',
     'bg_localization',

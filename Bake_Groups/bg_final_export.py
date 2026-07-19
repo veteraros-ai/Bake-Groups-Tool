@@ -51,6 +51,37 @@ class FinalExportProcessor(object):
                 FinalExportProcessor._set_fbx_bool("FBXExportSmoothMesh", previous_smooth_mesh)
 
     @staticmethod
+    def _export_with_lp_triangulation_rollback(export_nodes, export_path):
+        """Export the selection to FBX, temporarily triangulating any LP (_low)
+        meshes in the set first, then rolling the triangulation back so the LP
+        originals stay quads. HP nodes (usually zero-transform temp copies) pass
+        through untouched. The FBX file write is not undoable, so cmds.undo() only
+        reverts the in-scene triangulation."""
+        export_nodes = [n for n in (export_nodes or []) if n and cmds.objExists(n)]
+        if not export_nodes:
+            return
+        lp_nodes = [n for n in export_nodes if "_low" in n.split('|')[-1].lower()]
+        if not lp_nodes:
+            cmds.select(export_nodes, replace=True)
+            FinalExportProcessor.export_selected_fbx(export_path)
+            return
+        cmds.undoInfo(openChunk=True, chunkName="LPExportTriangulate")
+        try:
+            for m in lp_nodes:
+                try:
+                    cmds.polyTriangulate(m, constructionHistory=False)
+                except Exception:
+                    pass
+            cmds.select(export_nodes, replace=True)
+            FinalExportProcessor.export_selected_fbx(export_path)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            try:
+                cmds.undo()  # roll back the LP triangulation; originals stay quads
+            except Exception:
+                pass
+
+    @staticmethod
     def _is_zbrush_mesh(mesh_transform):
         if not mesh_transform or not cmds.objExists(mesh_transform):
             return False
@@ -197,151 +228,6 @@ class FinalExportProcessor(object):
             except Exception:
                 pass
 
-
-    @staticmethod
-    def combine_all_subgroups(base_name, hp_main, lp_main, parent_window=None):
-        """Final combine and rename logic."""
-        if not hp_main or not lp_main:
-            cmds.warning("Bake Groups: HP or LP root objects not found.")
-            return {'success': False, 'hp': 0, 'lp': 0}
-
-        progress_dlg = QtWidgets.QProgressDialog(bg_l10n.text("Baking Subgroups..."), bg_l10n.text("Cancel"), 0, 100, parent_window)
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.show()
-
-        with bg_core.undo_chunk("CombineAndRenameWithBase"):
-            try:
-                hp_count = 0
-                lp_count = 0
-
-                # --- HP LOGIC (Renaming inside subgroups) ---
-                hp_subgroups = [g for g in cmds.listRelatives(hp_main, children=True, fullPath=True, type='transform') or [] 
-                                if not cmds.listRelatives(g, shapes=True)]
-                
-                for sg in hp_subgroups:
-                    sg_name = sg.split('|')[-1].replace(bg_core.BakeConfig.SUFFIX_HP, "").replace(".", "_")
-                    meshes = cmds.listRelatives(sg, allDescendents=True, type='mesh', fullPath=True) or []
-                    transforms = list(set([cmds.listRelatives(m, parent=True, fullPath=True)[0] for m in meshes]))
-                    
-                    for i, tr in enumerate(transforms):
-                        new_name = "{}_{}_high_{:03d}".format(base_name, sg_name, i + 1).replace(".", "_")
-                        cmds.rename(tr, new_name)
-                        hp_count += 1
-
-                # --- LP LOGIC (Combining in the global LP_Combine_BG root) ---
-                def _has_mesh_shape(node):
-                    return bool(cmds.listRelatives(node, shapes=True, type='mesh') or [])
-
-                def _is_lp_subgroup(node):
-                    short_name = node.split('|')[-1]
-                    suffix_re = re.escape(bg_core.BakeConfig.SUFFIX_LP) + r'\d*$'
-                    is_lp_group = bool(re.search(suffix_re, short_name, re.IGNORECASE))
-                    attr = "{}.{}".format(node, bg_core.BakeConfig.ATTR_BAKE_GROUP)
-                    if cmds.objExists(attr):
-                        try:
-                            is_lp_group = is_lp_group or cmds.getAttr(attr) == "LP"
-                        except Exception:
-                            pass
-                    return is_lp_group
-
-                def _clean_lp_group_name(node):
-                    short_name = node.split('|')[-1].replace(".", "_")
-                    return re.sub(
-                        re.escape(bg_core.BakeConfig.SUFFIX_LP) + r'\d*$',
-                        '',
-                        short_name,
-                        flags=re.IGNORECASE
-                    )
-
-                def _is_old_chapter_lp_output(node, chapter_base):
-                    if not node or not cmds.objExists(node):
-                        return False
-                    if not cmds.listRelatives(node, shapes=True, type='mesh'):
-                        return False
-                    short_name = node.split('|')[-1].replace(".", "_")
-                    base = re.escape(chapter_base.replace(".", "_"))
-                    pattern = r'^{}(?:_.+)?_low\d*$'.format(base)
-                    return bool(re.match(pattern, short_name, re.IGNORECASE))
-
-                def _cleanup_old_chapter_lp_outputs(chapter_lp_root, chapter_base):
-                    old_outputs = [
-                        child for child in (cmds.listRelatives(chapter_lp_root, children=True, fullPath=True, type='transform') or [])
-                        if _is_old_chapter_lp_output(child, chapter_base)
-                    ]
-                    if old_outputs:
-                        cmds.delete(old_outputs)
-                    return len(old_outputs)
-
-                def _combine_lp_transforms(transforms, final_lp_name, chapter_lp_root):
-                    if not transforms:
-                        return False
-
-                    old_finals = [child for child in (cmds.listRelatives(chapter_lp_root, children=True, fullPath=True, type='transform') or [])
-                                  if child.split('|')[-1].startswith(final_lp_name) and cmds.listRelatives(child, shapes=True)]
-                    if old_finals:
-                        cmds.delete(old_finals)
-
-                    dups = cmds.duplicate(transforms, returnRootsOnly=True)
-                    if len(dups) > 1:
-                        combined = cmds.polyUnite(dups, ch=False, mergeUVSets=True)[0]
-                    else:
-                        combined = dups[0]
-
-                    cmds.delete(combined, constructionHistory=True)
-                    cmds.polyTriangulate(combined, constructionHistory=False)
-                    combined = cmds.rename(combined, final_lp_name)
-
-                    current_parent = cmds.listRelatives(combined, parent=True, fullPath=True)
-                    chapter_lp_full = cmds.ls(chapter_lp_root, l=True)[0]
-                    if not current_parent or current_parent[0] != chapter_lp_full:
-                        cmds.parent(combined, chapter_lp_full, absolute=True)
-                    return True
-
-                lp_children = cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []
-                lp_subgroups = [g for g in lp_children if not _has_mesh_shape(g) and _is_lp_subgroup(g)]
-                direct_lp_meshes = [g for g in lp_children if _has_mesh_shape(g)]
-
-                if not lp_subgroups:
-                    lp_subgroups = [g for g in lp_children if not _has_mesh_shape(g)]
-                
-                # Создаем или находим глобальный рут
-                global_lp_root = "LP_Combine_BG"
-                if not cmds.objExists(global_lp_root):
-                    cmds.group(em=True, name=global_lp_root, world=True)
-
-                # Создаем или находим папку главы
-                chapter_lp_root = "{}|{}".format(global_lp_root, base_name)
-                if not cmds.objExists(chapter_lp_root):
-                    grp = cmds.group(em=True, name=base_name)
-                    cmds.parent(grp, global_lp_root, absolute=True)
-
-                _cleanup_old_chapter_lp_outputs(chapter_lp_root, base_name)
-                
-                for sg in lp_subgroups:
-                    sg_name = _clean_lp_group_name(sg)
-                    final_lp_name = "{}_{}_low".format(base_name, sg_name).replace(".", "_")
-                    
-                    # Ищем старые финалки уже в новой папке главы
-                    meshes = cmds.listRelatives(sg, allDescendents=True, type='mesh', fullPath=True) or []
-                    if not meshes: continue
-                    transforms = list(set([cmds.listRelatives(m, parent=True, fullPath=True)[0] for m in meshes]))
-                    if not transforms: continue
-
-                    if _combine_lp_transforms(transforms, final_lp_name, chapter_lp_root):
-                        lp_count += 1
-
-                if lp_count == 0 and direct_lp_meshes:
-                    final_lp_name = "{}_low".format(base_name).replace(".", "_")
-                    if _combine_lp_transforms(direct_lp_meshes, final_lp_name, chapter_lp_root):
-                        lp_count += 1
-                            
-            except Exception as e:
-                cmds.warning("Combine error: {}".format(e))
-                return {'success': False, 'hp': 0, 'lp': 0}
-            finally:
-                progress_dlg.close()
-                
-        return {'success': True, 'hp': hp_count, 'lp': lp_count}
 
     @staticmethod
     def process_final_group(base_name, hp_main, final_mesh_widgets):
@@ -515,27 +401,21 @@ class FinalExportProcessor(object):
         # Determine prefixes and smooth levels (support UI and Batch export)
         prefixes_to_process = []
         
-        # Get the direct LP children list to search for prefixes (Support new LP_Combine_BG structure)
-        chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-        if cmds.objExists(chapter_grp_path):
-            lp_direct_children = cmds.listRelatives(chapter_grp_path, children=True, fullPath=True, type='transform') or []
-        else:
-            lp_direct_children = cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []
-            
+        # LP _low_NNN meshes now live in place inside the LP subgroups under
+        # lp_main (no LP_Combine_BG). Collect them by walking all descendants.
         lp_all = []
-        for child in lp_direct_children:
+        for child in (cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []):
             shapes = cmds.listRelatives(child, shapes=True, fullPath=True, type='mesh') or []
-            if shapes and not cmds.getAttr(shapes[0] + ".intermediateObject"):
+            if shapes and not cmds.getAttr(shapes[0] + ".intermediateObject") and "_low" in child.split('|')[-1].lower():
                 lp_all.append(child)
 
         if mode == 'lp':
             if not lp_all:
                 return False
 
-            cmds.select(lp_all, replace=True)
             export_name = "{}_LP".format(base_name).replace(".", "_")
             export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-            FinalExportProcessor.export_selected_fbx(export_path)
+            FinalExportProcessor._export_with_lp_triangulation_rollback(lp_all, export_path)
             return export_name
                 
         if final_mesh_widgets:
@@ -693,8 +573,8 @@ class FinalExportProcessor(object):
                 
                 export_name = "{}{}".format(base_name, suffix).replace(".", "_")
                 export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-                
-                FinalExportProcessor.export_selected_fbx(export_path)
+
+                FinalExportProcessor._export_with_lp_triangulation_rollback(export_nodes, export_path)
                 return export_name
                 
         except Exception as e:

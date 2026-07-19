@@ -83,7 +83,7 @@ class HPGroupingWorker(QtCore.QThread):
         groups = {}
         linked_mesh_names = set()
 
-        strategy_name = ["Spatial Volume Match", "PCA Shape Alignment", "Topology Fingerprint"][self.strategy] if self.strategy in (0, 1, 2) else str(self.strategy)
+        strategy_name = ["Spatial Volume Match", "Vertex Proximity", "Topology Fingerprint"][self.strategy] if self.strategy in (0, 1, 2) else str(self.strategy)
 
         def _short_name(name):
             try:
@@ -222,7 +222,7 @@ class HPGroupingWorker(QtCore.QThread):
 
         protected_group_names = set()
 
-        self.progress_value.emit(5)
+        self.progress_value.emit(4)
         self.progress_text.emit("Step 1: Preparing LP boundaries...")
 
         sorted_lp_names = sorted(self.lp_data.keys(), key=lambda k: self.lp_data[k].get("bbox_vol", 0))
@@ -230,7 +230,7 @@ class HPGroupingWorker(QtCore.QThread):
         lp_to_owned_hps = {lp: [] for lp in sorted_lp_names}
         hp_claims = {}
 
-        self.progress_value.emit(10)
+        self.progress_value.emit(5)
         self.progress_text.emit("Step 2: Smart Tender Matching (HP to LP)...")
 
         # GT Matcher/manual links are NOT created as final subgroups here.
@@ -255,13 +255,62 @@ class HPGroupingWorker(QtCore.QThread):
 
         hp_candidates = {hp: [] for hp in unassigned_hps}
         unassigned_hp_names = list(unassigned_hps)
-        
+
+        # Spatial grid over LP bounding boxes so each HP only runs is_overlapping()
+        # against nearby LP instead of all of them (O(HP x LP) -> ~O(HP x local)).
+        # is_overlapping() expands both boxes by match_padding from center; the grid
+        # buckets each LP by the exact same expanded box, so any LP that could pass
+        # is_overlapping() shares a grid cell with the HP. The exact same test still
+        # runs on every remaining candidate, and candidates are collected in the
+        # original sorted_lp_names order, so hp_candidates is byte-identical to the
+        # exhaustive scan -- only guaranteed non-overlapping tests are skipped.
+        def _info_min_max(info, pad):
+            c = info.get('center')
+            mx = info.get('max')
+            if c and mx and len(c) >= 3 and len(mx) >= 3:
+                hx = (mx[0] - c[0]) * pad
+                hy = (mx[1] - c[1]) * pad
+                hz = (mx[2] - c[2]) * pad
+                return (c[0] - hx, c[1] - hy, c[2] - hz), (c[0] + hx, c[1] + hy, c[2] + hz)
+            bb = info.get('bbox')
+            if bb and len(bb) == 6:
+                return (bb[0], bb[1], bb[2]), (bb[3], bb[4], bb[5])
+            return None, None
+
+        _lp_diags = [max(self.lp_data[lp].get('diag', self.lp_data[lp].get('radius', 1.0) * 2.0), 0.0) for lp in sorted_lp_names]
+        _positive_diags = [d for d in _lp_diags if d > 0.0]
+        _grid_cell = max(bg_core.StatsUtils.median(_positive_diags) if _positive_diags else 1.0, 0.001)
+
+        def _cells_for_minmax(mn, mx):
+            x0 = int(math.floor(mn[0] / _grid_cell)); x1 = int(math.floor(mx[0] / _grid_cell))
+            y0 = int(math.floor(mn[1] / _grid_cell)); y1 = int(math.floor(mx[1] / _grid_cell))
+            z0 = int(math.floor(mn[2] / _grid_cell)); z1 = int(math.floor(mx[2] / _grid_cell))
+            return [(x, y, z) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1) for z in range(z0, z1 + 1)]
+
+        _lp_grid = {}
+        _lp_ungridded = []  # LP whose bbox couldn't be read -> always a candidate
+        for lp_name in sorted_lp_names:
+            mn, mx = _info_min_max(self.lp_data[lp_name], self.match_padding)
+            if mn is None:
+                _lp_ungridded.append(lp_name)
+                continue
+            for cell in _cells_for_minmax(mn, mx):
+                _lp_grid.setdefault(cell, set()).add(lp_name)
+
         for hp_idx, hp_name in enumerate(unassigned_hp_names):
             if self.is_cancelled: return
             if hp_idx % max(1, len(unassigned_hp_names) // 25) == 0:
-                self.progress_value.emit(10 + int((hp_idx / float(max(len(unassigned_hp_names), 1))) * 8))
+                self.progress_value.emit(5 + int((hp_idx / float(max(len(unassigned_hp_names), 1))) * 10))
             hp_info = self.hp_data[hp_name]
-            for lp_name in sorted_lp_names:
+            hp_mn, hp_mx = _info_min_max(hp_info, self.match_padding)
+            if hp_mn is None:
+                lp_scan = sorted_lp_names
+            else:
+                _nearby = set(_lp_ungridded)
+                for cell in _cells_for_minmax(hp_mn, hp_mx):
+                    _nearby.update(_lp_grid.get(cell, ()))
+                lp_scan = [lp for lp in sorted_lp_names if lp in _nearby]
+            for lp_name in lp_scan:
                 lp_info = self.lp_data[lp_name]
                 if bg_core.MathUtils.is_overlapping(lp_info, hp_info, padding=self.match_padding):
                     hp_candidates[hp_name].append(lp_name)
@@ -475,7 +524,7 @@ class HPGroupingWorker(QtCore.QThread):
         else:
             compound_scene_diag = 1.0
 
-        self.progress_value.emit(18)
+        self.progress_value.emit(15)
         self.progress_text.emit("Step 2.2: Compound HP vertex linking...")
 
         lp_to_hp_candidates = {}
@@ -511,7 +560,7 @@ class HPGroupingWorker(QtCore.QThread):
             if self.is_cancelled:
                 return
             if lp_idx % max(1, len(compound_lp_items) // 20) == 0:
-                self.progress_value.emit(18 + int((lp_idx / float(max(len(compound_lp_items), 1))) * 6))
+                self.progress_value.emit(15 + int((lp_idx / float(max(len(compound_lp_items), 1))) * 7))
 
             hp_names = sorted(set(hp_names))
             if len(hp_names) < 2:
@@ -711,7 +760,7 @@ class HPGroupingWorker(QtCore.QThread):
             if self.is_cancelled:
                 return
             if idx % max(1, total_units // 20) == 0:
-                self.progress_value.emit(24 + int((idx / float(max(total_units, 1))) * 11))
+                self.progress_value.emit(22 + int((idx / float(max(total_units, 1))) * 8))
 
             hp_unit = [hp for hp in hp_unit if hp in hp_candidates]
             if not hp_unit:
@@ -780,7 +829,7 @@ class HPGroupingWorker(QtCore.QThread):
 
 
         def _step2_5_floater_decal_pass():
-            self.progress_value.emit(35)
+            self.progress_value.emit(30)
             self.progress_text.emit("Step 2.5: Analyzing HP holes for floater/decal matching...")
 
             # --- STEP 2.5 ---
@@ -1076,7 +1125,7 @@ class HPGroupingWorker(QtCore.QThread):
                         break
                     if parent_hp in floaters_assigned: continue
                     if parent_idx % max(1, len(all_hp_names) // 20) == 0:
-                        self.progress_value.emit(35 + int((parent_idx / float(max(len(all_hp_names), 1))) * 5))
+                        self.progress_value.emit(30 + int((parent_idx / float(max(len(all_hp_names), 1))) * 28))
                 
                     hole_boundary_verts = _hole_points(parent_hp)
                     parent_info = self.hp_data.get(parent_hp, {})
@@ -1411,7 +1460,12 @@ class HPGroupingWorker(QtCore.QThread):
                     floater_context_rejects + floater_ambiguous_rejects
                 ))
                 if floater_scan_limited:
-                    logs.append("[Warning] Floater/decal pass reached the safety limit and was stopped early to keep Analyze HP responsive.")
+                    unresolved = sorted(_short_name(c) for c in weak_floater_candidates if c not in floaters_assigned)
+                    logs.append("[Warning] Floater/decal pass hit the safety limit ({} distance tests) and stopped early; {} weak candidate(s) were left unresolved and may need manual attachment.".format(
+                        distance_test_limit, len(unresolved)))
+                    if unresolved:
+                        _debug("Step 2.5: floater pass safety-limit left these candidates unresolved:")
+                        _debug_list("  FLOATER_UNRESOLVED: ", unresolved)
             else:
                 _debug("Step 2.5: floater/decal pass skipped | detect_floaters={} | math_core={}.".format(
                     self.detect_floaters,
@@ -1421,7 +1475,7 @@ class HPGroupingWorker(QtCore.QThread):
             return
 
 
-        self.progress_value.emit(40)
+        self.progress_value.emit(58)
         self.progress_text.emit("Step 3: Clustering Similar LP meshes...")
 
         # --- STEP 3: Clustering Similar LP Meshes ---
@@ -1643,7 +1697,7 @@ class HPGroupingWorker(QtCore.QThread):
                 ))
         _debug("")
 
-        self.progress_value.emit(45)
+        self.progress_value.emit(61)
         self.progress_text.emit("Step 4: Calculating Smart Size Boundaries...")
 
         # --- STEP 4: Threshold Calculations & OUTLIER VALIDATION ---
@@ -1701,7 +1755,7 @@ class HPGroupingWorker(QtCore.QThread):
         _debug("  repeated bolt-like topology signatures={}".format(len(bolt_vtx_values)))
         _debug("")
 
-        self.progress_value.emit(50)
+        self.progress_value.emit(63)
         self.progress_text.emit("Step 5: Computing mesh clusters for singletons...")
 
         # --- STEP 5: Singletons Handling ---
@@ -2076,7 +2130,7 @@ class HPGroupingWorker(QtCore.QThread):
             return bg_core.MathUtils.is_overlapping(m1, m2)
 
         def _step6_7_categorize_and_pack():
-            self.progress_value.emit(55)
+            self.progress_value.emit(66)
             self.progress_text.emit("Step 6: Categorizing cluster metrics...")
 
             # --- STEP 6: CATEGORIZATION ---
@@ -2137,7 +2191,7 @@ class HPGroupingWorker(QtCore.QThread):
             for item_idx, item in enumerate(all_items):
                 if self.is_cancelled: return True
                 if item_idx % max(1, len(all_items) // 25) == 0:
-                    self.progress_value.emit(55 + int((item_idx / float(max(len(all_items), 1))) * 15))
+                    self.progress_value.emit(66 + int((item_idx / float(max(len(all_items), 1))) * 10))
             
                 true_vol, cluster_diag = get_cluster_metrics(item)
                 is_hard_custom = _item_is_hard_custom(item)
@@ -2165,19 +2219,24 @@ class HPGroupingWorker(QtCore.QThread):
                 math_core_success = False
             
                 if HAS_MATH_CORE:
-                    verts = self.hp_verts_cache.get(item[0].get("name"), [])
-                    if verts:
-                        metrics = bg_math_core.analyze_mesh_shape(verts)
-                    
-                        symmetry_ok = (not self.use_symmetry) or metrics.symmetry_score < self.bolt_symmetry
-                        if not is_zb and not is_hard_custom and metrics.elongation < self.bolt_elongation and symmetry_ok:
+                    # Reuse the shared get_shape_metrics cache instead of a second
+                    # direct analyze_mesh_shape() call for item[0] (it is analyzed
+                    # again just below via _mesh_is_bolt_like). get_shape_metrics
+                    # also swallows a failed shape analysis (returns None) so one
+                    # bad mesh can't crash the whole categorization pass.
+                    shape_metrics = get_shape_metrics(item[0])
+                    if shape_metrics is not None:
+                        elongation, symmetry_score = shape_metrics
+
+                        symmetry_ok = (not self.use_symmetry) or symmetry_score < self.bolt_symmetry
+                        if not is_zb and not is_hard_custom and elongation < self.bolt_elongation and symmetry_ok:
                             if cluster_diag <= medium_threshold:
                                 is_bolt_shape = True
-                            
+
                         effective_wire_elongation = 8.0 if is_zb else self.wire_elongation
-                        if metrics.elongation > effective_wire_elongation and true_vol < 0.05:
+                        if elongation > effective_wire_elongation and true_vol < 0.05:
                             is_wire_shape = True
-                    
+
                         math_core_success = True
             
                 if not math_core_success:
@@ -2324,7 +2383,7 @@ class HPGroupingWorker(QtCore.QThread):
                 _debug("  LP family bolt reclass item(s)={}".format(lp_family_reclass_count))
             _debug("")
 
-            self.progress_value.emit(70)
+            self.progress_value.emit(76)
             self.progress_text.emit("Step 7: Spatial Hashing and Packing...")
 
             # --- STEP 7: SPATIAL PACKING ---
@@ -2473,7 +2532,7 @@ class HPGroupingWorker(QtCore.QThread):
                     if self.is_cancelled: return
                     pack_done[0] += 1
                     if pack_done[0] % max(1, pack_total // 25) == 0:
-                        self.progress_value.emit(70 + int((pack_done[0] / float(max(pack_total, 1))) * 25))
+                        self.progress_value.emit(76 + int((pack_done[0] / float(max(pack_total, 1))) * 20))
                     placed = False
                     item_prefix = _item_group_prefix(prefix, item)
                 
@@ -2822,8 +2881,8 @@ class HPGroupingWorker(QtCore.QThread):
         logs.append("Matched {} objects via Broad/Narrow phase.".format(matched_count))
         logs.append("Total groups created: {} (Limit: {})".format(len(groups), self.group_limit))
 
-        self.progress_value.emit(96)
-        
+        self.progress_value.emit(97)
+
         # --- ENFORCED COMPLIANCE WITH SUBGROUP LIMITS (SMART MERGE) ---
         # GT/manual/custom links are already baked into cluster items, so normal
         # subgroup merging can run without creating protected one-cluster groups.
@@ -3174,9 +3233,51 @@ class HPGroupingWorker(QtCore.QThread):
             _debug_list("    HP: ", [m.get("name") for m in meshes if m.get("name")])
         _debug("")
 
+        # --- Diagnostics (read-only aggregation for the debug report) ---------
+        # Purpose: make it easy to see *why* a mesh grouped the way it did.
+        # This only reads already-computed state (unassigned_hps, hp_claims) and
+        # appends to the log/summary; it never changes grouping.
+        unassigned_list = sorted(_short_name(h) for h in unassigned_hps)
+        source_counts = {}
+        fallback_hits = []
+        weak_hits = []
+        for _hp_name, _claim in hp_claims.items():
+            _src = _claim.get("source", "unknown")
+            source_counts[_src] = source_counts.get(_src, 0) + 1
+            _reason = str(_claim.get("reason", ""))
+            try:
+                _score = float(_claim.get("score", 0.0) or 0.0)
+            except Exception:
+                _score = 0.0
+            if "accepted by fallback" in _reason:
+                fallback_hits.append((_short_name(_hp_name), _short_name(_claim.get("owner_lp")), _score))
+            elif _score < 45.0:
+                weak_hits.append((_short_name(_hp_name), _short_name(_claim.get("owner_lp")), _score))
+
+        _debug("")
+        _debug("=== Diagnostics ===")
+        _debug("Assignment sources: {}.".format(
+            ", ".join("{}={}".format(k, source_counts[k]) for k in sorted(source_counts)) or "none"))
+        if unassigned_list:
+            _debug("{} HP mesh(es) matched no LP owner (grouped by shape/proximity/GT instead):".format(len(unassigned_list)))
+            _debug_list("  UNMATCHED_HP: ", unassigned_list)
+        else:
+            _debug("Every HP mesh was matched to an LP owner.")
+        if fallback_hits:
+            _debug("{} low-confidence assignment(s) accepted by fallback (no reliable vertex validation):".format(len(fallback_hits)))
+            for _n, _lp, _sc in sorted(fallback_hits)[:80]:
+                _debug("  FALLBACK_ASSIGN: HP='{}' -> LP='{}' | score={:.1f}".format(_n, _lp, _sc))
+        if weak_hits:
+            _debug("{} weak assignment(s) (confidence score < 45):".format(len(weak_hits)))
+            for _n, _lp, _sc in sorted(weak_hits)[:80]:
+                _debug("  WEAK_ASSIGN: HP='{}' -> LP='{}' | score={:.1f}".format(_n, _lp, _sc))
+        _debug("")
+
         self.summary_lines = [
             "Analyze HP: {} HP mesh(es) processed into {} group(s).".format(len(self.hp_data), len(groups)),
             "LP-guided matching: {} HP mesh(es) resolved before final packing.".format(matched_count),
+            "Match confidence: {} fallback / {} weak assignment(s); {} HP mesh(es) matched no LP.".format(
+                len(fallback_hits), len(weak_hits), len(unassigned_list)),
             "Compound HP linking: {} component(s), {} linked pair(s), min vertices={}, distance={}%. ".format(
                 len(compound_components), compound_hit_pairs, compound_min_hits, self.compound_link_dist_pct
             ).strip(),

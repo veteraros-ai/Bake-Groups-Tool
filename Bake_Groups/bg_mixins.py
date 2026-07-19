@@ -11,6 +11,7 @@ modules_to_reload = [
     'bg_worker_hp',
     'bg_worker_lp',
     'bg_gt_matcher',
+    'bg_cage',
     'bg_final_export',
     'bg_localization'
 ]
@@ -33,6 +34,7 @@ import maya.api.OpenMaya as om
 from bg_worker_lp import LPMatchingWorker
 import bg_gt_matcher
 import bg_final_export
+import bg_cage
 import bg_localization as bg_l10n
 
 try:
@@ -52,12 +54,13 @@ except ImportError:
 
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
+import maya.mel as mel
 import uuid
 import re
 import math
 import os
 import contextlib
-from bg_ui_widgets import SubgroupButton
+from bg_ui_widgets import SubgroupButton, get_icon, configure_square_icon_button
 
 
 # ============================================================================
@@ -67,6 +70,10 @@ class HPAnalysisMixin:
     """Methods for High-poly analysis and auto-grouping."""
 
     def gather_hp_worker_params(self):
+        cache_mode = bg_core.DENSITY_MODE_OPTIMAL
+        combo = getattr(self, 'combo_hp_cache_mode', None)
+        if combo is not None and combo.currentIndex() == 1:
+            cache_mode = bg_core.DENSITY_MODE_SPEED
         return {
             'threshold_pct': self.spin_collision_pct.value(),
             'strategy': self.combo_hp_strategy.currentIndex(),
@@ -74,7 +81,8 @@ class HPAnalysisMixin:
             'compound_link_verts': self.spin_compound_link_verts.value(),
             'compound_link_dist_pct': self.spin_compound_link_dist.value(),
             'ignore_floaters': self.chk_ignore_floaters.isChecked(),
-            'material_slots': bool(getattr(self, 'chk_material_slots', None) and self.chk_material_slots.isChecked())
+            'material_slots': bool(getattr(self, 'chk_material_slots', None) and self.chk_material_slots.isChecked()),
+            'cache_mode': cache_mode
         }
 
     def _is_in_zbrush_display_layer(self, mesh_transform):
@@ -845,6 +853,33 @@ class HPAnalysisMixin:
         checked = getattr(self, '_hp_structure_checked_chapters', None)
         return bool(checked and pair_id in checked)
 
+    def _remove_empty_transform_groups(self, roots):
+        """Delete stray empty transform nodes (no shapes, no descendants) under the
+        given roots - e.g. a leftover 'transform1'. Never deletes a root itself or
+        a group that still contains meshes. Deepest-first so containers that become
+        empty after their children are removed are cleaned in the same pass. Uses
+        the same predicate prepare_meshes already applies during Analyze HP flatten."""
+        removed = []
+        for root in roots:
+            if not root or not cmds.objExists(root):
+                continue
+            descendants = cmds.listRelatives(root, allDescendents=True, type='transform', fullPath=True) or []
+            descendants.sort(key=lambda n: n.count('|'), reverse=True)
+            for node in descendants:
+                if not cmds.objExists(node):
+                    continue
+                if cmds.listRelatives(node, shapes=True):
+                    continue
+                if cmds.listRelatives(node, allDescendents=True):
+                    continue
+                try:
+                    short = node.split('|')[-1]
+                    cmds.delete(node)
+                    removed.append(short)
+                except Exception:
+                    pass
+        return removed
+
     def run_pre_analysis_checks(self):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
@@ -854,6 +889,23 @@ class HPAnalysisMixin:
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         if not hp_main:
             cmds.warning("HighPoly root not found.")
+            return False
+
+        # Auto-clean stray empty transform groups (e.g. 'transform1') first.
+        roots = [hp_main] + ([lp_main] if lp_main and cmds.objExists(lp_main) else [])
+        with bg_core.undo_chunk("RemoveEmptyTransforms"):
+            removed_empties = self._remove_empty_transform_groups(roots)
+        if removed_empties:
+            preview = ", ".join(removed_empties[:8])
+            if len(removed_empties) > 8:
+                preview += ", ... +{} more".format(len(removed_empties) - 8)
+            self.log(bg_l10n.text("Check: removed {count} empty transform group(s): {names}").format(
+                count=len(removed_empties), names=preview), "lightgreen")
+
+        # Frozen-transform gate (same as Create / Analyze HP / Assign LP): the
+        # standalone Check did not run it before, so non-zero transforms on the
+        # HP/LP roots or their meshes slipped past this button. Offer to freeze.
+        if not self.validate_frozen_transforms(roots, roots, bg_l10n.text("Check Before Analyze")):
             return False
 
         # Each _confirm_* function returns False only for "Select" (user wants
@@ -884,6 +936,44 @@ class HPAnalysisMixin:
         self.log("Check: no duplicate, ZBrush or combined-mesh issues found.", "lightgreen")
         cmds.inViewMessage(amg="Check completed: no issues found.", pos='midCenter', fade=True)
         return True
+
+    # --- Analyze HP geometry cache -------------------------------------------
+    # Caches extracted world verts + fingerprint + hole data per mesh so that a
+    # re-run on an unchanged scene (e.g. after only tweaking a slider) skips the
+    # expensive re-extraction. Keyed by the same cheap dirty-signature used for
+    # the combined-mesh check (uuid + vtx + face + rounded bbox), plus the
+    # effective density_pct so switching Optimal<->Speed correctly invalidates
+    # any mesh that was decimated (sub-threshold meshes use density=100 in both
+    # modes, so they are NOT needlessly invalidated on a mode switch).
+    def _analyze_geo_cache_dict(self):
+        cache = getattr(self, '_analyze_geo_cache', None)
+        if cache is None or not isinstance(cache, dict):
+            cache = {}
+            self._analyze_geo_cache = cache
+        return cache
+
+    def _analyze_geo_lookup(self, mesh_path, cache_mode):
+        """Returns (payload_or_None, cache_id, full_key, density_pct).
+        payload is the cached geometry dict on a hit; cache_id is None when the
+        mesh cannot be keyed (uncacheable, always recompute)."""
+        cache_id, sig = self._combined_check_cache_key(mesh_path)
+        if not cache_id:
+            return None, None, None, 100.0
+        try:
+            vcount = int(sig[1])
+        except Exception:
+            vcount = 0
+        density = bg_core.density_pct_for(vcount, cache_mode)
+        full_key = (sig, density)
+        entry = self._analyze_geo_cache_dict().get(cache_id)
+        if entry and entry.get('key') == full_key:
+            return entry.get('payload'), cache_id, full_key, density
+        return None, cache_id, full_key, density
+
+    def _analyze_geo_store(self, cache_id, full_key, payload):
+        if not cache_id:
+            return
+        self._analyze_geo_cache_dict()[cache_id] = {'key': full_key, 'payload': payload}
 
     def run_hp_analysis(self, _):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -926,6 +1016,10 @@ class HPAnalysisMixin:
         self._reset_prep_undo_tracking('hp_analysis')
 
         worker_params = self.gather_hp_worker_params()
+        # N_Mat is decided per chapter at Create time (multi-material LP kept as
+        # one chapter), not by a global flag anymore.
+        if 'material_slots' in pair:
+            worker_params['material_slots'] = bool(pair.get('material_slots'))
         threshold_pct = worker_params['threshold_pct']
         group_limit = int(getattr(self, 'hp_group_limit', 12))
         locked = pair.get('locked', [])
@@ -1706,6 +1800,10 @@ class HPAnalysisMixin:
         if maya_main_window:
             maya_main_window.setEnabled(False)
 
+        cache_mode = worker_params.get('cache_mode', bg_core.DENSITY_MODE_OPTIMAL)
+        cache_hits = 0
+        touched_geo_ids = set()
+        fingerprint_failures = []
         try:
             total_items = len(self.hp_data_cache) + len(self.lp_data_cache)
             step = 0
@@ -1715,10 +1813,29 @@ class HPAnalysisMixin:
                     break
                 self.progress_dlg.setLabelText(bg_l10n.text("Fingerprinting HP: {name}").format(name=data["name"].split('|')[-1]))
 
-                verts = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=100)
+                cached, cache_id, full_key, density = self._analyze_geo_lookup(m_path, cache_mode)
+                if cache_id:
+                    touched_geo_ids.add(cache_id)
+                if cached is not None:
+                    # Cache hit: reuse verts/hash/hole exactly as recomputed.
+                    verts = cached.get("verts", [])
+                    hp_verts_cache[m_path] = verts
+                    if cached.get("hole") is not None:
+                        hp_holes_cache[m_path] = cached.get("hole")
+                    data["hash"] = cached.get("hash", "empty")
+                    data["variance"] = cached.get("variance", 999.0)
+                    data["mean_radius"] = cached.get("mean_radius", 0.0)
+                    cache_hits += 1
+                    step += 1
+                    self.progress_dlg.setValue(int((step / total_items) * 40))
+                    self.progress_dlg.repaint()
+                    continue
+
+                verts = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=density)
                 hp_verts_cache[m_path] = verts
 
                 # Boundary holes detection
+                hole_entry = None
                 if not data.get("is_zbrush"):
                     hole_entry = build_hp_hole_cache_entry(m_path, data.get("center"))
                     if hole_entry:
@@ -1727,19 +1844,12 @@ class HPAnalysisMixin:
                 if not data.get("is_zbrush") and HAS_MATH_CORE:
                     try:
                         fp_string = bg_math_core.generate_fingerprint_data(verts, data["center"])
-                        
-                        #print("DEBUG HASH | Объект: {} | Хэш: {}".format(data["name"], fp_string))
-                        
                         data["hash"] = fp_string
                         data["variance"] = 0.0
                         data["mean_radius"] = data.get("radius", 0.0)
-                        
-                        data["hash"] = fp_string
-                        data["variance"] = 0.0
-                        data["mean_radius"] = data.get("radius", 0.0)
-                        
                     except Exception as e:
                         print("bg_mixins: Ошибка генерации фингерпринта для {}: {}".format(data["name"], e))
+                        fingerprint_failures.append(data["name"].split('|')[-1])
                         data["hash"] = "empty"
                         data["variance"] = 999.0
                         data["mean_radius"] = 0.0
@@ -1748,25 +1858,62 @@ class HPAnalysisMixin:
                     data["variance"] = 999.0
                     data["mean_radius"] = 0.0
 
+                self._analyze_geo_store(cache_id, full_key, {
+                    "verts": verts,
+                    "hole": hole_entry,
+                    "hash": data["hash"],
+                    "variance": data["variance"],
+                    "mean_radius": data["mean_radius"],
+                })
+
                 step += 1
-                self.progress_dlg.setValue(int((step / total_items) * 100))
+                self.progress_dlg.setValue(int((step / total_items) * 40))
                 self.progress_dlg.repaint()
 
             for m_path in self.lp_data_cache.keys():
                 if self.progress_dlg.wasCanceled():
                     break
                 self.progress_dlg.setLabelText(bg_l10n.text("Caching LP: {name}").format(name=m_path.split('|')[-1]))
-                if m_path in lp_prebuilt_verts_cache:
-                    lp_verts_cache[m_path] = lp_prebuilt_verts_cache[m_path]
-                else:
-                    lp_verts_cache[m_path] = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=100)
                 lp_data = self.lp_data_cache.get(m_path)
-                if lp_data is not None and HAS_MATH_CORE and lp_verts_cache.get(m_path):
+                if m_path in lp_prebuilt_verts_cache:
+                    # Virtual LP shells are already cached upstream; don't re-key them.
+                    lp_verts_cache[m_path] = lp_prebuilt_verts_cache[m_path]
+                    if lp_data is not None and HAS_MATH_CORE and lp_verts_cache.get(m_path):
+                        try:
+                            lp_data["hash"] = bg_math_core.generate_fingerprint_data(
+                                lp_verts_cache[m_path], lp_data.get("center", [0.0, 0.0, 0.0]))
+                            lp_data["variance"] = 0.0
+                        except Exception:
+                            lp_data["hash"] = "empty"
+                            lp_data["variance"] = 999.0
+                    elif lp_data is not None:
+                        lp_data.setdefault("hash", "empty")
+                        lp_data.setdefault("variance", 999.0)
+                    step += 1
+                    self.progress_dlg.setValue(int((step / total_items) * 40))
+                    self.progress_dlg.repaint()
+                    continue
+
+                cached, cache_id, full_key, density = self._analyze_geo_lookup(m_path, cache_mode)
+                if cache_id:
+                    touched_geo_ids.add(cache_id)
+                if cached is not None:
+                    lp_verts_cache[m_path] = cached.get("verts", [])
+                    if lp_data is not None:
+                        lp_data["hash"] = cached.get("hash", "empty")
+                        lp_data["variance"] = cached.get("variance", 999.0)
+                    cache_hits += 1
+                    step += 1
+                    self.progress_dlg.setValue(int((step / total_items) * 40))
+                    self.progress_dlg.repaint()
+                    continue
+
+                lp_verts = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=density)
+                lp_verts_cache[m_path] = lp_verts
+                if lp_data is not None and HAS_MATH_CORE and lp_verts:
                     try:
                         lp_data["hash"] = bg_math_core.generate_fingerprint_data(
-                            lp_verts_cache[m_path],
-                            lp_data.get("center", [0.0, 0.0, 0.0])
-                        )
+                            lp_verts, lp_data.get("center", [0.0, 0.0, 0.0]))
                         lp_data["variance"] = 0.0
                     except Exception:
                         lp_data["hash"] = "empty"
@@ -1774,9 +1921,28 @@ class HPAnalysisMixin:
                 elif lp_data is not None:
                     lp_data.setdefault("hash", "empty")
                     lp_data.setdefault("variance", 999.0)
+
+                self._analyze_geo_store(cache_id, full_key, {
+                    "verts": lp_verts,
+                    "hole": None,
+                    "hash": (lp_data or {}).get("hash", "empty"),
+                    "variance": (lp_data or {}).get("variance", 999.0),
+                    "mean_radius": 0.0,
+                })
+
                 step += 1
-                self.progress_dlg.setValue(int((step / total_items) * 100))
+                self.progress_dlg.setValue(int((step / total_items) * 40))
                 self.progress_dlg.repaint()
+
+            if cache_hits:
+                self.log("Analyze HP: reused cached geometry for {} mesh(es).".format(cache_hits), "lightblue")
+
+            if fingerprint_failures:
+                preview = ", ".join(fingerprint_failures[:8])
+                if len(fingerprint_failures) > 8:
+                    preview += ", ... +{} more".format(len(fingerprint_failures) - 8)
+                self.log("Analyze HP: fingerprint failed for {} mesh(es) (they fall back to generic clustering): {}".format(
+                    len(fingerprint_failures), preview), "orange")
 
         finally:
             if maya_main_window:
@@ -1786,7 +1952,32 @@ class HPAnalysisMixin:
             self._cancel_hp_analysis()
             return
 
+        # Bound the geometry cache to this run's working set so it can't grow
+        # unbounded across a long session (it holds full vert arrays). Re-running
+        # the same chapter still gets full cache hits; switching chapters evicts
+        # the previous one. Only prune on a completed (non-cancelled) pass.
+        geo_cache = getattr(self, '_analyze_geo_cache', None)
+        if isinstance(geo_cache, dict) and touched_geo_ids:
+            self._analyze_geo_cache = {k: v for k, v in geo_cache.items() if k in touched_geo_ids}
+
         self.progress_dlg.setLabelText(bg_l10n.text("Starting Multithreaded Processing..."))
+
+        # Scale-aware floater radius. floater_radius is an ABSOLUTE distance the
+        # worker uses to decide if a small detail sits on a parent surface. A hard
+        # 0.1 breaks floater/decal detection on large-scale scenes (a real gap of
+        # several units always exceeds 0.1). Scale it by the scene, but floor it at
+        # the historical 0.1 so normal/small scenes behave exactly as before -
+        # scaling only ever raises the radius for genuinely large scenes.
+        _hp_diags = []
+        for _d in self.hp_data_cache.values():
+            _dg = _d.get('diag', _d.get('radius', 0.0) * 2.0)
+            if _dg and _dg > 0.0:
+                _hp_diags.append(float(_dg))
+        _median_hp_diag = bg_core.StatsUtils.median(_hp_diags) if _hp_diags else 0.0
+        _floater_radius = max(0.1, _median_hp_diag * 0.02)
+        if _floater_radius > 0.1:
+            self.log("Analyze HP: large-scale scene (median HP diag {:.2f}); floater radius scaled to {:.3f}.".format(
+                _median_hp_diag, _floater_radius), "lightblue")
 
         self.hp_worker = HPGroupingWorker(
             self.hp_data_cache, self.lp_data_cache,
@@ -1802,10 +1993,11 @@ class HPAnalysisMixin:
             compound_link_verts=worker_params['compound_link_verts'],
             compound_link_dist_pct=worker_params['compound_link_dist_pct'],
             detect_floaters=not worker_params.get('ignore_floaters', True),
-            floater_radius=0.1
+            floater_radius=_floater_radius
         )
 
-        self.hp_worker.progress_value.connect(self.progress_dlg.setValue)
+        # Fingerprinting already filled 0-40%; the worker owns the 40-100% band.
+        self.hp_worker.progress_value.connect(self._on_hp_worker_progress)
         self.hp_worker.progress_text.connect(self.progress_dlg.setLabelText)
         self.hp_worker.finished.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair))
         self.progress_dlg.canceled.connect(self._cancel_hp_analysis)
@@ -2506,83 +2698,50 @@ class FinalViewMixin:
                 # уровня сглаживания одного меша не конфликтовало с Maya.
                 QtCore.QTimer.singleShot(100, safe_refresh)
 
-    def set_final_low_visibility(self, base_name, visible):
-        global_lp_root = "LP_Combine_BG"
-        chapter_grp_path = "{}|{}".format(global_lp_root, base_name)
-        self.is_final_low_visible = bool(visible)
-
-        if not cmds.objExists(global_lp_root):
-            self.is_final_low_visible = False
-            visible = False
-        else:
-            all_chapters = cmds.listRelatives(global_lp_root, children=True, fullPath=True) or []
-            current_chapter_full = cmds.ls(chapter_grp_path, long=True)
-            current_chapter_full = current_chapter_full[0] if current_chapter_full else ""
-
-            if visible and current_chapter_full:
-                cmds.setAttr(global_lp_root + ".visibility", True)
-                for chapter_folder in all_chapters:
-                    cmds.setAttr(chapter_folder + ".visibility", chapter_folder == current_chapter_full)
-            else:
-                for chapter_folder in all_chapters:
-                    cmds.setAttr(chapter_folder + ".visibility", False)
-                cmds.setAttr(global_lp_root + ".visibility", False)
-                self.is_final_low_visible = False
-
-        if getattr(self, 'is_final_view', False) and hasattr(self, 'btn_toggle_lp'):
-            self.btn_toggle_lp.blockSignals(True)
-            self.btn_toggle_lp.setChecked(self.is_final_low_visible)
-            self.btn_toggle_lp.setText(bg_l10n.text("Low Visible" if self.is_final_low_visible else "Low Hidden"))
-            self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if self.is_final_low_visible else "background-color: #8c4242;")
-            self.btn_toggle_lp.blockSignals(False)
-
-        self.sync_final_view_isolation(base_name)
-
-    def sync_final_view_isolation(self, base_name):
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not pair or not getattr(self, 'is_final_view', False):
+    def _warn_if_lp_undistributed(self, lp_main):
+        """Red warning when the LP still has meshes sitting directly under its
+        root - i.e. Assign LP Meshes was never run (or didn't finish). Those
+        meshes are in no subgroup, so they get no cage and won't export."""
+        if not lp_main or not cmds.objExists(lp_main):
             return
-        hp_main, _, _ = self.core.resolve_main_nodes(pair)
-        if not hp_main or not cmds.objExists(hp_main):
+        direct = [t for t in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or [])
+                  if cmds.listRelatives(t, shapes=True, type='mesh', noIntermediate=True)]
+        if not direct:
             return
-
-        chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-        hp_all_desc = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or []
-        model_panels = cmds.getPanel(type='modelPanel') or []
-        for panel in model_panels:
-            if not cmds.isolateSelect(panel, query=True, state=True):
-                continue
-            iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
-            set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
-            if cmds.objExists(set_name):
-                cmds.sets(clear=set_name)
-
-            for child in hp_all_desc:
-                short_name = child.split('|')[-1]
-                is_final_mesh = short_name.startswith(base_name) and "_high" in short_name
-                if is_final_mesh and cmds.listRelatives(child, shapes=True):
-                    cmds.isolateSelect(panel, addDagObject=child)
-            if getattr(self, 'is_final_low_visible', False) and cmds.objExists(chapter_grp_path):
-                cmds.isolateSelect(panel, addDagObject=chapter_grp_path)
+        preview = ", ".join(t.split('|')[-1] for t in direct[:8])
+        if len(direct) > 8:
+            preview += ", ... +{} more".format(len(direct) - 8)
+        msg = bg_l10n.text("LP is not distributed: {n} LP mesh(es) are loose under the LP root. Run Assign LP Meshes first.").format(n=len(direct))
+        self.log(msg + " [" + preview + "]", "red")
 
     def toggle_final_view(self):
         self.is_final_view = not getattr(self, 'is_final_view', False)
 
+        # Find Sim does not apply in Export Settings (subgroups are finalized
+        # there), so it hides and reappears on Back.
         if hasattr(self, 'btn_fs'):
             self.btn_fs.setVisible(not self.is_final_view)
-        if hasattr(self, 'btn_add'):
-            self.btn_add.setVisible(not self.is_final_view)
-        if hasattr(self, 'btn_combine_bake'):
-            self.btn_combine_bake.setVisible(not self.is_final_view)
 
         if self.is_final_view:
-            self.btn_toggle_view.setText(bg_l10n.text("Back"))
+            configure_square_icon_button(self.btn_toggle_view, "Back_button.png", "Back", size=30, icon_size=20)
             self.btn_preview.setVisible(True)
             self.btn_process_final.setVisible(True)
         else:
-            self.btn_toggle_view.setText(bg_l10n.text("Final Group"))
+            # Revert the square icon-only sizing back to a normal wide text
+            # button (configure_square_icon_button locks min/max size).
+            self.btn_toggle_view.setIcon(QtGui.QIcon())
+            self.btn_toggle_view.setToolTip("")
+            self.btn_toggle_view.setStatusTip("")
+            self.btn_toggle_view.setMinimumSize(0, 0)
+            self.btn_toggle_view.setMaximumSize(16777215, 16777215)
+            self.btn_toggle_view.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+            self.btn_toggle_view.setFixedHeight(30)
+            self.btn_toggle_view.setText(bg_l10n.text("Export Settings"))
             self.btn_preview.setVisible(False)
             self.btn_process_final.setVisible(False)
+            # Leaving Export Settings also leaves cage config (restore Matcher).
+            if getattr(self, 'is_cage_config', False):
+                self.exit_cage_config()
             if getattr(self, 'is_preview_active', False):
                 self.toggle_preview_smoothing()
 
@@ -2590,51 +2749,61 @@ class FinalViewMixin:
         if pair:
             hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
             base_name = pair.get('base', '')
-            chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
+
+            # Entering Export Settings finalizes the in-place naming (HP _high_NNN,
+            # LP _low_NNN) that export relies on - this replaces the old Combine Fin.
+            if self.is_final_view:
+                self.finalize_subgroup_naming(base_name, hp_main, lp_main)
+                self._warn_if_lp_undistributed(lp_main)
 
             if not hasattr(self, 'saved_subgroup_vis'):
                 self.saved_subgroup_vis = {}
 
-            # HP subgroups visibility
+            # HP: always fully visible in Export Settings for the smooth preview
+            # (show the HP root even if it was hidden, plus its subgroups). The
+            # prior state is remembered and restored on Back.
             if hp_main and cmds.objExists(hp_main):
                 hp_subgroups = cmds.listRelatives(hp_main, children=True, fullPath=True, type='transform') or []
                 if self.is_final_view:
+                    self._saved_hp_root_vis = cmds.getAttr(hp_main + ".visibility")
+                    cmds.setAttr(hp_main + ".visibility", True)
                     for sg in hp_subgroups:
                         self.saved_subgroup_vis[sg] = cmds.getAttr(sg + ".visibility")
                         cmds.setAttr(sg + ".visibility", True)
                 else:
+                    if hasattr(self, '_saved_hp_root_vis'):
+                        cmds.setAttr(hp_main + ".visibility", self._saved_hp_root_vis)
                     for sg in hp_subgroups:
-                        saved_state = self.saved_subgroup_vis.get(sg, True)
-                        cmds.setAttr(sg + ".visibility", saved_state)
+                        cmds.setAttr(sg + ".visibility", self.saved_subgroup_vis.get(sg, True))
 
-            # LP subgroups visibility
+            # LP: hide via the LP root so it is reflected by the "LP Visible" button
+            # (sync_toggle_buttons below) and the user can toggle it back on - not by
+            # force-hiding the LP subgroups. Prior state restored on Back.
             if lp_main and cmds.objExists(lp_main):
-                lp_subgroups = cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []
                 if self.is_final_view:
-                    for sg in lp_subgroups:
-                        self.saved_subgroup_vis[sg] = cmds.getAttr(sg + ".visibility")
-                        cmds.setAttr(sg + ".visibility", False)
+                    self._saved_lp_root_vis = cmds.getAttr(lp_main + ".visibility")
+                    cmds.setAttr(lp_main + ".visibility", False)
                 else:
-                    for sg in lp_subgroups:
-                        saved_state = self.saved_subgroup_vis.get(sg, True)
-                        cmds.setAttr(sg + ".visibility", saved_state)
+                    if hasattr(self, '_saved_lp_root_vis'):
+                        cmds.setAttr(lp_main + ".visibility", self._saved_lp_root_vis)
 
-            # LP_Combine_BG
-            global_lp_root = "LP_Combine_BG"
-            if self.is_final_view:
-                self.set_final_low_visibility(base_name, False)
-            elif cmds.objExists(global_lp_root):
-                self.set_final_low_visibility(base_name, False)
-            else:
-                self.is_final_low_visible = False
+            # Cage: only meaningful while working the chapter in Export
+            # Settings, so hide it on Back; shown again by _ensure_cage_visible
+            # when Export Settings / the cage panel is re-entered.
+            cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+            if cmds.objExists(cage_grp):
+                cmds.setAttr(cage_grp + ".visibility", bool(self.is_final_view))
 
-            if not self.is_final_view:
-                self.sync_toggle_buttons(hp_main, lp_main)
+            self.is_final_low_visible = False
 
-            # Isolate select logic
+            # Sync HP/LP Visible buttons to the real root visibility in both
+            # directions: entering shows "HP Visible" / "LP Hidden", and the LP
+            # button stays usable to re-show LP.
+            self.sync_toggle_buttons(hp_main, lp_main)
+
+            # Isolate select logic (isolate the HP being previewed in Export Settings)
             if hp_main and cmds.objExists(hp_main):
                 model_panels = cmds.getPanel(type='modelPanel') or []
-                hp_all_desc = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or []
                 for panel in model_panels:
                     if cmds.isolateSelect(panel, query=True, state=True):
                         iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
@@ -2643,13 +2812,23 @@ class FinalViewMixin:
                             cmds.sets(clear=set_name)
 
                         if self.is_final_view:
-                            self.sync_final_view_isolation(base_name)
+                            cmds.isolateSelect(panel, addDagObject=hp_main)
                         else:
                             cmds.isolateSelect(panel, addDagObject=hp_main)
                             if lp_main and cmds.objExists(lp_main):
                                 cmds.isolateSelect(panel, addDagObject=lp_main)
+                        # Keep the chapter cage isolated together with it.
+                        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+                        if cmds.objExists(cage_grp):
+                            cmds.isolateSelect(panel, addDagObject=cage_grp)
 
         self.refresh_left_panel()
+
+        # Cage settings open automatically on entering Export Settings (no
+        # separate Cage button anymore); leaving already calls exit_cage_config
+        # above.
+        if self.is_final_view and pair:
+            self.enter_cage_config()
 
     def render_final_view(self):
         self.final_mesh_widgets = []
@@ -2658,6 +2837,8 @@ class FinalViewMixin:
             return
         pair.setdefault('final_smooth_states', {})
         self.final_smooth_states = dict(pair.get('final_smooth_states') or {})
+        pair.setdefault('cage_overrides', {})
+        self.cage_overrides = dict(pair.get('cage_overrides') or {})
 
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         if not hp_main or not lp_main:
@@ -2667,16 +2848,9 @@ class FinalViewMixin:
         base_name = pair.get('base', '')
         subgroup_names = set()
 
-        chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-        lp_root = chapter_grp_path if cmds.objExists(chapter_grp_path) else lp_main
-
-        lp_children = cmds.listRelatives(lp_root, children=True, fullPath=True) or []
-        for lp_path in lp_children:
-            short_name = lp_path.split('|')[-1]
-            if short_name.startswith(base_name) and short_name.endswith("_low"):
-                display_name = short_name.replace(base_name + "_", "").replace("_low", "")
-                subgroup_names.add(display_name)
-
+        # Collect subgroup display names from the finalized in-place meshes:
+        # HP -> {base}_{sg}_high_NNN under hp_main, LP -> {base}_{sg}_low_NNN under
+        # lp_main. No LP_Combine_BG anymore.
         hp_all_desc = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or []
         for hp_path in hp_all_desc:
             short_name = hp_path.split('|')[-1]
@@ -2684,8 +2858,15 @@ class FinalViewMixin:
                 display_name = short_name.replace(base_name + "_", "").split("_high")[0]
                 subgroup_names.add(display_name)
 
+        lp_all_desc = cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []
+        for lp_path in lp_all_desc:
+            short_name = lp_path.split('|')[-1]
+            if short_name.startswith(base_name) and "_low" in short_name and cmds.listRelatives(lp_path, shapes=True):
+                display_name = short_name.replace(base_name + "_", "").split("_low")[0]
+                subgroup_names.add(display_name)
+
         if not subgroup_names:
-            self.subgroups_layout.addWidget(QtWidgets.QLabel(bg_l10n.text("No finalized meshes found. Run 'Combine Fin' first.")))
+            self.subgroups_layout.addWidget(QtWidgets.QLabel(bg_l10n.text("No finalized meshes found.")))
             return
 
         self.final_selected_names = set()
@@ -2705,11 +2886,18 @@ class FinalViewMixin:
             row_layout.setSpacing(6)
 
             is_vis = self.is_visible(hp_nodes[0]) if hp_nodes else False
-            btn_vis = QtWidgets.QPushButton(bg_l10n.text("Vis" if is_vis else "Hid"))
+            btn_vis = QtWidgets.QPushButton()
             btn_vis.setFixedSize(30, 24)
+            btn_vis.setIcon(get_icon("open_eye.png" if is_vis else "close_eye.png"))
+            btn_vis.setIconSize(QtCore.QSize(16, 16))
+            btn_vis.setProperty("bg_i18n_key", "Toggle visibility")
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.setFocusPolicy(QtCore.Qt.NoFocus)
-            btn_vis.clicked.connect(lambda checked=False, h=hp_nodes, b=btn_vis: self.run_undoable_bg_action("Final HP Visibility", self.toggle_final_hp_vis, h, b))
+            btn_vis.clicked.connect(lambda checked=False, h=hp_nodes, b=btn_vis, n=display_name: self.run_undoable_bg_action("Final HP Visibility", self.toggle_final_hp_vis, h, b, n))
+            # Right-click isolates this subgroup (show only it), like base mode.
+            btn_vis.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            btn_vis.customContextMenuRequested.connect(
+                lambda pos, n=display_name: self.run_undoable_bg_action("Isolate Final Visibility", self.isolate_final_hp_vis, n))
             row_layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(display_name)
@@ -2730,25 +2918,46 @@ class FinalViewMixin:
             combo.setStyleSheet("background-color: #444; color: white;")
             combo.setFocusPolicy(QtCore.Qt.NoFocus)
 
-            cached_level = self.final_smooth_states.get(display_name, 2)
+            cached_level = self.final_smooth_states.get(display_name, 1)
             combo.setCurrentIndex(cached_level)
             combo.currentIndexChanged.connect(lambda idx, prefix=full_prefix, name=display_name, c=combo:
                                                self.run_undoable_bg_action("Final Smooth Level", self.on_final_smooth_combo_changed, name, idx, prefix, c))
             row_layout.addWidget(combo)
 
-            btn_smooth_up = QtWidgets.QPushButton(bg_l10n.text("+"))
+            btn_smooth_up = QtWidgets.QPushButton()
             btn_smooth_up.setFixedSize(24, 24)
+            btn_smooth_up.setIcon(get_icon("Plus.png"))
+            btn_smooth_up.setIconSize(QtCore.QSize(14, 14))
             btn_smooth_up.setStyleSheet("background-color: #425c42; font-weight: bold;")
             btn_smooth_up.setFocusPolicy(QtCore.Qt.NoFocus)
             btn_smooth_up.clicked.connect(lambda checked=False, c=combo, delta=1: self.adjust_final_smooth_level(c, delta))
             row_layout.addWidget(btn_smooth_up)
 
-            btn_smooth_down = QtWidgets.QPushButton(bg_l10n.text("-"))
+            btn_smooth_down = QtWidgets.QPushButton()
             btn_smooth_down.setFixedSize(24, 24)
+            btn_smooth_down.setIcon(get_icon("Minus.png"))
+            btn_smooth_down.setIconSize(QtCore.QSize(14, 14))
             btn_smooth_down.setStyleSheet("background-color: #8c6239; font-weight: bold;")
             btn_smooth_down.setFocusPolicy(QtCore.Qt.NoFocus)
             btn_smooth_down.clicked.connect(lambda checked=False, c=combo, delta=-1: self.adjust_final_smooth_level(c, delta))
             row_layout.addWidget(btn_smooth_down)
+
+            # Per-subgroup cage max-offset override (blank = global default).
+            cage_edit = QtWidgets.QLineEdit()
+            cage_edit.setObjectName("CageOverride")
+            cage_edit.setFixedWidth(46)
+            cage_edit.setAlignment(QtCore.Qt.AlignCenter)
+            cage_edit.setPlaceholderText("gl.")
+            cage_edit.setToolTip(bg_l10n.text(
+                "Cage max offset override for this subgroup (blank = global). "
+                "Percent of bbox diagonal."))
+            cage_edit.setStyleSheet("background-color: #3a2d40; color: #d9b3ff;")
+            cached_ov = self.cage_overrides.get(display_name)
+            if cached_ov is not None:
+                cage_edit.setText(str(cached_ov))
+            cage_edit.editingFinished.connect(
+                lambda name=display_name, e=cage_edit: self.on_cage_override_changed(name, e))
+            row_layout.addWidget(cage_edit)
 
             self.subgroups_layout.addWidget(frame)
 
@@ -2761,6 +2970,7 @@ class FinalViewMixin:
                 'btn_vis': btn_vis,
                 'btn_smooth_up': btn_smooth_up,
                 'btn_smooth_down': btn_smooth_down,
+                'cage_edit': cage_edit,
                 'hp_nodes': hp_nodes
             })
         bg_l10n.localize_widget_tree(self.subgroups_widget)
@@ -2783,11 +2993,14 @@ class FinalViewMixin:
             else:
                 self.final_selected_names.discard(name)
 
+        self._refresh_final_selection_visuals()
+
+    def _refresh_final_selection_visuals(self):
         for widget_data in getattr(self, 'final_mesh_widgets', []):
             btn = widget_data.get('name_button')
             if not btn:
                 continue
-            is_selected = widget_data.get('subgroup_name') in self.final_selected_names
+            is_selected = widget_data.get('subgroup_name') in getattr(self, 'final_selected_names', set())
             btn.blockSignals(True)
             btn.setChecked(is_selected)
             btn.blockSignals(False)
@@ -2805,6 +3018,68 @@ class FinalViewMixin:
             if frame and hasattr(self, 'subgroup_row_style'):
                 frame.setStyleSheet(self.subgroup_row_style(widget_data.get('subgroup_name'), is_selected))
 
+    def _handle_final_rubber_band(self, event):
+        """Rubber-band (marquee) selection over the Final Group subgroup panel.
+        Returns True if the event was consumed. Active only in Final View; the
+        press only reaches the panel's event filter when it lands on empty area
+        (child buttons/combos consume their own presses), matching the request
+        to drag from an empty spot."""
+        if not getattr(self, 'is_final_view', False):
+            return False
+        try:
+            et = event.type()
+        except Exception:
+            return False
+        if et == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
+            self._rubber_origin = event.pos()
+            band = getattr(self, '_rubber_band', None)
+            if band is None:
+                band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self.subgroups_widget)
+                self._rubber_band = band
+            band.setGeometry(QtCore.QRect(self._rubber_origin, QtCore.QSize()))
+            band.show()
+            self._rubber_active = True
+            return True
+        if et == QtCore.QEvent.MouseMove and getattr(self, '_rubber_active', False):
+            rect = QtCore.QRect(self._rubber_origin, event.pos()).normalized()
+            self._rubber_band.setGeometry(rect)
+            return True
+        if et == QtCore.QEvent.MouseButtonRelease and getattr(self, '_rubber_active', False):
+            self._rubber_active = False
+            rect = QtCore.QRect(self._rubber_origin, event.pos()).normalized()
+            band = getattr(self, '_rubber_band', None)
+            if band is not None:
+                band.hide()
+            additive = bool(event.modifiers() & QtCore.Qt.ControlModifier)
+            # A plain click on empty area (no real drag) clears the selection.
+            if (event.pos() - self._rubber_origin).manhattanLength() < 3 and not additive:
+                self.final_selected_names = set()
+                self._refresh_final_selection_visuals()
+                return True
+            self._select_final_rows_in_rect(rect, additive=additive)
+            return True
+        return False
+
+    def _select_final_rows_in_rect(self, rect, additive=False):
+        if not hasattr(self, 'final_selected_names'):
+            self.final_selected_names = set()
+        hits = set()
+        for widget_data in getattr(self, 'final_mesh_widgets', []):
+            frame = widget_data.get('frame')
+            name = widget_data.get('subgroup_name')
+            if frame and name and rect.intersects(frame.geometry()):
+                hits.add(name)
+        if additive:
+            self.final_selected_names |= hits
+        else:
+            self.final_selected_names = hits
+        self._refresh_final_selection_visuals()
+
+    def select_all_final_subgroups(self):
+        self.final_selected_names = set(
+            wd.get('subgroup_name') for wd in getattr(self, 'final_mesh_widgets', []) if wd.get('subgroup_name'))
+        self._refresh_final_selection_visuals()
+
     def adjust_final_smooth_level(self, combo, delta):
         if not combo:
             return
@@ -2816,12 +3091,15 @@ class FinalViewMixin:
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
         rename_action = menu.addAction("Rename Final Group")
+        select_all_action = menu.addAction("Select All Subgroups")
         bg_l10n.localize_menu(menu)
         action = menu.exec_(QtGui.QCursor.pos())
         if action == rename_action:
             new_name, ok = QtWidgets.QInputDialog.getText(self, bg_l10n.text("Rename Final Group"), bg_l10n.text("New Name:"), text=old_name)
             if ok and new_name and new_name != old_name:
                 self.rename_final_subgroup(old_name, new_name.strip().replace(".", "_"))
+        elif action == select_all_action:
+            self.select_all_final_subgroups()
 
     def select_final_hp_nodes(self, display_name):
         hp_nodes = cmds.ls("*{}_high*".format(display_name), long=True) or []
@@ -2834,6 +3112,1075 @@ class FinalViewMixin:
             return
         pair['final_smooth_states'] = dict(getattr(self, 'final_smooth_states', {}) or {})
         bg_core.BakeSessionModel.save(self.root_pairs)
+
+    # ------------------------------------------------------------------
+    # CAGE
+    # ------------------------------------------------------------------
+    def _active_pair(self):
+        return next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+
+    def on_cage_override_changed(self, name, edit):
+        """Store/clear a per-subgroup cage max-offset override from the row field."""
+        pair = self._active_pair()
+        if not pair:
+            return
+        pair.setdefault('cage_overrides', {})
+        raw = (edit.text() or "").strip().replace(',', '.')
+        if not raw:
+            pair['cage_overrides'].pop(name, None)
+            if hasattr(self, 'cage_overrides'):
+                self.cage_overrides.pop(name, None)
+        else:
+            try:
+                val = float(raw)
+            except ValueError:
+                edit.setText("")
+                pair['cage_overrides'].pop(name, None)
+                cmds.warning("Cage override must be a number.")
+                return
+            if val <= 0:
+                edit.setText("")
+                pair['cage_overrides'].pop(name, None)
+            else:
+                pair['cage_overrides'][name] = val
+                if hasattr(self, 'cage_overrides'):
+                    self.cage_overrides[name] = val
+        bg_core.BakeSessionModel.save(self.root_pairs)
+
+    def _cage_params_for(self, pair, display_name):
+        settings = dict(pair.get('cage_settings') or {})
+        settings.setdefault('inflate', bg_cage.CageProcessor.DEFAULT_INFLATE_PCT)
+        settings.setdefault('gap', bg_cage.CageProcessor.DEFAULT_GAP_PCT)
+        settings.setdefault('unit', 'percent')
+        settings.setdefault('fitted', False)
+        settings.setdefault('display_mode', 'solid')
+        override = (pair.get('cage_overrides') or {}).get(display_name)
+        if isinstance(override, dict):
+            settings.update(override)       # per-subgroup overrides win
+        elif override is not None:
+            settings['inflate'] = override  # legacy scalar override
+        return settings
+
+    def _collect_cage_subgroups(self, base_name, hp_main, lp_main):
+        """Map subgroup display name -> {'lp': [...], 'hp': [...]} from the
+        finalized in-place meshes under lp_main / hp_main."""
+        groups = {}
+        lp_desc = cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []
+        for lp in lp_desc:
+            short = lp.split('|')[-1]
+            if not (short.startswith(base_name) and "_low" in short and cmds.listRelatives(lp, shapes=True, type='mesh')):
+                continue
+            sg = short.replace(base_name + "_", "").split("_low")[0]
+            groups.setdefault(sg, {'lp': [], 'hp': []})['lp'].append(lp)
+
+        hp_desc = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or []
+        for hp in hp_desc:
+            short = hp.split('|')[-1]
+            if not (short.startswith(base_name) and "_high" in short and cmds.listRelatives(hp, shapes=True, type='mesh')):
+                continue
+            sg = short.replace(base_name + "_", "").split("_high")[0]
+            if sg in groups:
+                groups[sg]['hp'].append(hp)
+        return groups
+
+    def rebuild_active_cage(self, only_subgroups=None, resolve_overlaps=False, create_missing_only=True):
+        """Build cage meshes for the active chapter and prune orphans.
+
+        ``only_subgroups`` (a set of display names) limits the build to those
+        subgroups (the rest keep their current cage) so a selection can be
+        created on its own. ``resolve_overlaps`` runs the (heavier) cross-cage
+        overlap cleanup - only wanted after a Fit. ``create_missing_only``
+        (default True) skips any subgroup that already HAS a cage mesh, so an
+        existing cage - which may carry manual brush sculpting - is never
+        recreated/overwritten; only genuinely missing cages get built. Pass
+        False (used by the hidden Fit-to-HP path) to force a full recompute.
+        Returns a summary dict."""
+        pair = self._active_pair()
+        if not pair:
+            self.log("No active chapter for cage.", "red")
+            return {}
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not lp_main:
+            self.log("HP or LP root not found for cage.", "red")
+            return {}
+        base_name = pair.get('base', 'Chapter')
+        import time as _time
+        t = {}
+        _t0 = _time.time()
+
+        # Ensure finalized _low_NNN / _high_NNN naming exists even if the cage is
+        # built before entering Export Settings.
+        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
+        t['naming'] = _time.time() - _t0; _t0 = _time.time()
+        groups = self._collect_cage_subgroups(base_name, hp_main, lp_main)
+        if not groups:
+            self.log("No finalized LP meshes found for cage.", "red")
+            return {}
+
+        # All chapter HP meshes: obstacle HP for a subgroup is everything except
+        # its own HP (other subgroups' geometry the cage must not intersect).
+        all_hp = [m for m in (cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or [])
+                  if cmds.listRelatives(m, shapes=True, type='mesh')]
+
+        # Single reference diagonal for the whole chapter so a percent inflation
+        # is the SAME absolute distance on every subgroup (big and small alike).
+        try:
+            bb = cmds.exactWorldBoundingBox(lp_main)
+            ref_diag = ((bb[3] - bb[0]) ** 2 + (bb[4] - bb[1]) ** 2 + (bb[5] - bb[2]) ** 2) ** 0.5
+        except Exception:
+            ref_diag = None
+        t['collect'] = _time.time() - _t0; _t0 = _time.time()
+
+        made = updated = 0
+        expected = set()
+        cmds.refresh(suspend=True)
+        try:
+            with bg_core.undo_chunk("BuildCage"):
+                chapter_grp = bg_cage.CageProcessor.ensure_chapter_group(base_name)
+                # One scan of the existing cage hierarchy instead of a full scan
+                # per LP mesh (was O(N^2)).
+                cage_index = bg_cage.CageProcessor.index_existing_cages(chapter_grp)
+                for sg, meshes in groups.items():
+                    # Expected covers ALL subgroups so a selective rebuild does
+                    # not prune the cages we intentionally skipped.
+                    for lp in meshes['lp']:
+                        expected.add(lp.split('|')[-1] + bg_cage.SUFFIX_CAGE)
+                    if only_subgroups and sg not in only_subgroups:
+                        continue
+                    params = self._cage_params_for(pair, sg)
+                    target_hp = meshes['hp']
+                    target_set = set(cmds.ls(target_hp, long=True) or [])
+                    obstacle_hp = [m for m in all_hp if m not in target_set]
+                    if not target_hp:
+                        self.log("Cage: subgroup '{}' has no HP.".format(sg), "orange")
+                    for lp in meshes['lp']:
+                        cage_name = lp.split('|')[-1] + bg_cage.SUFFIX_CAGE
+                        if create_missing_only:
+                            existing = cage_index.get(cage_name)
+                            if existing and cmds.objExists(existing):
+                                continue  # keep the existing (possibly sculpted) cage untouched
+                        cage, created = bg_cage.CageProcessor.update_or_create_cage(
+                            lp, target_hp, obstacle_hp, params, chapter_grp, lp_main, ref_diag,
+                            existing_index=cage_index)
+                        if cage:
+                            cage_index[cage_name] = cage
+                            made += 1 if created else 0
+                            updated += 0 if created else 1
+                t['build'] = _time.time() - _t0; _t0 = _time.time()
+                bg_cage.CageProcessor.prune_orphans(chapter_grp, expected)
+                t['prune'] = _time.time() - _t0; _t0 = _time.time()
+
+                # Resolve intersections BETWEEN different subgroups' cages by
+                # shrinking them in the conflict zones (never wanted for baking).
+                # Only on Fit - a plain Expansion/Gap tweak keeps the clean hull.
+                if resolve_overlaps:
+                    entries = []
+                    for sg, meshes in groups.items():
+                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
+                            entries.append({'cage': cage, 'own_hp': meshes['hp']})
+                    if len(entries) >= 2:
+                        floor = max((ref_diag or 1.0) * 0.0005, 1e-5)
+                        bg_cage.CageProcessor.resolve_cage_overlaps(entries, floor)
+                t['resolve'] = _time.time() - _t0
+        finally:
+            cmds.refresh(suspend=False)
+
+        if made or updated:
+            self.log("Cage: {} created, {} adjusted under Cage_BG.".format(made, updated), "lightgreen")
+        # Phase timings (help diagnose the slow-Create report in a real scene).
+        total = sum(t.values())
+        if total > 0.5:
+            self.log("Cage timing (s): " + "  ".join("{}={:.2f}".format(k, v) for k, v in t.items())
+                     + "  total={:.2f}".format(total), "orange")
+        self.save_cage_states()
+        return {'made': made, 'updated': updated}
+
+    def save_cage_states(self):
+        pair = self._active_pair()
+        if not pair or not hasattr(self, 'cage_overrides'):
+            return
+        pair['cage_overrides'] = dict(self.cage_overrides)
+        bg_core.BakeSessionModel.save(self.root_pairs)
+
+    def clear_active_cage(self):
+        pair = self._active_pair()
+        if not pair:
+            return
+        base_name = pair.get('base', 'Chapter')
+        with bg_core.undo_chunk("ClearCage"):
+            bg_cage.CageProcessor.clear_chapter_cage(base_name)
+        self.log("Cage cleared for chapter '{}'.".format(base_name), "lightblue")
+
+    def sculpt_active_cage(self):
+        """Select the cage mesh(es) - only the selected subgroup's if one is
+        picked in the panel, otherwise the whole chapter - and switch Maya to
+        the sculpting brush that pushes vertices along their own normal (Maya's
+        Sculpting Tools name this brush 'Bulge'; there is no brush literally
+        named 'Inflate', but Bulge is exactly that behaviour)."""
+        pair = self._active_pair()
+        if not pair:
+            return cmds.warning("No active chapter selected.")
+        base_name = pair.get('base', 'Chapter')
+        targets = set(getattr(self, 'final_selected_names', None) or set())
+        if targets:
+            meshes = []
+            for sg in targets:
+                meshes.extend(self._cage_meshes_for_subgroup(base_name, sg))
+        else:
+            meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        if not meshes:
+            return cmds.warning("No cage meshes to sculpt. Adjust Expansion first to build the cage.")
+        cmds.select(meshes, replace=True)
+
+        # Informational only (read-only check, nothing is modified): the cage
+        # is a straight duplicate of the LP with only its vertex POSITIONS
+        # edited, never its topology, so it can only be non-manifold if the
+        # source LP mesh already is. Maya's Sculpting Tools then warn (but
+        # still function) on that inherited topology. Surfacing which mesh it
+        # comes from here, instead of auto-running a cleanup, avoids risking a
+        # vertex-count/order change that would break the cage<->LP
+        # correspondence Substance relies on.
+        flagged = []
+        for m in meshes:
+            try:
+                if cmds.polyInfo(m, nonManifoldVertices=True) or cmds.polyInfo(m, nonManifoldEdges=True):
+                    flagged.append(m.split('|')[-1])
+            except Exception:
+                pass
+        if flagged:
+            self.log(
+                "Cage sculpt: non-manifold topology inherited from the LP source on {} "
+                "- Maya may warn while sculpting but it still works.".format(", ".join(flagged)), "orange")
+
+        try:
+            mel.eval('SetMeshBulgeTool;')
+        except Exception as e:
+            cmds.warning("Could not activate the sculpting brush: {}".format(e))
+
+    def export_chapter_cage_if_enabled(self, pair, export_dir):
+        """Export the chapter's cage as its own {base}_cage.fbx into
+        ``export_dir`` - always a separate file, alongside the regular HP/LP
+        export, whenever a cage exists AND the chapter's 'export cage' flag
+        (default on) is enabled. No-op (returns False) if there is no cage or
+        the flag is off - there is no separate Export Cage button anymore."""
+        base_name = pair.get('base', 'Chapter')
+        settings = pair.get('cage_settings') or {}
+        if not settings.get('export_enabled', True):
+            return False
+        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        if not cage_meshes:
+            return False
+        export_name = "{}_cage".format(base_name)
+        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        # Triangulate on export (undone afterwards) to mirror the LP export so
+        # Substance's cage<->low vertex matching stays consistent.
+        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
+            return True
+        cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
+        return False
+
+    def export_active_cage(self):
+        """Explicit Export Cage button: write the active chapter's cage to its
+        own {base}_cage.fbx. Reuses the folder the chapter was last exported to
+        (``pair['export_dir']``) with no dialog; only prompts once, and stores
+        the choice, if the chapter has never been exported. Runs regardless of
+        the 'Export cage with chapter' checkbox - it is a deliberate action."""
+        pair = self._active_pair()
+        if not pair:
+            return cmds.warning("No active chapter selected.")
+        base_name = pair.get('base', 'Chapter')
+        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        if not cage_meshes:
+            return cmds.warning("No cage to export - press Create Cage first.")
+
+        export_dir = pair.get('export_dir')
+        if not export_dir or not os.path.isdir(export_dir):
+            export_dirs = cmds.fileDialog2(
+                fileMode=3,
+                caption=bg_l10n.text("Select Export Directory for {name}").format(name=base_name))
+            if not export_dirs:
+                return
+            export_dir = export_dirs[0]
+            pair['export_dir'] = export_dir
+            bg_core.BakeSessionModel.save(self.root_pairs)
+
+        export_name = "{}_cage".format(base_name)
+        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        with self.suspend_subgroup_color_preview():
+            with self.suspend_isolation():
+                if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+                    self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
+                    cmds.inViewMessage(amg="Cage exported: {}.fbx".format(export_name),
+                                       pos='midCenter', fade=True)
+                else:
+                    cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
+
+    def _make_cage_slider_row(self, lo, hi, value, decimals, step=None, curve=1.0):
+        """Return (widget, spinbox, slider, read_fn). Slider and spinbox stay in
+        sync; the caller wires rebuild triggers to sliderReleased / editingFinished.
+        ``curve`` > 1 gives a non-linear response so small values (typical for a
+        cage) get most of the slider travel and are easy to dial in."""
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(0, 1000)
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(decimals)
+        spin.setRange(lo, max(hi, value))
+        if step:
+            spin.setSingleStep(step)
+        spin.setValue(value)
+        spin.setFixedWidth(80)
+        # ``bipolar`` (a symmetric lo=-hi range) maps 0 to the slider CENTRE and
+        # applies the curve to the magnitude on each side, so the handle rests in
+        # the middle and travels both ways with fine control near zero.
+        bipolar = lo < 0 and abs(lo + hi) < 1e-9
+        state = {'syncing': False, 'lo': lo, 'hi': hi, 'curve': float(curve) or 1.0,
+                 'bipolar': bipolar}
+
+        def to_slider(val):
+            if state['bipolar']:
+                half = state['hi'] or 1.0
+                frac = max(-1.0, min(1.0, val / half))
+                mag = abs(frac) ** (1.0 / state['curve'])
+                sign = 1.0 if frac >= 0 else -1.0
+                return int(max(0, min(1000, round(500 + sign * mag * 500))))
+            span = (state['hi'] - state['lo']) or 1.0
+            frac = max(0.0, min(1.0, (val - state['lo']) / span))
+            return int(max(0, min(1000, round((frac ** (1.0 / state['curve'])) * 1000))))
+
+        def from_slider(pos):
+            if state['bipolar']:
+                half = state['hi'] or 1.0
+                d = (pos - 500) / 500.0
+                mag = abs(d) ** state['curve']
+                sign = 1.0 if d >= 0 else -1.0
+                return sign * mag * half
+            span = (state['hi'] - state['lo']) or 1.0
+            frac = (pos / 1000.0) ** state['curve']
+            return state['lo'] + frac * span
+
+        slider.setValue(to_slider(value))
+
+        def on_slider(pos):
+            if state['syncing']:
+                return
+            state['syncing'] = True
+            spin.setValue(from_slider(pos))
+            state['syncing'] = False
+
+        def on_spin(val):
+            if state['syncing']:
+                return
+            state['syncing'] = True
+            slider.setValue(to_slider(val))
+            state['syncing'] = False
+
+        slider.valueChanged.connect(on_slider)
+        spin.valueChanged.connect(on_spin)
+        h.addWidget(slider, stretch=1)
+        h.addWidget(spin)
+        return row, spin, slider, state
+
+    def build_cage_settings_panel(self, pair):
+        """Build the embedded Cage settings panel (lives in the Matcher slot
+        during setup). Returns the panel widget."""
+        settings = dict(pair.get('cage_settings') or {})
+        fitted = {'v': bool(settings.get('fitted', False))}
+
+        # Work in absolute world units, with slider range and step derived from
+        # the whole chapter scale so the useful range spans the slider (instead
+        # of being squished near zero) and one step is a sensible world distance.
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        base_name = pair.get('base', 'Chapter')
+        # Enumerate the chapter's subgroups once - reused below by Create Cage
+        # and Expansion. Naming is NOT re-finalized here: toggle_final_view
+        # already finalizes it once on entering Export Settings (a prerequisite
+        # for this panel to exist at all), and re-running that full rename pass
+        # here on every panel build was pure redundant overhead.
+        if hp_main and lp_main:
+            groups = self._collect_cage_subgroups(base_name, hp_main, lp_main)
+        else:
+            groups = {}
+        chapter_diag = 1.0
+        try:
+            ref = lp_main if (lp_main and cmds.objExists(lp_main)) else hp_main
+            bb = cmds.exactWorldBoundingBox(ref)
+            chapter_diag = ((bb[3] - bb[0]) ** 2 + (bb[4] - bb[1]) ** 2 + (bb[5] - bb[2]) ** 2) ** 0.5 or 1.0
+        except Exception:
+            chapter_diag = 1.0
+
+        # Migrate stored values (older builds saved percent-of-diagonal).
+        if settings.get('unit', 'percent') == 'percent':
+            cur_inflate = chapter_diag * float(settings.get('inflate', bg_cage.CageProcessor.DEFAULT_INFLATE_PCT)) / 100.0
+        else:
+            cur_inflate = float(settings.get('inflate', chapter_diag * 0.05))
+
+        # The Expansion slider is a RELATIVE jog: the handle rests in the CENTRE
+        # (0), a move dials a delta (right = inflate, left = deflate) applied
+        # uniformly to every cage in scope, and on release the value snaps back to
+        # 0 / centre for the next nudge. Because subgroups can hold different
+        # absolute inflate amounts, an absolute slider position is meaningless -
+        # only the relative delta is; one delta for the whole scope also stops
+        # some cages deflating while others inflate on the same drag.
+
+        infl_hi = max(chapter_diag * 0.30, cur_inflate)
+        # Sensible spinbox step / decimals for this scale (~200 steps across range).
+        import math as _math
+        mag = _math.floor(_math.log10(infl_hi)) if infl_hi > 0 else -2
+        decimals = int(max(2, 3 - mag))
+        infl_step = round(infl_hi / 200.0, decimals) or (10 ** -decimals)
+
+        panel = QtWidgets.QWidget()
+        # STYLE_MAIN leaves QSlider unstyled, so on Maya's dark theme the groove
+        # is nearly invisible. Draw an explicit groove + handle so the jog track
+        # (the long bar) and its centred handle read clearly.
+        cage_slider_css = """
+            QSlider::groove:horizontal { height: 6px; background: #1E1E1E;
+                border: 1px solid #444; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #b48ead;
+                border: 1px solid #5a3d6b; width: 14px; margin: -6px 0;
+                border-radius: 7px; }
+            QSlider::handle:horizontal:hover { background: #d9b3ff; }
+        """
+        panel.setStyleSheet(bg_core.BakeConfig.STYLE_MAIN + cage_slider_css)
+        outer = QtWidgets.QVBoxLayout(panel)
+        outer.setContentsMargins(4, 4, 4, 4)
+
+        header = QtWidgets.QLabel(bg_l10n.text("CAGE SETTINGS"))
+        header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setStyleSheet("font-weight: bold; background-color: #3a2a44; border: 1px solid #5a3d6b; padding: 6px;")
+        outer.addWidget(header)
+
+        # Labels sit ABOVE their controls (vertical layout) so nothing collapses
+        # when the docked panel is narrow or the window is resized.
+        def add_labeled(text_key, widget):
+            lbl = QtWidgets.QLabel(bg_l10n.text(text_key))
+            lbl.setStyleSheet("color: #bbbbbb; margin-top: 4px;")
+            outer.addWidget(lbl)
+            outer.addWidget(widget)
+
+        # Bipolar jog (centre = 0), cubic response so tiny nudges near the centre
+        # are easy to dial - cage deltas are typically a couple % of the diagonal.
+        # The Expansion row, status and checkbox are added later, in the assembly
+        # block, so the panel reads in the final visual order.
+        inflate_row, inflate_spin, inflate_slider, _ = self._make_cage_slider_row(
+            -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
+
+        status = QtWidgets.QLabel("")
+        status.setWordWrap(True)
+        status.setStyleSheet("color: #d9b3ff;")
+
+        # Cage actions are square icon buttons (icon only, text moved to the
+        # tooltip). The tooltip is localized at build time; the panel is rebuilt
+        # on language change, so it stays in sync.
+        CAGE_BTN, CAGE_ICON = 42, 30
+
+        def _square_btn(icon_name, tip_key):
+            b = QtWidgets.QPushButton()
+            b.setIcon(get_icon(icon_name))
+            b.setIconSize(QtCore.QSize(CAGE_ICON, CAGE_ICON))
+            b.setFixedSize(CAGE_BTN, CAGE_BTN)
+            b.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            tip = bg_l10n.text(tip_key)
+            b.setToolTip(tip)
+            b.setStatusTip(tip)
+            return b
+
+        def _btn_row(*btns):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            for b in btns:
+                row.addWidget(b)
+            row.addStretch(1)
+            return row
+
+        def _recenter(spin, slider):
+            """Snap a jog slider (and its spinbox) back to 0 / the centre after
+            its delta has been applied, ready for the next relative nudge."""
+            spin.blockSignals(True)
+            slider.blockSignals(True)
+            spin.setValue(0.0)
+            slider.setValue(500)
+            spin.blockSignals(False)
+            slider.blockSignals(False)
+
+        def _selected():
+            return set(getattr(self, 'final_selected_names', None) or set())
+
+        def save_settings(scope_names, is_global):
+            changed = {
+                'unit': 'absolute',
+                'inflate': inflate_spin.value(),
+                'fitted': fitted['v'],
+            }
+            overrides = pair.setdefault('cage_overrides', {})
+            if is_global:
+                # Nothing selected: global change, reset per-subgroup overrides.
+                # Preserve the display mode (it is a separate, chapter-wide look).
+                changed['display_mode'] = (pair.get('cage_settings') or {}).get('display_mode', 'solid')
+                changed['export_enabled'] = (pair.get('cage_settings') or {}).get('export_enabled', True)
+                pair['cage_settings'] = changed
+                overrides.clear()
+            else:
+                for sg in scope_names:
+                    ov = overrides.get(sg)
+                    ov = dict(ov) if isinstance(ov, dict) else {}
+                    ov.update(changed)
+                    overrides[sg] = ov
+            bg_core.BakeSessionModel.save(self.root_pairs)
+
+        def do_create():
+            """Build cage meshes only where one doesn't exist yet. Never
+            touches an existing cage (which may carry manual brush sculpting).
+            Always covers the WHOLE chapter - unlike Expansion, a subgroup
+            selection or hidden subgroups do NOT narrow this down, since Create
+            Cage is chapter-wide scaffolding, not a per-subgroup tweak.
+
+            The cage is created DEFLATED (identical to the LP, inflate = 0) and
+            the Expansion slider is reset to 0, so the artist always inflates
+            from a known, reversible baseline. Selection is cleared afterwards so
+            the just-created mesh isn't accidentally the target of the next
+            Expansion."""
+            fitted['v'] = False
+            # Slider back to the centre (0) BEFORE building, so the artist always
+            # inflates from a known, reversible baseline.
+            _recenter(inflate_spin, inflate_slider)
+            self._cage_islands = {}  # stale intersection islands no longer valid
+            save_settings(set(groups.keys()), True)  # inflate=0 global, overrides cleared
+            self.rebuild_active_cage(only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
+            try:
+                cmds.select(clear=True)
+            except Exception:
+                pass
+            self._ensure_cage_visible(pair)
+            # The cage now exists: flip the LP Visible button to Cage Vis.
+            self.sync_toggle_buttons(hp_main, lp_main)
+            status.setText(bg_l10n.text("Cage created.") + " [" + bg_l10n.text("all subgroups") + "]")
+
+        # The Expansion jog applies LIVE while the handle moves, so the cage
+        # inflates smoothly in real time (not one jump on release). Because the
+        # cubic slider curve puts fine control near the centre and coarse control
+        # near the ends, one drag is comfortable at both small and large scales.
+        # Only the incremental change since the last step is pushed each time, so
+        # summing the steps equals one big delta (inflate is linear along a fixed
+        # LP-normal field) - fully reversible.
+        lp_by_cage_short = dict(
+            (lp.split('|')[-1] + bg_cage.SUFFIX_CAGE, lp)
+            for meshes in groups.values() for lp in meshes.get('lp', []))
+
+        def _lp_for(cage):
+            return lp_by_cage_short.get(cage.split('|')[-1])
+
+        def _expansion_targets():
+            """[(cage, lp), ...] plus a scope label, in priority order: cage
+            meshes picked in the viewport -> selected subgroup rows -> every
+            currently VISIBLE subgroup."""
+            mesh_sel = self._selected_cage_meshes(base_name)
+            row_sel = _selected()
+            targets = []
+            if mesh_sel:
+                for m in mesh_sel:
+                    sg = self._subgroup_for_cage_mesh(base_name, m)
+                    if sg and sg in groups:
+                        targets.append((m, _lp_for(m)))
+                return targets, bg_l10n.text("selected cage mesh(es)")
+            if row_sel:
+                for sg in row_sel:
+                    if sg in groups:
+                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
+                            targets.append((cage, _lp_for(cage)))
+                return targets, bg_l10n.text("selected subgroup(s)")
+            for sg, meshes in groups.items():
+                if any(cmds.objExists(hp) and cmds.getAttr(hp + ".visibility") for hp in meshes.get('hp', [])):
+                    for cage in self._cage_meshes_for_subgroup(base_name, sg):
+                        targets.append((cage, _lp_for(cage)))
+            return targets, bg_l10n.text("visible subgroups")
+
+        expo = {'last': 0.0, 'targets': [], 'label': '', 'open': False}
+
+        def expansion_begin():
+            fitted['v'] = False
+            expo['targets'], expo['label'] = _expansion_targets()
+            expo['last'] = 0.0  # the jog always starts from the centre
+            if expo['targets']:
+                cmds.undoInfo(openChunk=True, chunkName="CageExpansion")
+                expo['open'] = True
+
+        def expansion_live():
+            if not expo['targets']:
+                return
+            cur = inflate_spin.value()
+            delta = cur - expo['last']
+            if abs(delta) < 1e-9:
+                return
+            expo['last'] = cur
+            for cage, lp in expo['targets']:
+                if cmds.objExists(cage):
+                    bg_cage.CageProcessor.inflate_existing_cage(cage, delta, lp)
+
+        def expansion_end():
+            if expo['open']:
+                cmds.undoInfo(closeChunk=True)
+                expo['open'] = False
+            # No absolute inflate is stored: the slider is a relative jog that
+            # always starts at 0, and per-subgroup absolute values diverge (that
+            # divergence caused the old partial-deflation bug).
+            cs = pair.setdefault('cage_settings', {})
+            cs['unit'] = 'absolute'
+            cs['inflate'] = 0.0
+            cs['fitted'] = False
+            cs.setdefault('display_mode', 'solid')
+            cs.setdefault('export_enabled', True)
+            (pair.setdefault('cage_overrides', {})).clear()
+            bg_core.BakeSessionModel.save(self.root_pairs)
+            if expo['targets']:
+                self._ensure_cage_visible(pair)
+                status.setText(bg_l10n.text("Expansion adjusted (sculpting preserved).")
+                               + " [" + expo['label'] + "]")
+            else:
+                status.setText(bg_l10n.text("No cage yet - press Create Cage."))
+            _recenter(inflate_spin, inflate_slider)
+            expo['last'] = 0.0
+            expo['targets'] = []
+
+        def expansion_spin_commit():
+            # Typed value / spinbox focus-out: apply the net delta in one step.
+            if abs(inflate_spin.value()) < 1e-9:
+                _recenter(inflate_spin, inflate_slider)
+                return
+            expansion_begin()
+            expansion_live()
+            expansion_end()
+
+        def do_fit():
+            # Hidden from the UI (unreliable) but kept intact: forces a full
+            # from-scratch recompute, unlike Expansion's incremental push.
+            fitted['v'] = True
+            only = _selected() or None
+            save_settings(only or set(groups.keys()), not only)
+            self.rebuild_active_cage(only_subgroups=only, resolve_overlaps=True, create_missing_only=False)
+            self._ensure_cage_visible(pair)
+            status.setText(bg_l10n.text("Cage fitted to HP (gap kept)."))
+
+        inflate_slider.sliderPressed.connect(expansion_begin)
+        inflate_slider.valueChanged.connect(expansion_live)
+        inflate_slider.sliderReleased.connect(expansion_end)
+        inflate_spin.editingFinished.connect(expansion_spin_commit)
+
+        btn_create = _square_btn("Cage_Create.png", "Create Cage")
+        btn_create.clicked.connect(do_create)
+
+        # Display mode toggle: transparent wireframe <-> opaque gray. Only
+        # changes the look (no rebuild). The icon swaps to match the active mode.
+        display_mode = {'v': (pair.get('cage_settings') or {}).get('display_mode', 'solid')}
+        btn_display = _square_btn("Cage_Solid_Gray.png", "Display: Solid gray")
+
+        def _refresh_display_btn():
+            solid = display_mode['v'] == 'solid'
+            # Show the icon of the mode the click will switch TO, so the artist
+            # sees what the cage display will become (not the current look).
+            btn_display.setIcon(get_icon("Cage_Wireframe.png" if solid else "Cage_Solid_Gray.png"))
+            tip = bg_l10n.text("Display: Wireframe") if solid else bg_l10n.text("Display: Solid gray")
+            btn_display.setToolTip(tip)
+            btn_display.setStatusTip(tip)
+
+        def toggle_display():
+            display_mode['v'] = 'solid' if display_mode['v'] == 'wire' else 'wire'
+            settings = pair.setdefault('cage_settings', {})
+            settings['display_mode'] = display_mode['v']
+            bg_core.BakeSessionModel.save(self.root_pairs)
+            bg_cage.CageProcessor.set_chapter_cage_display(pair.get('base', ''), display_mode['v'])
+            _refresh_display_btn()
+
+        _refresh_display_btn()
+        btn_display.clicked.connect(toggle_display)
+
+        # Whether this chapter's cage rides along with the regular chapter
+        # export (always as its own {base}_cage.fbx) - replaces the old
+        # standalone "Export Cage" button. On by default.
+        cb_export = QtWidgets.QCheckBox(bg_l10n.text("Export cage with chapter"))
+        cb_export.setChecked(bool((pair.get('cage_settings') or {}).get('export_enabled', True)))
+
+        def toggle_export_enabled(checked):
+            cage_settings = pair.setdefault('cage_settings', {})
+            cage_settings['export_enabled'] = bool(checked)
+            bg_core.BakeSessionModel.save(self.root_pairs)
+
+        cb_export.toggled.connect(toggle_export_enabled)
+
+        btn_fit = QtWidgets.QPushButton(bg_l10n.text("Fit to HP"))
+        btn_fit.setStyleSheet("background-color: #8e44ad; font-weight: bold; color: white;")
+        btn_fit.clicked.connect(do_fit)
+        # Fit to HP is currently unreliable - hidden from the UI until fixed,
+        # the underlying rebuild/resolve logic stays intact for later.
+        btn_fit.setVisible(False)
+
+        btn_brush = _square_btn("Cage_Brush.png", "Sculpt Cage (Inflate)")
+        btn_brush.clicked.connect(self.sculpt_active_cage)
+
+        # --- Cage/HP intersection touch-up ------------------------------------
+        # Find where the cage still pierces its HP, then push those polygon
+        # islands straight out along their own normal with the slider below.
+        def _scoped_cage_hp_pairs():
+            """[(cage_path, hp_nodes)] for the current scope (selected cage
+            meshes -> selected subgroups -> visible subgroups)."""
+            pairs = []
+            mesh_sel = self._selected_cage_meshes(base_name)
+            row_sel = _selected()
+            if mesh_sel:
+                for m in mesh_sel:
+                    sg = self._subgroup_for_cage_mesh(base_name, m)
+                    if sg in groups:
+                        pairs.append((m, groups[sg]['hp']))
+            elif row_sel:
+                for sg in row_sel:
+                    if sg in groups:
+                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
+                            pairs.append((cage, groups[sg]['hp']))
+            else:
+                for sg, meshes in groups.items():
+                    if any(cmds.objExists(hp) and cmds.getAttr(hp + ".visibility") for hp in meshes.get('hp', [])):
+                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
+                            pairs.append((cage, meshes['hp']))
+            return pairs
+
+        # Bipolar jog (centre = 0), same live real-time behaviour and cubic
+        # (scale-adaptive) response as Expansion: fine control near the centre,
+        # coarse near the ends, applied smoothly while the handle moves.
+        ix_row, ix_spin, ix_slider, _ = self._make_cage_slider_row(
+            -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
+
+        def do_find_intersections():
+            pairs = _scoped_cage_hp_pairs()
+            self._cage_islands = {}
+            faces_sel = []
+            n_isl = 0
+            cmds.refresh(suspend=True)
+            try:
+                for cage, hp_nodes in pairs:
+                    isls = bg_cage.CageProcessor.find_hp_intersection_islands(cage, hp_nodes)
+                    if isls:
+                        self._cage_islands[cage] = isls
+                        n_isl += len(isls)
+                        for isl in isls:
+                            faces_sel.extend("{}.f[{}]".format(cage, f) for f in isl['faces'])
+            finally:
+                cmds.refresh(suspend=False)
+            _recenter(ix_spin, ix_slider)  # start the jog from the centre
+            if faces_sel:
+                try:
+                    cmds.select(faces_sel, replace=True)
+                except Exception:
+                    pass
+                status.setText(bg_l10n.text("Found {n} intersection island(s).").format(n=n_isl))
+            else:
+                cmds.select(clear=True)
+                status.setText(bg_l10n.text("No cage/HP intersections found."))
+
+        # Normal move jogs the found islands LIVE while the handle moves, exactly
+        # like Expansion, so the touch-up is smooth at any scale. Incremental and
+        # reversible (move_islands along a fixed object-space normal).
+        nmove = {'last': 0.0, 'open': False}
+
+        def normal_begin():
+            nmove['last'] = 0.0
+            if getattr(self, '_cage_islands', None):
+                cmds.undoInfo(openChunk=True, chunkName="CageNormalMove")
+                nmove['open'] = True
+
+        def normal_live():
+            islands_map = getattr(self, '_cage_islands', None) or {}
+            if not islands_map:
+                return
+            cur = ix_spin.value()
+            delta = cur - nmove['last']
+            if abs(delta) < 1e-9:
+                return
+            nmove['last'] = cur
+            for cage, isls in islands_map.items():
+                if cmds.objExists(cage):
+                    bg_cage.CageProcessor.move_islands(cage, isls, delta)
+
+        def normal_end():
+            if nmove['open']:
+                cmds.undoInfo(closeChunk=True)
+                nmove['open'] = False
+            if getattr(self, '_cage_islands', None):
+                self._ensure_cage_visible(pair)
+            _recenter(ix_spin, ix_slider)
+            nmove['last'] = 0.0
+
+        def normal_spin_commit():
+            if abs(ix_spin.value()) < 1e-9:
+                _recenter(ix_spin, ix_slider)
+                return
+            normal_begin()
+            normal_live()
+            normal_end()
+
+        ix_slider.sliderPressed.connect(normal_begin)
+        ix_slider.valueChanged.connect(normal_live)
+        ix_slider.sliderReleased.connect(normal_end)
+        ix_spin.editingFinished.connect(normal_spin_commit)
+
+        btn_find = _square_btn("Cage_Find.png", "Find intersections")
+        btn_find.clicked.connect(do_find_intersections)
+
+        # No Back button here anymore - the main Export Settings Back button
+        # (top toolbar) already leaves this panel too (exit_cage_config).
+        btn_clear = _square_btn("Cage_Delete.png", "Delete Cage")
+        btn_clear.clicked.connect(lambda: (self.run_undoable_bg_action("Clear Cage", self.clear_active_cage),
+                                           self.sync_toggle_buttons(hp_main, lp_main),
+                                           status.setText(bg_l10n.text("Cage cleared."))))
+
+        btn_export_cage = _square_btn("Cage_Export.png", "Export Cage")
+        btn_export_cage.clicked.connect(self.export_active_cage)
+
+        # --- Assemble the panel in final visual order ------------------------
+        # Build/sculpt/look buttons sit directly under the header, then the
+        # Expansion jog. Find + Export Cage + Clear share one row above the
+        # Normal move jog. The "export with chapter" checkbox is pinned to the
+        # very bottom; the status line sits just above it.
+        outer.addLayout(_btn_row(btn_create, btn_brush, btn_display))
+        add_labeled("Expansion (inflate)", inflate_row)
+        outer.addWidget(btn_fit)  # hidden, kept for later
+        outer.addLayout(_btn_row(btn_find, btn_export_cage, btn_clear))
+        add_labeled("Normal move", ix_row)
+        outer.addStretch(1)
+        outer.addWidget(cb_export)
+        outer.addWidget(status)
+
+        # No auto-build on entry: the artist presses Create Cage explicitly.
+        if not bg_cage.CageProcessor.get_chapter_cage_meshes(base_name):
+            status.setText(bg_l10n.text("No cage yet - press Create Cage."))
+        else:
+            self._ensure_cage_visible(pair)
+            status.setText("")
+
+        bg_l10n.localize_widget_tree(panel)
+        return panel
+
+    @staticmethod
+    def _set_visible(node, state):
+        try:
+            if node and cmds.objExists(node) and cmds.attributeQuery('visibility', node=node, exists=True):
+                attr = node + ".visibility"
+                # Skip the setAttr when already correct - this runs on the whole
+                # cage subtree on every Expansion tweak / Create Cage, and it is
+                # almost always already visible, so avoiding a no-op dirty/notify
+                # pass on every node is a real, cheap win.
+                if bool(cmds.getAttr(attr)) != bool(state):
+                    cmds.setAttr(attr, bool(state))
+        except Exception:
+            pass
+
+    def _ensure_cage_visible(self, pair):
+        """Make the whole chapter cage hierarchy (group, mirrored folders and all
+        cage meshes) plus its parents visible, then hide the cages of subgroups
+        the artist has toggled off via 'Vis'."""
+        base_name = pair.get('base', 'Chapter')
+        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if not cmds.objExists(chapter):
+            return
+        # Whole subtree (folders + meshes).
+        for node in [chapter] + (cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []):
+            self._set_visible(node, True)
+        # Parents up to the root.
+        parents = cmds.listRelatives(chapter, parent=True, fullPath=True)
+        node = parents[0] if parents else None
+        while node and cmds.objExists(node):
+            self._set_visible(node, True)
+            parents = cmds.listRelatives(node, parent=True, fullPath=True)
+            node = parents[0] if parents else None
+        # Mirror the current per-subgroup Vis state onto the cages.
+        self._sync_cage_visibility_to_subgroups(pair)
+        # The cage is built AFTER isolation is set up, so add it to the active
+        # isolate set now or it would stay hidden / out of sync in isolation.
+        self._isolate_add_cage(pair)
+
+    def _isolate_add_cage(self, pair):
+        """Add the chapter cage to every isolated model panel's view set - but
+        only where it isn't already there, and only actually redraw ('update')
+        the panels that changed. This is called on every Expansion tweak /
+        Create Cage, and 'isolateSelect -update' forces a real, un-suspended
+        viewport redraw per panel - re-running it when the isolate set is
+        already correct was the main cost behind the multi-second Create Cage
+        delay in a real Maya session with several viewports open."""
+        base_name = pair.get('base', 'Chapter')
+        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if not cmds.objExists(cage_grp):
+            return
+        to_update = []
+        for panel in cmds.getPanel(type='modelPanel') or []:
+            try:
+                if not cmds.isolateSelect(panel, query=True, state=True):
+                    continue
+                iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
+                set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
+                if set_name and cmds.objExists(set_name) and cmds.sets(cage_grp, isMember=set_name):
+                    continue  # already isolated - nothing to do for this panel
+                cmds.isolateSelect(panel, addDagObject=cage_grp)
+                to_update.append(panel)
+            except Exception:
+                pass
+        if not to_update:
+            return
+        cmds.refresh(suspend=True)
+        try:
+            for panel in to_update:
+                cmds.isolateSelect(panel, update=True)
+        finally:
+            cmds.refresh(suspend=False)
+
+    def _cage_meshes_for_subgroup(self, base_name, display_name):
+        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if not cmds.objExists(chapter):
+            return []
+        prefix = "{}_{}_low".format(base_name, display_name)
+        out = []
+        for tr in cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []:
+            short = tr.split('|')[-1]
+            if short.startswith(prefix) and short.endswith(bg_cage.SUFFIX_CAGE) \
+                    and cmds.listRelatives(tr, shapes=True, type='mesh'):
+                out.append(tr)
+        return out
+
+    @staticmethod
+    def _subgroup_for_cage_mesh(base_name, mesh):
+        """Display name of the subgroup a cage mesh belongs to, parsed from its
+        name ({base}_{sg}_low..._cage) - same convention as
+        _collect_cage_subgroups. None if it doesn't match."""
+        short = mesh.split('|')[-1]
+        prefix = base_name + '_'
+        if not (short.startswith(prefix) and short.endswith(bg_cage.SUFFIX_CAGE)):
+            return None
+        rest = short[len(prefix):]
+        if '_low' not in rest:
+            return None
+        return rest.split('_low')[0]
+
+    def _selected_cage_meshes(self, base_name):
+        """Cage meshes of this chapter that are directly selected in the
+        viewport right now (as opposed to a subgroup row picked in the panel).
+        Lets Expansion target just a piece of a subgroup's cage."""
+        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if not cmds.objExists(chapter):
+            return []
+        chapter_prefix = chapter + "|"
+        hits = []
+        for node in cmds.ls(selection=True, long=True) or []:
+            if not node.startswith(chapter_prefix):
+                continue
+            short = node.split('|')[-1]
+            if short.endswith(bg_cage.SUFFIX_CAGE) and cmds.listRelatives(node, shapes=True, type='mesh'):
+                hits.append(node)
+        return hits
+
+    def set_cage_subgroup_visibility(self, base_name, display_name, visible):
+        for cage in self._cage_meshes_for_subgroup(base_name, display_name):
+            self._set_visible(cage, visible)
+            if visible:
+                parent = cmds.listRelatives(cage, parent=True, fullPath=True)
+                if parent:
+                    self._set_visible(parent[0], True)
+
+    def _sync_cage_visibility_to_subgroups(self, pair):
+        """Cages follow their subgroup's HP visibility: a subgroup hidden via
+        'Vis' hides its cage too. Scans the cage hierarchy ONCE (instead of once
+        per subgroup, which is what repeatedly calling set_cage_subgroup_visibility
+        /_cage_meshes_for_subgroup would do) - this runs on every Expansion
+        tweak / Create Cage, so re-scanning per subgroup was a real cost."""
+        base_name = pair.get('base', 'Chapter')
+        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if not cmds.objExists(chapter):
+            return
+        widgets = [wd for wd in (getattr(self, 'final_mesh_widgets', []) or [])
+                   if any(cmds.objExists(n) for n in wd.get('hp_nodes', []))]
+        if not widgets:
+            return
+        all_cage_meshes = [
+            tr for tr in (cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or [])
+            if tr.split('|')[-1].endswith(bg_cage.SUFFIX_CAGE) and cmds.listRelatives(tr, shapes=True, type='mesh')
+        ]
+        for widget_data in widgets:
+            hp_nodes = [n for n in widget_data.get('hp_nodes', []) if cmds.objExists(n)]
+            visible = bool(cmds.getAttr(hp_nodes[0] + ".visibility"))
+            prefix = "{}_{}_low".format(base_name, widget_data.get('subgroup_name'))
+            for cage in all_cage_meshes:
+                if not cage.split('|')[-1].startswith(prefix):
+                    continue
+                self._set_visible(cage, visible)
+                if visible:
+                    parent = cmds.listRelatives(cage, parent=True, fullPath=True)
+                    if parent:
+                        self._set_visible(parent[0], True)
+
+    def enter_cage_config(self):
+        pair = self._active_pair()
+        if not pair:
+            return cmds.warning("No active chapter selected.")
+        container = getattr(self, 'cage_container', None)
+        if container is None:
+            # Fallback if the cage slot is unavailable for any reason.
+            return self.rebuild_active_cage()
+        # Remember the splitter layout before we reshape it (only on first entry,
+        # not on the in-place rebuilds done for language changes).
+        was_active = getattr(self, 'is_cage_config', False)
+        # Rebuild the panel fresh so it reflects the active chapter's settings
+        # and the current language.
+        layout = container.layout()
+        old = getattr(self, 'cage_panel', None)
+        if old is not None:
+            layout.removeWidget(old)
+            old.deleteLater()
+        self.cage_panel = self.build_cage_settings_panel(pair)
+        layout.addWidget(self.cage_panel)
+        # Show the cage panel (under the TOC) and hide the Matcher for more room.
+        if not was_active and hasattr(self, 'right_splitter'):
+            self._saved_right_sizes = self.right_splitter.sizes()
+        container.setVisible(True)
+        if hasattr(self, 'gt_widget'):
+            self.gt_widget.setVisible(False)
+        self.is_cage_config = True
+        # Hand the space freed by the hidden Matcher to the Table of Contents:
+        # the cage panel stays only as tall as its content. Deferred so the
+        # panel's sizeHint is valid after this layout pass.
+        QtCore.QTimer.singleShot(0, self._fit_cage_split)
+
+    def _fit_cage_split(self):
+        if not getattr(self, 'is_cage_config', False):
+            return
+        splitter = getattr(self, 'right_splitter', None)
+        panel = getattr(self, 'cage_panel', None)
+        if splitter is None or panel is None:
+            return
+        total = splitter.height()
+        if total <= 0:
+            return
+        cage_h = max(140, min(panel.sizeHint().height(), total - 140))
+        # [Matcher (hidden), Table of Contents, Cage panel]
+        splitter.setSizes([0, total - cage_h, cage_h])
+
+    def exit_cage_config(self):
+        self.is_cage_config = False
+        container = getattr(self, 'cage_container', None)
+        if container is not None:
+            container.setVisible(False)
+        if hasattr(self, 'gt_widget'):
+            self.gt_widget.setVisible(True)
+        # Restore the splitter proportions the Matcher had before cage config.
+        saved = getattr(self, '_saved_right_sizes', None)
+        if saved and hasattr(self, 'right_splitter'):
+            try:
+                self.right_splitter.setSizes(saved)
+            except Exception:
+                pass
+            self._saved_right_sizes = None
 
     def on_final_smooth_combo_changed(self, triggered_name, new_level, full_prefix, combo_widget):
         self.final_smooth_states[triggered_name] = new_level
@@ -2857,12 +4204,17 @@ class FinalViewMixin:
             self.set_final_row_selected(triggered_name, True)
             self.save_final_smooth_states()
 
-    def toggle_final_hp_vis(self, hp_nodes, btn):
+    def toggle_final_hp_vis(self, hp_nodes, btn, display_name=None):
         valid_nodes = [n for n in hp_nodes if cmds.objExists(n)]
         if not valid_nodes:
             return
         current_state = cmds.getAttr(valid_nodes[0] + ".visibility")
         new_state = not current_state
+        # Cages follow their subgroup: hide the cage when the subgroup is hidden.
+        if display_name:
+            pair = self._active_pair()
+            if pair:
+                self.set_cage_subgroup_visibility(pair.get('base', ''), display_name, new_state)
         for node in valid_nodes:
             cmds.setAttr(node + ".visibility", new_state)
             if new_state:
@@ -2872,12 +4224,52 @@ class FinalViewMixin:
                     grandparent = cmds.listRelatives(parent[0], parent=True, fullPath=True)
                     if grandparent:
                         cmds.setAttr(grandparent[0] + ".visibility", True)
-        if new_state:
-            btn.setText(bg_l10n.text("Vis"))
-            btn.setStyleSheet("background-color: #4a5d4a;")
-        else:
-            btn.setText(bg_l10n.text("Hid"))
-            btn.setStyleSheet("background-color: #8c4242;")
+        btn.setIcon(get_icon("open_eye.png" if new_state else "close_eye.png"))
+        btn.setStyleSheet("background-color: #4a5d4a;" if new_state else "background-color: #8c4242;")
+
+    @staticmethod
+    def _set_final_hp_vis(hp_nodes, visible):
+        for node in hp_nodes:
+            if not cmds.objExists(node):
+                continue
+            cmds.setAttr(node + ".visibility", visible)
+            if visible:
+                parent = cmds.listRelatives(node, parent=True, fullPath=True)
+                if parent:
+                    cmds.setAttr(parent[0] + ".visibility", True)
+                    grandparent = cmds.listRelatives(parent[0], parent=True, fullPath=True)
+                    if grandparent:
+                        cmds.setAttr(grandparent[0] + ".visibility", True)
+
+    def isolate_final_hp_vis(self, display_name):
+        """Right-click on a Final-view Vis button: show ONLY this subgroup (its
+        HP AND its cage), hide the others. If it is already the only one shown,
+        reveal everything again - mirrors the base-mode isolate."""
+        pair = self._active_pair()
+        if not pair:
+            return
+        base = pair.get('base', '')
+        widgets = getattr(self, 'final_mesh_widgets', [])
+        if not widgets:
+            return
+
+        def hp_visible(wd):
+            nodes = [n for n in wd.get('hp_nodes', []) if cmds.objExists(n)]
+            return bool(nodes) and bool(cmds.getAttr(nodes[0] + ".visibility"))
+
+        visible = set(wd['subgroup_name'] for wd in widgets if hp_visible(wd))
+        show_all = (visible == set([display_name]))  # already isolated -> reveal all
+
+        for wd in widgets:
+            name = wd['subgroup_name']
+            vis = bool(show_all or name == display_name)
+            nodes = [n for n in wd.get('hp_nodes', []) if cmds.objExists(n)]
+            self._set_final_hp_vis(nodes, vis)
+            self.set_cage_subgroup_visibility(base, name, vis)
+            btn = wd.get('btn_vis')
+            if btn:
+                btn.setIcon(get_icon("open_eye.png" if vis else "close_eye.png"))
+                btn.setStyleSheet("background-color: #4a5d4a;" if vis else "background-color: #8c4242;")
 
     def rename_final_subgroup(self, old_name, new_name):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -2895,10 +4287,10 @@ class FinalViewMixin:
                 if short.startswith(old_name + "_high"):
                     cmds.rename(hp, short.replace(old_name, new_name, 1))
 
-            chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-            lp_root = chapter_grp_path if cmds.objExists(chapter_grp_path) else lp_main
-            lp_meshes = cmds.listRelatives(lp_root, children=True, fullPath=True) or []
+            lp_meshes = cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []
             for lp in lp_meshes:
+                if not cmds.listRelatives(lp, shapes=True):
+                    continue
                 short = lp.split('|')[-1]
                 if short.startswith(old_name + "_low"):
                     cmds.rename(lp, short.replace(old_name, new_name, 1))
@@ -2960,6 +4352,10 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        # Remember the chosen folder on the chapter so the standalone Export Cage
+        # button can reuse it without prompting again.
+        pair['export_dir'] = export_dir
+        bg_core.BakeSessionModel.save(self.root_pairs)
         self.disable_preview_smoothing_for_export()
 
         with self.suspend_subgroup_color_preview():
@@ -2983,6 +4379,11 @@ class ExportMixin:
                     )
                     if exported_name:
                         cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
+
+                # No separate Export Cage button anymore: whenever a cage exists
+                # for this chapter and its "export cage" flag is on (default),
+                # it goes out too - always as its own {base}_cage.fbx file.
+                self.export_chapter_cage_if_enabled(pair, export_dir)
 
     def batch_export_book(self, mode='separate'):
         if not self.active_root_id:
@@ -3029,6 +4430,9 @@ class ExportMixin:
                         )
                         if exported:
                             success_count += 1
+                    # Same as the single-chapter export: cage goes out too, as
+                    # its own file, whenever it exists and is enabled.
+                    self.export_chapter_cage_if_enabled(pair, export_dir)
         cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
 
     def export_active_lp_only(self):
@@ -3103,126 +4507,99 @@ class ExportMixin:
         cmds.inViewMessage(amg="LP Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
+    def _export_meshes_with_lp_triangulation(self, meshes, export_path):
+        """Triangulate the given LP originals in place inside an undo chunk,
+        export the selection to FBX, then cmds.undo() the chunk so the LP
+        originals revert to quads. The FBX file write is not undoable, so only
+        the in-scene triangulation is rolled back."""
+        meshes = [m for m in (meshes or []) if m and cmds.objExists(m)]
+        if not meshes:
+            return False
+        ok = False
+        cmds.undoInfo(openChunk=True, chunkName="LPExportTriangulate")
+        try:
+            for m in meshes:
+                try:
+                    cmds.polyTriangulate(m, constructionHistory=False)
+                except Exception:
+                    pass
+            cmds.select(meshes, replace=True)
+            bg_final_export.FinalExportProcessor.export_selected_fbx(export_path)
+            ok = True
+        except Exception as e:
+            cmds.warning("LP export/triangulation failed: {}".format(e))
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            try:
+                cmds.undo()  # roll back the triangulation; leaves originals as quads
+            except Exception:
+                pass
+        return ok
+
     def _export_lp_for_pair(self, pair, export_dir):
         base_name = pair.get('base', 'Chapter_Export')
-        chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-        _, lp_main, _ = self.core.resolve_main_nodes(pair)
-        search_root = chapter_grp_path if cmds.objExists(chapter_grp_path) else lp_main
-        if not search_root or not cmds.objExists(search_root):
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if not lp_main or not cmds.objExists(lp_main):
             return False
+        # Ensure the finalized _low_NNN naming exists even if the user runs an
+        # LP-only export without entering Export Settings first.
+        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
         to_export = []
-        lp_children = cmds.listRelatives(search_root, children=True, fullPath=True) or []
-        for child in lp_children:
-            short_name = child.split('|')[-1]
-            is_subgroup = not cmds.listRelatives(child, shapes=True)
-            if "_low" in short_name and not is_subgroup:
+        for child in (cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []):
+            if not cmds.listRelatives(child, shapes=True):
+                continue
+            if "_low" in child.split('|')[-1]:
                 to_export.append(child)
         if not to_export:
             return False
-        cmds.select(to_export, replace=True)
         export_name = "{}_LP".format(base_name)
         export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-        try:
-            bg_final_export.FinalExportProcessor.export_selected_fbx(export_path)
-            return True
-        except Exception as e:
-            cmds.warning("Failed to export LP for {}: {}".format(base_name, e))
-            return False
+        ok = self._export_meshes_with_lp_triangulation(to_export, export_path)
+        if not ok:
+            cmds.warning("Failed to export LP for {}".format(base_name))
+        return ok
 
-    def combine_all_subgroups_ui(self):
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not pair:
-            return
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        base_name = pair.get('base', 'Unknown')
-        if not hp_main or not lp_main:
-            cmds.warning("Bake Groups: HP or LP root objects not found.")
-            return
-        if not self.validate_combine_fin_lp_structure(hp_main, lp_main):
-            return
-        result = bg_final_export.FinalExportProcessor.combine_all_subgroups(base_name, hp_main, lp_main, parent_window=self)
-        self.refresh_left_panel()
-        if not result or not result.get('success'):
-            cmds.warning("Combine Fin failed. See script editor for details.")
-            return
+    def finalize_subgroup_naming(self, base_name, hp_main, lp_main):
+        """Rename subgroup meshes in place to the finalized export naming:
+        HP -> {base}_{sg}_high_{NNN}, LP -> {base}_{sg}_low_{NNN} (mirroring HP).
+        No combining, no LP_Combine_BG. Runs when entering Export Settings; the
+        naming persists. Returns (hp_count, lp_count).
 
-        if result.get('lp', 0) == 0:
-            cmds.warning("Combine Fin: no LP subgroups were combined. Run Assign LP Meshes first or check LP subgroup names.")
-        else:
-            self.set_final_low_visibility(base_name, False)
-        if hasattr(self, 'record_user_action'):
-            self.record_user_action(
-                "Combine Fin",
-                "hp={} | lp={}".format(result.get('hp', 0), result.get('lp', 0))
-            )
-
-        cmds.inViewMessage(
-            amg="Combine Fin complete: HP {} / LP {}".format(result.get('hp', 0), result.get('lp', 0)),
-            pos='midCenter',
-            fade=True
-        )
-
-    def combine_fin_subgroup_names(self, root_node, suffix, expected_group=None):
-        result = set()
-        if not root_node or not cmds.objExists(root_node):
-            return result
-        suffix_re = re.escape(suffix) + r'\d*$'
-        for child in (cmds.listRelatives(root_node, children=True, fullPath=True, type='transform') or []):
-            if not child or not cmds.objExists(child):
-                continue
-            if cmds.listRelatives(child, shapes=True, fullPath=True, type='mesh', noIntermediate=True):
-                continue
-            if expected_group:
-                attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
-                if cmds.objExists(attr):
-                    try:
-                        if cmds.getAttr(attr) != expected_group:
+        Meshes whose name is ALREADY correct are skipped (no cmds.rename call)
+        - this function is called every time Export Settings / the Cage panel
+        is (re)entered, so on an already-finalized chapter (the common case)
+        it used to fire a real rename per mesh for nothing every single time,
+        which is real, measurable overhead on a production scene."""
+        hp_count = 0
+        lp_count = 0
+        with bg_core.undo_chunk("FinalizeSubgroupNaming"):
+            for root, suffix, tag in ((hp_main, "high", bg_core.BakeConfig.SUFFIX_HP),
+                                      (lp_main, "low", bg_core.BakeConfig.SUFFIX_LP)):
+                if not root or not cmds.objExists(root):
+                    continue
+                subgroups = [g for g in (cmds.listRelatives(root, children=True, fullPath=True, type='transform') or [])
+                             if not cmds.listRelatives(g, shapes=True)]
+                for sg in subgroups:
+                    sg_name = sg.split('|')[-1].replace(tag, "").replace(".", "_")
+                    meshes = cmds.listRelatives(sg, allDescendents=True, type='mesh', fullPath=True) or []
+                    transforms = list(set([cmds.listRelatives(m, parent=True, fullPath=True)[0] for m in meshes]))
+                    for i, tr in enumerate(sorted(transforms)):
+                        new_name = "{}_{}_{}_{:03d}".format(base_name, sg_name, suffix, i + 1).replace(".", "_")
+                        if tr.split('|')[-1] == new_name:
+                            if suffix == "high":
+                                hp_count += 1
+                            else:
+                                lp_count += 1
                             continue
-                    except Exception:
-                        pass
-            short_name = child.split('|')[-1].replace(".", "_")
-            clean_name = re.sub(suffix_re, '', short_name, flags=re.IGNORECASE).strip()
-            if clean_name:
-                result.add(clean_name)
-        return result
-
-    def validate_combine_fin_lp_structure(self, hp_main, lp_main):
-        hp_names = self.combine_fin_subgroup_names(hp_main, bg_core.BakeConfig.SUFFIX_HP, "HP")
-        lp_names = self.combine_fin_subgroup_names(lp_main, bg_core.BakeConfig.SUFFIX_LP, "LP")
-        missing_in_lp = sorted(hp_names - lp_names)
-        extra_in_lp = sorted(lp_names - hp_names)
-        if not missing_in_lp and not extra_in_lp:
-            return True
-
-        def _format_names(names, limit=12):
-            names = list(names or [])
-            if not names:
-                return "-"
-            shown = names[:limit]
-            text = ", ".join(shown)
-            if len(names) > limit:
-                text += ", +{}".format(len(names) - limit)
-            return text
-
-        message = bg_l10n.text("Combine Fin stopped: LP subgroup structure does not match HP.")
-        details = [
-            bg_l10n.text("Missing in LP: {names}").format(names=_format_names(missing_in_lp)),
-            bg_l10n.text("Extra in LP: {names}").format(names=_format_names(extra_in_lp)),
-            bg_l10n.text("Fix LP subgroups with Assign LP Meshes or rename/create matching LP subgroups before Combine Fin.")
-        ]
-        full_message = "{}\n\n{}".format(message, "\n".join(details))
-        self.log(full_message.replace("\n", " | "), "orange")
-        cmds.warning(full_message)
-
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle(bg_l10n.text("LP Subgroup Structure Mismatch"))
-        box.setText(message)
-        box.setInformativeText("\n".join(details))
-        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        box.setStyleSheet("QMessageBox { background-color: #242424; color: white; } QPushButton { background-color: #333; padding: 5px; }")
-        box.exec_()
-        return False
+                        try:
+                            cmds.rename(tr, new_name)
+                            if suffix == "high":
+                                hp_count += 1
+                            else:
+                                lp_count += 1
+                        except Exception:
+                            pass
+        return hp_count, lp_count
 
 
 # ============================================================================
@@ -5070,7 +6447,54 @@ class SceneInteractionMixin:
             except RuntimeError:
                 pass
 
-    def create_root_pair_from_picked(self):
+    def _count_lp_materials(self, lp_node):
+        """Distinct material count across every LP mesh under ``lp_node``."""
+        if not lp_node or not cmds.objExists(lp_node):
+            return 0
+        keys = set()
+        for mesh_node in self.mesh_transform_nodes_under(lp_node):
+            for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+                key = rec.get("key")
+                if key:
+                    keys.add(key)
+        return len(keys)
+
+    def create_pair_smart(self):
+        """Create-pair entry point. Inspect how many materials the picked LP
+        has: one -> a normal single chapter; several -> ask whether to keep it as
+        one chapter (split by material during Analyze HP, the old N_Mat flag) or
+        split it into several chapters now (the old Create by Mat)."""
+        if not self.picked_hp or not cmds.objExists(self.picked_hp):
+            return cmds.warning("Invalid HP node.")
+        if not self.picked_lp or not cmds.objExists(self.picked_lp):
+            return cmds.warning("Invalid LP node.")
+
+        mat_count = self._count_lp_materials(self.picked_lp)
+        if mat_count <= 1:
+            return self.run_undoable_bg_action("Create Pair", self.create_root_pair_from_picked, False)
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Multiple LP Materials"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText(bg_l10n.text("The LP has several materials ({n}).").format(n=mat_count))
+        box.setInformativeText(bg_l10n.text(
+            "Create it as a single chapter (split by material during Analyze HP), "
+            "or split it into several chapters now?"))
+        one_btn = box.addButton(bg_l10n.text("Create as one chapter"), QtWidgets.QMessageBox.AcceptRole)
+        multi_btn = box.addButton(bg_l10n.text("Create several chapters"), QtWidgets.QMessageBox.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        bg_l10n.localize_widget_tree(box)
+        box.setDefaultButton(one_btn)
+        box.exec_()
+
+        clicked = box.clickedButton()
+        if clicked == one_btn:
+            self.run_undoable_bg_action("Create Pair", self.create_root_pair_from_picked, True)
+        elif clicked == multi_btn:
+            self.run_undoable_bg_action("Create by Mat", self.create_root_pairs_by_material_from_picked)
+        # Cancel -> nothing
+
+    def create_root_pair_from_picked(self, material_slots=False):
         if not self.picked_hp or not cmds.objExists(self.picked_hp):
             return cmds.warning("Invalid HP node.")
         if not self.picked_lp or not cmds.objExists(self.picked_lp):
@@ -5115,7 +6539,8 @@ class SceneInteractionMixin:
             np = {"id": str(uuid.uuid4()), "base": f_base,
                   "hp_uuid": cmds.ls(hp_node, uuid=True)[0],
                   "lp_uuid": cmds.ls(lp_node, uuid=True)[0],
-                  "locked": [], "book": "", "final_smooth_states": {}}
+                  "locked": [], "book": "", "final_smooth_states": {},
+                  "material_slots": bool(material_slots)}
             self.root_pairs.append(np)
             bg_core.BakeSessionModel.save(self.root_pairs)
             self.picked_hp, self.picked_lp = None, None

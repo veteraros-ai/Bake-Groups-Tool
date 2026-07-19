@@ -14,6 +14,7 @@ from datetime import datetime
 import maya.cmds as cmds
 import bg_core
 import bg_gt_matcher
+import bg_cage
 import bg_final_export
 import bg_localization as bg_l10n
 import bg_update
@@ -116,6 +117,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.update_worker = None
         self.update_dialog = None
         self.update_check_timer = None
+        self.manual_prompt_timer = None
         self.manual_update_check_requested = False
         self._dock_relayout_pending = False
         self._resize_relayout_pending = False
@@ -136,6 +138,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.update_check_timer.setSingleShot(True)
         self.update_check_timer.timeout.connect(self.start_update_check)
         self.update_check_timer.start(1200)
+        # Offer the PureRef manual on launch (once, unless dismissed).
+        self.manual_prompt_timer = QtCore.QTimer(self)
+        self.manual_prompt_timer.setSingleShot(True)
+        self.manual_prompt_timer.timeout.connect(self.maybe_show_manual_prompt)
+        self.manual_prompt_timer.start(1800)
 
     # ------------------------------------------------------------------------
     # UI Initialization
@@ -160,6 +167,12 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         g_frame = QtWidgets.QFrame()
         g_layout = QtWidgets.QVBoxLayout(g_frame)
 
+        # The two pick rows sit in a left column; one tall Create button spans
+        # both of them on the right. Create inspects the LP material count and
+        # either makes a single chapter or offers to split by material.
+        pick_row = QtWidgets.QHBoxLayout()
+        picks_col = QtWidgets.QVBoxLayout()
+
         hp_layout = QtWidgets.QHBoxLayout()
         self.le_picked_hp = QtWidgets.QLineEdit()
         self.le_picked_hp.setReadOnly(True)
@@ -169,7 +182,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         btn_pick_hp.clicked.connect(lambda: self.pick_node("HP"))
         hp_layout.addWidget(self.le_picked_hp, stretch=3)
         hp_layout.addWidget(btn_pick_hp, stretch=1)
-        g_layout.addLayout(hp_layout)
+        picks_col.addLayout(hp_layout)
 
         lp_layout = QtWidgets.QHBoxLayout()
         self.le_picked_lp = QtWidgets.QLineEdit()
@@ -180,20 +193,23 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         btn_pick_lp.clicked.connect(lambda: self.pick_node("LP"))
         lp_layout.addWidget(self.le_picked_lp, stretch=3)
         lp_layout.addWidget(btn_pick_lp, stretch=1)
-        g_layout.addLayout(lp_layout)
+        picks_col.addLayout(lp_layout)
 
-        create_layout = QtWidgets.QHBoxLayout()
-        btn_create_main = QtWidgets.QPushButton(" Create Pair from Picked")
-        btn_create_main.setIcon(get_icon("add_group.png"))
-        btn_create_main.setStyleSheet("background-color: #3f523f; font-weight: bold; padding: 8px;")
-        btn_create_main.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create Pair", self.create_root_pair_from_picked))
-        create_layout.addWidget(btn_create_main)
+        pick_row.addLayout(picks_col, stretch=3)
 
-        self.btn_create_by_material = QtWidgets.QPushButton("Create by Mat")
-        self.btn_create_by_material.setStyleSheet("background-color: #4b5140; font-weight: bold; padding: 8px;")
-        self.btn_create_by_material.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create by Mat", self.create_root_pairs_by_material_from_picked))
-        create_layout.addWidget(self.btn_create_by_material)
-        g_layout.addLayout(create_layout)
+        btn_create_main = QtWidgets.QPushButton()
+        btn_create_main.setIcon(get_icon("Create_Bake_Groups.png"))
+        btn_create_main.setIconSize(QtCore.QSize(52, 52))
+        btn_create_main.setFixedSize(64, 64)
+        create_tip = bg_l10n.tooltip(" Create Pair from Picked")
+        btn_create_main.setToolTip(create_tip)
+        btn_create_main.setStatusTip(create_tip)
+        btn_create_main.setProperty("bg_i18n_key", " Create Pair from Picked")
+        btn_create_main.setStyleSheet("background-color: #333333; border: 1px solid #555555; border-radius: 4px; padding: 2px;")
+        btn_create_main.clicked.connect(lambda checked=False: self.create_pair_smart())
+        pick_row.addWidget(btn_create_main, alignment=QtCore.Qt.AlignVCenter)
+
+        g_layout.addLayout(pick_row)
 
         tool_layout = QtWidgets.QHBoxLayout()
         self.cb_color_subgroups = QtWidgets.QCheckBox("Color HP")
@@ -283,6 +299,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.subgroups_widget = QtWidgets.QWidget()
         self.subgroups_widget.setMinimumWidth(0)
         self.subgroups_widget.setStyleSheet("background-color: transparent;")
+        # Rubber-band marquee selection in Final Group view is driven from
+        # eventFilter() when watched is this widget.
+        self.subgroups_widget.installEventFilter(self)
         self.subgroups_layout = QtWidgets.QVBoxLayout(self.subgroups_widget)
         self.subgroups_layout.setAlignment(QtCore.Qt.AlignTop)
         self.subgroups_scroll.setWidget(self.subgroups_widget)
@@ -301,26 +320,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.btn_fs.customContextMenuRequested.connect(self.toggle_find_sim_mode)
         self.find_sim_mode = "SIM"
 
-        self.btn_add = QtWidgets.QPushButton("Add to Act")
-        self.btn_add.setFixedHeight(30)
-        self.btn_add.setStyleSheet("background-color: #425c42; font-weight: bold;")
-        self.btn_add.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Add to Selected Group", self.add_to_selected_subgroup_ui))
-
-        self.btn_combine_bake = QtWidgets.QPushButton("Combine Fin")
-        self.btn_combine_bake.setFixedHeight(30)
-        self.btn_combine_bake.setStyleSheet("background-color: #633f6b; font-weight: bold;")
-        self.btn_combine_bake.clicked.connect(self.combine_all_subgroups_ui)
-
         self.btn_preview = QtWidgets.QPushButton("Smooth View")
         self.btn_preview.setFixedHeight(30)
         self.btn_preview.setStyleSheet("background-color: #3498db; font-weight: bold; color: white;")
         self.btn_preview.clicked.connect(self.toggle_preview_smoothing)
         self.btn_preview.setVisible(False)
 
-        self.btn_toggle_view = QtWidgets.QPushButton("Final Group")
+        self.btn_toggle_view = QtWidgets.QPushButton("Export Settings")
         self.btn_toggle_view.setFixedHeight(30)
         self.btn_toggle_view.setStyleSheet("background-color: #d35400; font-weight: bold;")
-        self.btn_toggle_view.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Final Group", self.toggle_final_view))
+        self.btn_toggle_view.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Export Settings", self.toggle_final_view))
 
         self.btn_process_final = QtWidgets.QPushButton("Export")
         self.btn_process_final.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -332,10 +341,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.btn_process_final.setVisible(False)
 
         bl_layout.addWidget(self.btn_fs)
-        bl_layout.addWidget(self.btn_add)
-        bl_layout.addWidget(self.btn_combine_bake)
-        bl_layout.addWidget(self.btn_preview)
         bl_layout.addWidget(self.btn_toggle_view)
+        bl_layout.addWidget(self.btn_preview)
         bl_layout.addWidget(self.btn_process_final)
         left_layout.addLayout(bl_layout)
 
@@ -400,15 +407,29 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.shortcut_select_by_mesh.activated.connect(self.select_subgroup_by_selected_mesh)
 
         top_right_layout.addWidget(self.toc_tree)
+        # Matcher on top, Table of Contents below (original order).
         self.right_splitter.addWidget(top_right_widget)
-        self.right_splitter.setSizes([400, 300])
+
+        # Cage settings panel lives UNDER the Table of Contents; it is shown (and
+        # the Matcher hidden, for more room) only during cage setup.
+        self.cage_container = QtWidgets.QWidget()
+        cage_container_layout = QtWidgets.QVBoxLayout(self.cage_container)
+        cage_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.cage_container.setVisible(False)
+        self.right_splitter.addWidget(self.cage_container)
+
+        self.right_splitter.setSizes([400, 300, 300])
 
         session_buttons_layout = QtWidgets.QHBoxLayout()
         session_buttons_layout.setSpacing(4)
 
         self.btn_save_session = QtWidgets.QPushButton("Save Session")
         self.btn_save_session.setFixedHeight(30)
-        self.btn_save_session.setStyleSheet("background-color: #3b3b3b; font-weight: bold; border: 1px solid #555;")
+        self.btn_save_session.setStyleSheet(
+            "QPushButton { background-color: #3b3b3b; font-weight: bold; border: 1px solid #555; }"
+            "QPushButton:hover { background-color: #4a4a4a; border: 1px solid #777; }"
+            "QPushButton:pressed { background-color: #2b2b2b; border: 1px solid #444; }"
+        )
         self.btn_save_session.clicked.connect(self.manual_save_session)
         session_buttons_layout.addWidget(self.btn_save_session)
 
@@ -581,12 +602,22 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.combo_hp_strategy = QtWidgets.QComboBox()
         self.combo_hp_strategy.addItems([
             "Spatial Volume Match",
-            "PCA Shape Alignment",
+            "Vertex Proximity",
             "Topology Fingerprint"
         ])
         self.combo_hp_strategy.setCurrentIndex(1)
         self.algo_group.addWidget(algo_label)
         self.algo_group.addWidget(self.combo_hp_strategy)
+
+        # Optimization mode: how aggressively very-high-poly meshes are decimated
+        # before matching. Optimal = full resolution for normal meshes, gentle cap
+        # only for multi-million-vert sculpts. Speed = tighter cap for faster runs.
+        cache_mode_label = QtWidgets.QLabel("Optimization:")
+        self.combo_hp_cache_mode = QtWidgets.QComboBox()
+        self.combo_hp_cache_mode.addItems(["Optimal", "Speed"])
+        self.combo_hp_cache_mode.setCurrentIndex(0)
+        self.algo_group.addWidget(cache_mode_label)
+        self.algo_group.addWidget(self.combo_hp_cache_mode)
 
         grid = QtWidgets.QGridLayout()
         grid.addWidget(QtWidgets.QLabel("HP Collision (%):"), 0, 0)
@@ -602,9 +633,12 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.chk_ignore_floaters.setChecked(True)
         grid.addWidget(self.chk_ignore_floaters, 0, 2)
 
+        # N_Mat is no longer a visible flag: the multi-material choice is made in
+        # a dialog at Create time and stored per chapter (pair['material_slots']).
+        # Kept as a hidden default holder so gather_hp_worker_params still works.
         self.chk_material_slots = QtWidgets.QCheckBox("N_Mat")
         self.chk_material_slots.setChecked(False)
-        grid.addWidget(self.chk_material_slots, 0, 3)
+        self.chk_material_slots.setVisible(False)
 
         self.lbl_hp_link_vtx = QtWidgets.QLabel("HP Link Vtx:")
         grid.addWidget(self.lbl_hp_link_vtx, 1, 0)
@@ -652,7 +686,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.spin_wire_elong.setRange(1.0, 20.0)
         self.spin_wire_elong.setValue(4.0)
         self.spin_wire_elong.setSingleStep(0.1)
-        self.algo_group.toggle_button.setChecked(True)
+        # Collapsed by default now that N_Mat no longer lives here.
+        self.algo_group.toggle_button.setChecked(False)
         self.algo_group.on_pressed()
         layout.addWidget(self.algo_group)
 
@@ -673,6 +708,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             QFrame { border: 1px solid #333; border-radius: 4px; background-color: #2a2a2a; }
             QGroupBox { border: 1px solid #444; margin-top: 10px; border-radius: 4px; padding-top: 10px; font-weight: bold; }
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top center; padding: 0 3px; color: #aaa; }
+            QToolTip { color: #f0f0f0; background-color: #2a2a2a; border: 1px solid #555555; padding: 4px; }
         """
         self.setStyleSheet(style)
 
@@ -804,6 +840,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         try:
             event_type = event.type()
         except Exception:
+            return super(BakeManagerUI, self).eventFilter(watched, event)
+        # Rubber-band (marquee) selection over the Final Group subgroup panel.
+        if watched is getattr(self, 'subgroups_widget', None):
+            if self._handle_final_rubber_band(event):
+                return True
             return super(BakeManagerUI, self).eventFilter(watched, event)
         shortcut_types = (QtCore.QEvent.KeyPress, QtCore.QEvent.ShortcutOverride)
         if event_type in shortcut_types and self.should_handle_bg_undo_shortcut(event):
@@ -1014,6 +1055,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             with open(file_path, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(report))
             self.log(bg_l10n.text("Debug log saved: {path}").format(path=file_path), "lightgreen")
+            cmds.inViewMessage(amg=bg_l10n.text("Log saved"), pos='midCenter', fade=True)
         except Exception as exc:
             self.log(bg_l10n.text("Failed to save debug log: {error}").format(error=exc), "red")
 
@@ -1041,6 +1083,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             "active_material_visibility_filter": getattr(self, "active_material_visibility_filter", None),
             "settings": {
                 "hp_strategy": self.combo_hp_strategy.currentText() if hasattr(self, "combo_hp_strategy") else None,
+                "hp_optimization": self.combo_hp_cache_mode.currentText() if hasattr(self, "combo_hp_cache_mode") else None,
                 "hp_collision_pct": self.spin_threshold.value() if hasattr(self, "spin_threshold") else None,
                 "ignore_floaters": self.chk_ignore_floaters.isChecked() if hasattr(self, "chk_ignore_floaters") else None,
                 "material_slots": self.chk_material_slots.isChecked() if hasattr(self, "chk_material_slots") else None,
@@ -1130,9 +1173,58 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             return
 
         self.log(bg_l10n.text("Support package saved: {path}").format(path=file_path), "lightgreen")
+        cmds.inViewMessage(amg=bg_l10n.text("Log saved"), pos='midCenter', fade=True)
 
     def setup_script_jobs(self):
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
+
+    def _on_hp_worker_progress(self, value):
+        # The main-thread fingerprint/caching phase already filled 0-40% of the
+        # progress dialog; the worker owns the remaining 40-100% band. The worker
+        # still emits a self-contained 0-100, remapped here so the bar advances
+        # once, smoothly, instead of filling twice.
+        try:
+            dlg = getattr(self, "progress_dlg", None)
+            if dlg is not None:
+                dlg.setValue(40 + int(max(0, min(100, int(value or 0))) * 0.60))
+        except RuntimeError:
+            pass
+
+    MANUAL_PROMPT_OPTIONVAR = "BakeGroups_ManualPrompt_Dismissed"
+
+    def _resolve_manual_file(self):
+        """Full path to the bundled PureRef manual, or None (see bg_update)."""
+        return bg_update.resolve_manual_file()
+
+    def maybe_show_manual_prompt(self):
+        """On launch, offer to open the folder holding the PureRef manual - unless
+        the user chose 'Don't show again'. Skipped when the manual is missing or
+        an update dialog is currently open (shows next launch instead)."""
+        try:
+            if getattr(self, '_is_closing', False):
+                return
+            if cmds.optionVar(exists=self.MANUAL_PROMPT_OPTIONVAR) and cmds.optionVar(q=self.MANUAL_PROMPT_OPTIONVAR):
+                return
+            manual = self._resolve_manual_file()
+            if not manual:
+                return
+            dlg = getattr(self, 'update_dialog', None)
+            if dlg is not None:
+                try:
+                    if dlg.isVisible():
+                        return
+                except Exception:
+                    pass
+            choice = bg_update.show_manual_prompt(self)
+            if choice == bg_update.ManualPromptDialog.OPEN:
+                folder = os.path.dirname(manual)
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+                cmds.optionVar(iv=(self.MANUAL_PROMPT_OPTIONVAR, 1))
+            elif choice == bg_update.ManualPromptDialog.NEVER:
+                cmds.optionVar(iv=(self.MANUAL_PROMPT_OPTIONVAR, 1))
+            # LATER -> leave the optionVar unset so it appears again next launch.
+        except Exception:
+            pass
 
     def start_update_check(self):
         if self._is_closing:
@@ -1776,6 +1868,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 self.update_check_timer.stop()
             except RuntimeError:
                 pass
+        if self.manual_prompt_timer:
+            try:
+                self.manual_prompt_timer.stop()
+            except RuntimeError:
+                pass
         dialog = self.update_dialog
         install_worker = getattr(dialog, "install_worker", None) if dialog else None
         if install_worker and install_worker.isRunning():
@@ -1841,6 +1938,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         bg_l10n.localize_widget_tree(self)
         self.refresh_right_panel()
         self.refresh_left_panel()
+        # Rebuild the cage panel in the new language (its labels/combo are built
+        # from bg_l10n at construction, so re-localizing the old tree is unsafe).
+        if getattr(self, 'is_cage_config', False):
+            self.enter_cage_config()
 
     def set_localized_button_state(self, button, key):
         if not button:
@@ -2033,8 +2134,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             layout.setContentsMargins(4, 4, 4, 4)
 
             is_vis = self.subgroup_pair_is_visible(hp_node, lp_node)
-            btn_vis = QtWidgets.QPushButton("Vis" if is_vis else "Hid")
+            btn_vis = QtWidgets.QPushButton()
             btn_vis.setFixedSize(30, 24)
+            btn_vis.setIcon(get_icon("open_eye.png" if is_vis else "close_eye.png"))
+            btn_vis.setIconSize(QtCore.QSize(16, 16))
+            btn_vis.setProperty("bg_i18n_key", "Toggle visibility")
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, b=btn_vis: self.run_undoable_bg_action("Subgroup Visibility", self.toggle_subgroup_vis, h, l, b))
             btn_vis.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -2048,9 +2152,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_name.rightClicked.connect(lambda checked=False, old_name=ui_name, h=hp_node, l=lp_node: self.run_undoable_bg_action("Rename Group", self.rename_subgroup_ui, old_name, h, l))
             layout.addWidget(btn_name, stretch=1)
 
-            btn_plus = QtWidgets.QPushButton("Add")
-            btn_plus.setFixedSize(56, 24)
-            btn_plus.setProperty("bg_no_tooltip", True)
+            btn_plus = QtWidgets.QPushButton()
+            btn_plus.setFixedSize(36, 24)
+            btn_plus.setProperty("bg_i18n_key", "Add selected mesh")
+            btn_plus.setIcon(get_icon("Add.png"))
+            btn_plus.setIconSize(QtCore.QSize(16, 16))
             btn_plus.setStyleSheet(self.subgroup_add_button_style(is_active_subgroup))
             btn_plus.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, pm_hp=hp_main, pm_lp=lp_main: self.run_undoable_bg_action("Add to Group", self.add_to_groups_ui, h, l, pm_hp, pm_lp))
             layout.addWidget(btn_plus)
@@ -2070,8 +2176,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_lock.clicked.connect(lambda checked=False, n=ui_name: self.run_undoable_bg_action("Toggle Group Lock", self.toggle_lock, n))
             layout.addWidget(btn_lock)
 
-            btn_del = QtWidgets.QPushButton("X")
+            btn_del = QtWidgets.QPushButton()
             btn_del.setFixedSize(24, 24)
+            btn_del.setIcon(get_icon("Delete.png"))
+            btn_del.setIconSize(QtCore.QSize(16, 16))
             btn_del.setStyleSheet("background-color: #8c4242;")
             btn_del.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, r_h=hp_main, r_l=lp_main: self.run_undoable_bg_action("Delete Group", self.safe_delete_subgroup_ui, h, l, r_h, r_l))
             layout.addWidget(btn_del)
@@ -2112,13 +2220,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             cmds.isolateSelect(panel, state=self.is_isolated)
             if self.is_isolated:
                 iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
+                # The chapter cage is isolated together with its HP/LP so it
+                # doesn't linger visible (or vanish) out of sync with the chapter.
+                cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(pair.get('base', ''))
+                if not cmds.objExists(cage_grp):
+                    cage_grp = None
                 cmds.isolateSelect(panel, addDagObject=hp_node)
                 cmds.isolateSelect(panel, addDagObject=lp_node)
                 if iso_set:
                     set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
                     if cmds.objExists(set_name):
                         cmds.sets(clear=set_name)
-                nodes_to_add = [n for n in [hp_node, lp_node] if n and cmds.objExists(n)]
+                nodes_to_add = [n for n in [hp_node, lp_node, cage_grp] if n and cmds.objExists(n)]
                 for node in nodes_to_add:
                     cmds.isolateSelect(panel, addDagObject=node)
             cmds.isolateSelect(panel, update=True)
@@ -2159,9 +2272,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.set_localized_button_state(self.btn_toggle_hp, "HP Visible" if hp_vis else "HP Hidden")
         self.btn_toggle_hp.setStyleSheet("background-color: #4a5d4a;" if hp_vis else "background-color: #8c4242;")
 
-        self.btn_toggle_lp.setChecked(lp_vis)
-        self.set_localized_button_state(self.btn_toggle_lp, "LP Visible" if lp_vis else "LP Hidden")
-        self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
+        # In Export Settings with a cage, this button reflects/controls the cage
+        # group visibility instead of LP.
+        cage_grp = self._cage_toggle_node()
+        if cage_grp:
+            cage_vis = bool(cmds.getAttr("{}.visibility".format(cage_grp)))
+            self.btn_toggle_lp.setChecked(cage_vis)
+            self.set_localized_button_state(self.btn_toggle_lp, "Cage Vis" if cage_vis else "Cage Hid")
+            self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if cage_vis else "background-color: #8c4242;")
+        else:
+            self.btn_toggle_lp.setChecked(lp_vis)
+            self.set_localized_button_state(self.btn_toggle_lp, "LP Visible" if lp_vis else "LP Hidden")
+            self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
 
         material_filter = getattr(self, 'active_material_visibility_filter', None)
         group_state = self.get_active_subgroups_visibility_state(hp_node, lp_node, hp_vis, lp_vis)
@@ -2469,18 +2591,40 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             return "none"
         return "partial"
 
+    def _cage_toggle_node(self):
+        """In Export Settings, when the active chapter has a cage, the LP Visible
+        button controls the cage group instead of the LP root. Returns the cage
+        group node in that case, else None (normal LP behaviour)."""
+        if not getattr(self, 'is_final_view', False):
+            return None
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return None
+        base_name = pair.get('base', '')
+        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
+        if cage_grp and cmds.objExists(cage_grp) and bg_cage.CageProcessor.get_chapter_cage_meshes(base_name):
+            return cage_grp
+        return None
+
     def toggle_root_vis(self, type_str, state):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
 
-        if type_str == "LP" and getattr(self, 'is_final_view', False):
-            self.set_final_low_visibility(pair.get('base', ''), state)
-            return
-
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
-        parent_node = hp_node if type_str == "HP" else lp_node
         btn = self.btn_toggle_hp if type_str == "HP" else self.btn_toggle_lp
+
+        # Export Settings + a cage present: the "LP" button toggles the cage
+        # group (labelled Cage Vis/Cage Hid) instead of the LP root.
+        if type_str == "LP":
+            cage_grp = self._cage_toggle_node()
+            if cage_grp:
+                self.set_localized_button_state(btn, "Cage Vis" if state else "Cage Hid")
+                btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
+                cmds.setAttr("{}.visibility".format(cage_grp), state)
+                return
+
+        parent_node = hp_node if type_str == "HP" else lp_node
         self.set_localized_button_state(btn, "{} Visible".format(type_str) if state else "{} Hidden".format(type_str))
         btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
         if parent_node and cmds.objExists(parent_node):
@@ -2523,7 +2667,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             cmds.setAttr("{}.visibility".format(hp), new_state)
         if lp and cmds.objExists(lp):
             cmds.setAttr("{}.visibility".format(lp), new_state)
-        btn_widget.setText(bg_l10n.text("Vis" if new_state else "Hid"))
+        btn_widget.setIcon(get_icon("open_eye.png" if new_state else "close_eye.png"))
         btn_widget.setStyleSheet("background-color: #4a5d4a;" if new_state else "background-color: #8c4242;")
         if getattr(self, 'is_final_view', False):
             pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -2580,11 +2724,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         action_optimize.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Optimize Groups", self.optimize_subgroups))
         action_select_by_mesh = menu.addAction("Group search by mesh (Ctrl+Shift+Z)")
         action_select_by_mesh.triggered.connect(self.select_subgroup_by_selected_mesh)
-        menu.addSeparator()
-        action_select_low = menu.addAction("Select all _low meshes (Active Chapter)")
-        action_select_low.triggered.connect(self.select_all_combined_low_meshes)
-        action_select_book_low = menu.addAction("Select all _low meshes (Entire Book)")
-        action_select_book_low.triggered.connect(self.select_all_book_low_meshes)
         bg_l10n.localize_menu(menu)
         menu.exec_(self.subgroups_widget.mapToGlobal(pos))
 
@@ -2642,67 +2781,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.log("A subgroup has been found and is active: {}".format(found_ui_name), "green")
         else:
             self.log("The selected object does not belong to any subgroup of the active Root.", "yellow")
-
-    def select_all_combined_low_meshes(self):
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not pair:
-            cmds.warning("No active group for selection.")
-            return
-        base_name = pair.get('base', '')
-        chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-        _, lp_main, _ = self.core.resolve_main_nodes(pair)
-        search_root = chapter_grp_path if cmds.objExists(chapter_grp_path) else lp_main
-        if not search_root or not cmds.objExists(search_root):
-            cmds.warning("LP root not found.")
-            return
-        to_select = []
-        lp_children = cmds.listRelatives(search_root, children=True, fullPath=True) or []
-        for child in lp_children:
-            short_name = child.split('|')[-1]
-            is_subgroup = not cmds.listRelatives(child, shapes=True)
-            if "_low" in short_name and not is_subgroup:
-                to_select.append(child)
-        if to_select:
-            cmds.select(to_select, replace=True)
-            cmds.inViewMessage(amg="Selected {} final _low meshes".format(len(to_select)), pos='midCenter', fade=True)
-        else:
-            cmds.warning("Combined _low meshes not found. Run 'Combine Fin' first.")
-            cmds.select(clear=True)
-
-    def select_all_book_low_meshes(self):
-        if not self.active_root_id:
-            cmds.warning("No active chapter to determine book.")
-            return
-        active_pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not active_pair:
-            return
-        active_book = active_pair.get('book')
-        if not active_book:
-            cmds.warning("Active chapter is not linked to any Book.")
-            return
-        book_pairs = [p for p in self.root_pairs if p.get('book') == active_book]
-        if not book_pairs:
-            return
-        to_select = []
-        for pair in book_pairs:
-            base_name = pair.get('base', '')
-            chapter_grp_path = "LP_Combine_BG|{}".format(base_name)
-            _, lp_main, _ = self.core.resolve_main_nodes(pair)
-            search_root = chapter_grp_path if cmds.objExists(chapter_grp_path) else lp_main
-            if not search_root or not cmds.objExists(search_root):
-                continue
-            lp_children = cmds.listRelatives(search_root, children=True, fullPath=True) or []
-            for child in lp_children:
-                short_name = child.split('|')[-1]
-                is_subgroup = not cmds.listRelatives(child, shapes=True)
-                if "_low" in short_name and not is_subgroup:
-                    to_select.append(child)
-        if to_select:
-            cmds.select(to_select, replace=True)
-            cmds.inViewMessage(amg="Selected {} _low meshes in book '{}'".format(len(to_select), active_book), pos='midCenter', fade=True)
-        else:
-            cmds.warning("Combined _low meshes in book '{}' not found.".format(active_book))
-            cmds.select(clear=True)
 
 
 def cleanup_stale_bake_manager_ui():

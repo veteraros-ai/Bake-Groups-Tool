@@ -1,8 +1,7 @@
 {
-  "latest_version": "1.3.7",
-  "package_sha256": "327db5ed1897d2d577b6591d3dceb7070157ea73f9c59cc783ee54eca1105c8b",
+  "latest_version": "1.3.8",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/1ec1d221944d415ba8f713f2ddfb439a963fead9",
-  "release_notes": "Hotfix: Maya 2025 (PySide6) failed to launch the tool at all (TypeError: object.__init__() takes exactly one argument) due to a multiple-inheritance __init__ conflict between MayaQWidgetDockableMixin, QMainWindow and the tool's own mixins. Fixed with no effect on Maya 2024/2026/2027."
+  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main",
+  "release_notes": "Cage system and workflow update. NEW: full Cage toolset in Export Settings - create a cage per subgroup, live scale-adaptive Expansion / Normal-move jog sliders, Sculpt, Find intersections, Solid/Wireframe display toggle and Export Cage; the LP visibility button becomes Cage Vis/Hid when a cage exists. Create Pair now checks the LP material count: one material makes a single chapter, several materials prompt to create one chapter (split by material on Analyze HP) or several chapters - replacing the old 'Create by Mat' button and 'N_Mat' flag; Create Pair moved to a large icon button next to Pick HP/LP. UI: subgroup rows use icon buttons (eye visibility, Add, Delete, smooth +/-), redesigned cage panel with square icons, readable tooltips, Algorithm section collapsed by default. FIXES: the standalone Check button now validates frozen transforms; a red warning shows in Export Settings when the LP is not distributed. DOCS: launch prompt and an update-window button to open the illustrated PureRef manual."
 }
