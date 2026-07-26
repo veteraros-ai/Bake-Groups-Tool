@@ -386,34 +386,54 @@ class FinalExportProcessor(object):
         return new_lp_meshes, new_hp_meshes
 
     @staticmethod
-    def export_chapter(base_name, hp_main, lp_main, final_mesh_widgets, parent_window=None, mode='both', export_dir=None, smooth_states=None):
-        """Prepare meshes, apply smoothing, export, and rollback."""
+    def export_chapter(base_name, hp_main, lp_main, final_mesh_widgets, parent_window=None, mode='both', export_dir=None, smooth_states=None, extra_chapters=None, export_name_override=None):
+        """Prepare meshes, apply smoothing, export, and rollback.
+
+        ``extra_chapters`` (list of {'base','hp','lp','smooth'}) folds several
+        chapters into ONE combined HP/LP file (Export by material, book named
+        after a material), and ``export_name_override`` sets the file base name.
+        With both omitted this behaves exactly as a single-chapter export."""
         if not export_dir:
             export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Export Directory"))
             if not export_dirs: return False
             export_dir = export_dirs[0]
-        
+
         if not cmds.pluginInfo('fbxmaya', query=True, loaded=True):
             cmds.loadPlugin('fbxmaya')
 
         FinalExportProcessor._cleanup_zero_transform_hp_export_temps()
 
+        # Chapters folded into this export - one, unless Export by material.
+        chapters = [{'base': base_name, 'hp': hp_main, 'lp': lp_main, 'smooth': smooth_states or {}}]
+        if extra_chapters:
+            chapters.extend(extra_chapters)
+        name_base = export_name_override or base_name
+
+        def _chapter_for_short(short_lower):
+            for ch in chapters:
+                if short_lower.startswith(str(ch['base']).lower() + "_"):
+                    return ch
+            return chapters[0]
+
         # Determine prefixes and smooth levels (support UI and Batch export)
         prefixes_to_process = []
-        
+
         # LP _low_NNN meshes now live in place inside the LP subgroups under
-        # lp_main (no LP_Combine_BG). Collect them by walking all descendants.
+        # each chapter's lp_main (no LP_Combine_BG). Collect by walking descendants.
         lp_all = []
-        for child in (cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []):
-            shapes = cmds.listRelatives(child, shapes=True, fullPath=True, type='mesh') or []
-            if shapes and not cmds.getAttr(shapes[0] + ".intermediateObject") and "_low" in child.split('|')[-1].lower():
-                lp_all.append(child)
+        for ch in chapters:
+            if not ch['lp'] or not cmds.objExists(ch['lp']):
+                continue
+            for child in (cmds.listRelatives(ch['lp'], allDescendents=True, fullPath=True, type='transform') or []):
+                shapes = cmds.listRelatives(child, shapes=True, fullPath=True, type='mesh') or []
+                if shapes and not cmds.getAttr(shapes[0] + ".intermediateObject") and "_low" in child.split('|')[-1].lower():
+                    lp_all.append(child)
 
         if mode == 'lp':
             if not lp_all:
                 return False
 
-            export_name = "{}_LP".format(base_name).replace(".", "_")
+            export_name = "{}_LP".format(name_base).replace(".", "_")
             export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
             FinalExportProcessor._export_with_lp_triangulation_rollback(lp_all, export_path)
             return export_name
@@ -432,10 +452,11 @@ class FinalExportProcessor(object):
                 if "_low" in lp_short:
                     prefix = lp_short.rsplit("_low", 1)[0]
                     if not any(p['prefix'] == prefix for p in prefixes_to_process):
+                        ch = _chapter_for_short(lp_short)
                         prefixes_to_process.append({
                             'prefix': prefix,
                             'smooth_level': FinalExportProcessor._smooth_level_from_states(
-                                smooth_states or {}, base_name, prefix, default_level=2
+                                ch['smooth'], ch['base'], prefix, default_level=2
                             )
                         })
         
@@ -451,9 +472,13 @@ class FinalExportProcessor(object):
         cmds.refresh(suspend=True)
         
         try:
-            hp_all = FinalExportProcessor.get_valid_mesh_transforms(hp_main)
-            
-            exported_meshes = set() 
+            hp_all = []
+            for ch in chapters:
+                if ch['hp'] and cmds.objExists(ch['hp']):
+                    hp_all.extend(FinalExportProcessor.get_valid_mesh_transforms(ch['hp']))
+            hp_all = list(set(hp_all))
+
+            exported_meshes = set()
             all_to_export = []
             
             for i, item in enumerate(prefixes_to_process):
@@ -571,7 +596,7 @@ class FinalExportProcessor(object):
                 if mode == 'hp': suffix = "_HP"
                 elif mode == 'lp': suffix = "_LP"
                 
-                export_name = "{}{}".format(base_name, suffix).replace(".", "_")
+                export_name = "{}{}".format(name_base, suffix).replace(".", "_")
                 export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
 
                 FinalExportProcessor._export_with_lp_triangulation_rollback(export_nodes, export_path)

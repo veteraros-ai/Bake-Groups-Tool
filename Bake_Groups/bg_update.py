@@ -509,6 +509,22 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.release_notes_box.setMaximumHeight(110)
         layout.addWidget(self.release_notes_box)
 
+        # Contact block - always visible, so users can reach the author with
+        # questions or ideas straight from the About window.
+        self.contact_label = QtWidgets.QLabel(
+            bg_l10n.text("If you have questions or ideas for the script, write to this email."))
+        self.contact_label.setObjectName("UpdateContact")
+        self.contact_label.setWordWrap(True)
+        layout.addWidget(self.contact_label)
+
+        self.contact_email = QtWidgets.QLabel(
+            '<a href="mailto:veteraros@gmail.com" style="color:#8ab4f8;">veteraros@gmail.com</a>')
+        self.contact_email.setObjectName("UpdateContactEmail")
+        self.contact_email.setTextFormat(QtCore.Qt.RichText)
+        self.contact_email.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        self.contact_email.setOpenExternalLinks(True)
+        layout.addWidget(self.contact_email)
+
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(8)
 

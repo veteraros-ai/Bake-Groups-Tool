@@ -105,6 +105,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.lp_data_cache = {}
         self.is_preview_active = False
         self.is_final_view = False
+        # Session-wide Cage Vis/Hid preference: kept across chapter switches in
+        # Export Settings so the cage's shown/hidden state doesn't jump between
+        # chapters (reset to shown on each entry into Export Settings).
+        self.cage_vis_pref = True
         self.is_final_low_visible = False
         self.final_smooth_states = {}
         self.zbrush_triangle_threshold = 50
@@ -332,12 +336,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.btn_toggle_view.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Export Settings", self.toggle_final_view))
 
         self.btn_process_final = QtWidgets.QPushButton("Export")
-        self.btn_process_final.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.btn_process_final.customContextMenuRequested.connect(self.show_export_context_menu)
         self.btn_process_final.setIcon(get_icon("export.png"))
         self.btn_process_final.setFixedHeight(30)
         self.btn_process_final.setStyleSheet("background-color: #27ae60; font-weight: bold; color: white;")
-        self.btn_process_final.clicked.connect(self.export_final_group_ui)
+        self.btn_process_final.clicked.connect(lambda checked=False: self._export_run())
         self.btn_process_final.setVisible(False)
 
         bl_layout.addWidget(self.btn_fs)
@@ -418,7 +420,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.cage_container.setVisible(False)
         self.right_splitter.addWidget(self.cage_container)
 
-        self.right_splitter.setSizes([400, 300, 300])
+        # Export panel lives below Cage Settings; shown only in Export Settings.
+        self.export_container = QtWidgets.QWidget()
+        export_container_layout = QtWidgets.QVBoxLayout(self.export_container)
+        export_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.export_container.setVisible(False)
+        self.right_splitter.addWidget(self.export_container)
+
+        self.right_splitter.setSizes([400, 260, 220, 220])
 
         session_buttons_layout = QtWidgets.QHBoxLayout()
         session_buttons_layout.setSpacing(4)
@@ -433,15 +442,15 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.btn_save_session.clicked.connect(self.manual_save_session)
         session_buttons_layout.addWidget(self.btn_save_session)
 
-        self.btn_load_session = QtWidgets.QPushButton("Load Session")
-        self.btn_load_session.setFixedHeight(30)
-        self.btn_load_session.clicked.connect(self.load_custom_session)
-        session_buttons_layout.addWidget(self.btn_load_session)
-
         self.btn_language = QtWidgets.QPushButton("Language")
         self.btn_language.setFixedHeight(30)
         self.btn_language.clicked.connect(self.show_language_menu)
         session_buttons_layout.addWidget(self.btn_language)
+
+        self.btn_about = QtWidgets.QPushButton("About")
+        self.btn_about.setFixedHeight(30)
+        self.btn_about.clicked.connect(self.show_about_dialog)
+        session_buttons_layout.addWidget(self.btn_about)
 
         right_layout.addLayout(session_buttons_layout)
 
@@ -1000,8 +1009,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         menu.addSeparator()
         action_support_package = menu.addAction(bg_l10n.text("Save Support Package"))
         action_support_package.triggered.connect(self.save_support_package)
-        action_about = menu.addAction(bg_l10n.text("About"))
-        action_about.triggered.connect(self.show_about_dialog)
         menu.addSeparator()
         action_save_debug = menu.addAction(bg_l10n.text("Save Debug Log"))
         action_save_debug.setEnabled(bool(getattr(self, 'last_debug_lines', []) or getattr(self, 'user_action_lines', [])))
@@ -1177,6 +1184,23 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
 
     def setup_script_jobs(self):
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
+        # Persist our settings alongside the scene on every save. SceneSaved
+        # fires AFTER the write, so the scene name is already the new one on a
+        # Save As - get_json_path() then targets the new "<scene>_BakeGroups.json".
+        self.script_jobs.append(cmds.scriptJob(event=["SceneSaved", self.on_scene_saved]))
+
+    def on_scene_saved(self):
+        """Mirror the current session to disk after each scene save. Because the
+        JSON path is derived from the live scene name, a Save As under a new name
+        automatically writes the JSON under that new name too."""
+        try:
+            self.objectName()  # window still alive?
+        except RuntimeError:
+            return
+        try:
+            bg_core.BakeSessionModel.save(getattr(self, 'root_pairs', []) or [])
+        except Exception as e:
+            cmds.warning("Failed to auto-save Bake Groups settings: {}".format(e))
 
     def _on_hp_worker_progress(self, value):
         # The main-thread fingerprint/caching phase already filled 0-40% of the
@@ -1243,9 +1267,17 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         # the actual update check only runs when the user clicks "Check"
         # inside the window (run_manual_update_check).
         if self.update_dialog:
-            self.update_dialog.raise_()
-            self.update_dialog.activateWindow()
-            return
+            # The dialog is only HIDDEN on close (no WA_DeleteOnClose), so a
+            # repeat open must re-show() it - raise/activate alone won't unhide a
+            # closed window. If the underlying C++ object is actually gone, drop
+            # the stale reference and fall through to build a fresh one.
+            try:
+                self.update_dialog.show()
+                self.update_dialog.raise_()
+                self.update_dialog.activateWindow()
+                return
+            except RuntimeError:
+                self.update_dialog = None
         self.update_dialog = bg_update.open_updates_window(self, self.run_manual_update_check)
         self.update_dialog.destroyed.connect(self.clear_update_dialog)
 
@@ -2199,15 +2231,35 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 widget.setStatusTip("")
                 widget.setProperty("bg_status_tip", "")
 
+    def _deselect_cage_meshes(self):
+        """Remove any cage nodes/components from the current selection (cage
+        meshes live under |Cage_BG| and end with the cage suffix). Leaves the
+        rest of the selection untouched."""
+        try:
+            sel = cmds.ls(selection=True, long=True) or []
+        except Exception:
+            return
+        root_tag = "|{}|".format(bg_cage.CAGE_ROOT)
+        cage_sel = [n for n in sel if root_tag in n or bg_cage.SUFFIX_CAGE in n]
+        if cage_sel:
+            try:
+                cmds.select(cage_sel, deselect=True)
+            except Exception:
+                pass
+
     def activate_root(self, pair):
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
         if not hp_node or not lp_node:
             self.active_root_id = pair['id']
             return cmds.warning("Original groups were deleted.")
 
-        if self.active_root_id == pair['id']:
+        is_switch = self.active_root_id != pair['id']
+        if not is_switch:
             self.is_isolated = not self.is_isolated
         else:
+            # Switching chapters drops the previous chapter's cage from the
+            # viewport selection so it can't linger as the Expansion scope.
+            self._deselect_cage_meshes()
             self.active_root_id = pair['id']
             self.active_subgroup_name = None
             self.is_isolated = True
@@ -2248,6 +2300,26 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.restore_subgroup_colors()
         elif color_groups_enabled:
             self.update_subgroup_colors()
+
+        # Switching chapters in Export Settings rebuilds the Cage panel so the
+        # Expansion slider (and every other cage control) targets the NEW
+        # chapter. Without this the panel keeps the previous chapter's closures
+        # and Expansion would inflate the OLD chapter's cage.
+        if is_switch and getattr(self, 'is_final_view', False):
+            self.enter_cage_config()
+            # enter_cage_config force-shows the whole cage subtree
+            # (_ensure_cage_visible), so re-apply the session-wide Cage Vis/Hid
+            # preference to the chapter group here - AFTER the rebuild - and
+            # refresh the button so both the mesh and the button match (hiding
+            # the cage in one chapter stays hidden in the next).
+            new_cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(pair.get('base', ''))
+            if cmds.objExists(new_cage_grp):
+                try:
+                    cmds.setAttr(new_cage_grp + ".visibility",
+                                 bool(getattr(self, 'cage_vis_pref', True)))
+                except Exception:
+                    pass
+            self.sync_toggle_buttons(hp_node, lp_node)
 
     def select_meshes_in_group(self, hp_grp, lp_grp):
         to_select = []
@@ -2619,6 +2691,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if type_str == "LP":
             cage_grp = self._cage_toggle_node()
             if cage_grp:
+                # Remember the choice session-wide so it carries to other
+                # chapters (see activate_root).
+                self.cage_vis_pref = bool(state)
                 self.set_localized_button_state(btn, "Cage Vis" if state else "Cage Hid")
                 btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
                 cmds.setAttr("{}.visibility".format(cage_grp), state)

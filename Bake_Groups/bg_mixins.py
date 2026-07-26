@@ -2793,6 +2793,17 @@ class FinalViewMixin:
             cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
             if cmds.objExists(cage_grp):
                 cmds.setAttr(cage_grp + ".visibility", bool(self.is_final_view))
+            # The whole Cage_BG root is only relevant inside Export Settings:
+            # hide the entire cage hierarchy on Back and show the root again on
+            # entry (per-chapter groups keep their own state underneath).
+            cage_root = "|{}".format(bg_cage.CAGE_ROOT)
+            if cmds.objExists(cage_root):
+                cmds.setAttr(cage_root + ".visibility", bool(self.is_final_view))
+            # Entering Export Settings shows the cage, so reset the session-wide
+            # Cage Vis/Hid preference to "shown"; it then persists across chapter
+            # switches (see activate_root / toggle_root_vis).
+            if self.is_final_view:
+                self.cage_vis_pref = True
 
             self.is_final_low_visible = False
 
@@ -3800,18 +3811,8 @@ class FinalViewMixin:
         _refresh_display_btn()
         btn_display.clicked.connect(toggle_display)
 
-        # Whether this chapter's cage rides along with the regular chapter
-        # export (always as its own {base}_cage.fbx) - replaces the old
-        # standalone "Export Cage" button. On by default.
-        cb_export = QtWidgets.QCheckBox(bg_l10n.text("Export cage with chapter"))
-        cb_export.setChecked(bool((pair.get('cage_settings') or {}).get('export_enabled', True)))
-
-        def toggle_export_enabled(checked):
-            cage_settings = pair.setdefault('cage_settings', {})
-            cage_settings['export_enabled'] = bool(checked)
-            bg_core.BakeSessionModel.save(self.root_pairs)
-
-        cb_export.toggled.connect(toggle_export_enabled)
+        # (The old "Export cage with chapter" checkbox moved to the Export panel's
+        #  Cage include-checkbox.)
 
         btn_fit = QtWidgets.QPushButton(bg_l10n.text("Fit to HP"))
         btn_fit.setStyleSheet("background-color: #8e44ad; font-weight: bold; color: white;")
@@ -3944,15 +3945,13 @@ class FinalViewMixin:
         # --- Assemble the panel in final visual order ------------------------
         # Build/sculpt/look buttons sit directly under the header, then the
         # Expansion jog. Find + Export Cage + Clear share one row above the
-        # Normal move jog. The "export with chapter" checkbox is pinned to the
-        # very bottom; the status line sits just above it.
+        # Normal move jog. Status line pinned to the bottom.
         outer.addLayout(_btn_row(btn_create, btn_brush, btn_display))
         add_labeled("Expansion (inflate)", inflate_row)
         outer.addWidget(btn_fit)  # hidden, kept for later
         outer.addLayout(_btn_row(btn_find, btn_export_cage, btn_clear))
         add_labeled("Normal move", ix_row)
         outer.addStretch(1)
-        outer.addWidget(cb_export)
         outer.addWidget(status)
 
         # No auto-build on entry: the artist presses Create Cage explicitly.
@@ -4140,6 +4139,17 @@ class FinalViewMixin:
             old.deleteLater()
         self.cage_panel = self.build_cage_settings_panel(pair)
         layout.addWidget(self.cage_panel)
+        # Export panel lives right below the cage panel.
+        exp_container = getattr(self, 'export_container', None)
+        if exp_container is not None:
+            elayout = exp_container.layout()
+            eold = getattr(self, 'export_panel', None)
+            if eold is not None:
+                elayout.removeWidget(eold)
+                eold.deleteLater()
+            self.export_panel = self.build_export_panel(pair)
+            elayout.addWidget(self.export_panel)
+            exp_container.setVisible(True)
         # Show the cage panel (under the TOC) and hide the Matcher for more room.
         if not was_active and hasattr(self, 'right_splitter'):
             self._saved_right_sizes = self.right_splitter.sizes()
@@ -4156,21 +4166,32 @@ class FinalViewMixin:
         if not getattr(self, 'is_cage_config', False):
             return
         splitter = getattr(self, 'right_splitter', None)
-        panel = getattr(self, 'cage_panel', None)
-        if splitter is None or panel is None:
+        cage_panel = getattr(self, 'cage_panel', None)
+        export_panel = getattr(self, 'export_panel', None)
+        if splitter is None or cage_panel is None:
             return
         total = splitter.height()
         if total <= 0:
             return
-        cage_h = max(140, min(panel.sizeHint().height(), total - 140))
-        # [Matcher (hidden), Table of Contents, Cage panel]
-        splitter.setSizes([0, total - cage_h, cage_h])
+        cage_h = cage_panel.sizeHint().height()
+        exp_h = export_panel.sizeHint().height() if export_panel is not None else 0
+        bottom = cage_h + exp_h
+        if bottom > total - 120 and bottom > 0:
+            scale = max(total - 120, 200) / float(bottom)
+            cage_h = int(cage_h * scale)
+            exp_h = int(exp_h * scale)
+        toc_h = max(120, total - cage_h - exp_h)
+        # [Matcher (hidden), Table of Contents, Cage panel, Export panel]
+        splitter.setSizes([0, toc_h, cage_h, exp_h])
 
     def exit_cage_config(self):
         self.is_cage_config = False
         container = getattr(self, 'cage_container', None)
         if container is not None:
             container.setVisible(False)
+        exp_container = getattr(self, 'export_container', None)
+        if exp_container is not None:
+            exp_container.setVisible(False)
         if hasattr(self, 'gt_widget'):
             self.gt_widget.setVisible(True)
         # Restore the splitter proportions the Matcher had before cage config.
@@ -4304,39 +4325,6 @@ class FinalViewMixin:
 class ExportMixin:
     """Methods for final export, batch export, and combine."""
 
-    def show_export_context_menu(self, point):
-        menu = QtWidgets.QMenu(self)
-        try:
-            menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
-        except AttributeError:
-            menu.setStyleSheet("QMenu { background-color: #242424; color: #ddd; border: 1px solid #444; } QMenu::item:selected { background-color: #3e3e3e; }")
-
-        menu_book = menu.addMenu("Export Book")
-        action_book_sep = menu_book.addAction("Separate HP and LP")
-        action_book_both = menu_book.addAction("HP+LP in single file")
-
-        menu_lp = menu.addMenu("Export LP")
-        action_lp_chapter = menu_lp.addAction("Chapter")
-        action_lp_book = menu_lp.addAction("Book")
-
-        menu_hp = menu.addMenu("Export HP")
-        action_hp_chapter = menu_hp.addAction("Chapter")
-        action_hp_book = menu_hp.addAction("Book")
-
-        action_book_sep.triggered.connect(lambda: self.batch_export_book(mode='separate'))
-        action_book_both.triggered.connect(lambda: self.batch_export_book(mode='both'))
-        action_lp_chapter.triggered.connect(self.export_active_lp_only)
-        action_lp_book.triggered.connect(self.batch_export_lp_book)
-        action_hp_chapter.triggered.connect(lambda: self.export_final_group_ui(mode='hp'))
-        action_hp_book.triggered.connect(lambda: self.batch_export_book(mode='hp'))
-        bg_l10n.localize_menu(menu)
-
-        target_button = getattr(self, 'btn_process_final', None) or getattr(self, 'btn_export', None)
-        if target_button:
-            menu.exec_(target_button.mapToGlobal(point))
-        else:
-            menu.exec_(QtGui.QCursor.pos())
-
     def export_final_group_ui(self, mode='separate'):
         if isinstance(mode, bool):
             mode = 'separate'
@@ -4434,6 +4422,337 @@ class ExportMixin:
                     # its own file, whenever it exists and is enabled.
                     self.export_chapter_cage_if_enabled(pair, export_dir)
         cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
+
+    def export_by_material(self, scope='active'):
+        """Export by material. Per book: if the BOOK name matches one of the LP
+        materials (regular creation - book named after the material), all its
+        chapters are merged into one {book}_HP.fbx + {book}_LP.fbx; otherwise the
+        book is just a container (e.g. Book_01 with material-named chapters), so
+        each chapter is exported on its own as {chapter}_HP.fbx / {chapter}_LP.fbx.
+        ``scope`` 'active' = the active chapter's book; 'all' = every book."""
+        if not self.root_pairs:
+            return cmds.warning("Chapter list is empty.")
+        if scope == 'active':
+            pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+            if not pair:
+                return cmds.warning("No active chapter selected.")
+            book = pair.get('book')
+            if not book:
+                return cmds.warning("Active chapter is not in any book.")
+            books = [book]
+        else:
+            books = sorted(set(p.get('book') for p in self.root_pairs if p.get('book')))
+            if not books:
+                return cmds.warning("No books to export by material.")
+
+        export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Folder for Export by Material"))
+        if not export_dirs:
+            return
+        export_dir = export_dirs[0]
+        self.disable_preview_smoothing_for_export()
+
+        total = 0
+        with self.suspend_subgroup_color_preview():
+            with self.suspend_isolation():
+                self.log("Export by material (isolation disabled)...", "lightblue")
+                for book in books:
+                    total += self._export_book_by_material(book, export_dir)
+        cmds.select(clear=True)
+        cmds.inViewMessage(amg="Export by material: {} FBX pair(s) written.".format(total), pos='midCenter', fade=True)
+
+    def _export_book_by_material(self, book, export_dir, inc_hp=True, inc_lp=True, inc_cage=True):
+        """Export one book by material. If the book name IS a material, merge all
+        chapters into one {book}_HP/LP/cage; otherwise the book is a container so
+        each chapter goes out on its own (named by chapter). ``inc_*`` pick which
+        parts to write. Returns how many chapters/files groups were written."""
+        book_pairs = [p for p in self.root_pairs if p.get('book') == book]
+        chapters = []
+        material_names = set()
+        for pair in book_pairs:
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            if not hp_main or not lp_main:
+                continue
+            base_name = pair.get('base', 'Chapter')
+            self.finalize_subgroup_naming(base_name, hp_main, lp_main)
+            chapters.append({'base': base_name, 'hp': hp_main, 'lp': lp_main,
+                             'smooth': pair.get('final_smooth_states', {}), 'pair': pair})
+            for mesh_node in self.mesh_transform_nodes_under(lp_main):
+                for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+                    mat = rec.get("material") or rec.get("key")
+                    if mat:
+                        material_names.add(self._clean_material_book_name(mat).lower())
+        if not chapters:
+            self.log("Export by material: book '{}' has no exportable chapters.".format(book), "orange")
+            return 0
+
+        book_is_material = self._clean_material_book_name(book).lower() in material_names
+        file_base = self._sanitize_export_name(book)
+
+        if book_is_material:
+            primary, extra = chapters[0], chapters[1:]
+            wrote = False
+            if inc_hp and bg_final_export.FinalExportProcessor.export_chapter(
+                    primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='hp',
+                    export_dir=export_dir, smooth_states=primary['smooth'],
+                    extra_chapters=extra, export_name_override=file_base):
+                wrote = True
+            if inc_lp and bg_final_export.FinalExportProcessor.export_chapter(
+                    primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
+                    export_dir=export_dir, smooth_states=primary['smooth'],
+                    extra_chapters=extra, export_name_override=file_base):
+                wrote = True
+            if inc_cage:
+                self._export_book_cage_merged(chapters, file_base, export_dir)
+            if wrote:
+                self.log("Export by material: book '{}' (material) -> {}_*.fbx.".format(book, file_base), "lightgreen")
+                return 1
+            return 0
+
+        # Container book -> each chapter as its own file (named by chapter).
+        done = 0
+        for ch in chapters:
+            if self._export_chapter_files(ch['pair'], export_dir, inc_hp, inc_lp, inc_cage, single=False):
+                done += 1
+        self.log("Export by material: book '{}' (container) -> {} chapter(s).".format(book, done), "lightgreen")
+        return done
+
+    def _export_book_cage_merged(self, chapters, file_base, export_dir):
+        """Merge every chapter's cage into one {file_base}_cage.fbx (used when a
+        book is exported as a single material file)."""
+        cage_meshes = []
+        for ch in chapters:
+            cage_meshes.extend(bg_cage.CageProcessor.get_chapter_cage_meshes(ch['base']))
+        if not cage_meshes:
+            return
+        export_name = "{}_cage".format(file_base)
+        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
+        else:
+            cmds.warning("Cage export failed for '{}'.".format(file_base))
+
+    def _export_chapter_cage(self, pair, export_dir):
+        """Export the chapter's cage as {base}_cage.fbx (triangulated). Cage
+        inclusion is now decided by the Export panel's Cage checkbox, so this
+        always exports when a cage exists (no per-chapter flag)."""
+        base_name = pair.get('base', 'Chapter')
+        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        if not cage_meshes:
+            return False
+        export_name = "{}_cage".format(base_name)
+        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
+            return True
+        cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
+        return False
+
+    def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage, single):
+        """Export one chapter's requested parts. ``single`` merges HP+LP into one
+        file only when both are included; otherwise HP and LP go to separate
+        files. Returns True if anything was written."""
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not lp_main:
+            return False
+        base_name = pair.get('base', 'Chapter')
+        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
+        smooth = pair.get('final_smooth_states', {})
+        wrote = False
+        if single and inc_hp and inc_lp:
+            if bg_final_export.FinalExportProcessor.export_chapter(
+                    base_name, hp_main, lp_main, [], parent_window=self, mode='both',
+                    export_dir=export_dir, smooth_states=smooth):
+                wrote = True
+        else:
+            if inc_hp and bg_final_export.FinalExportProcessor.export_chapter(
+                    base_name, hp_main, lp_main, [], parent_window=self, mode='hp',
+                    export_dir=export_dir, smooth_states=smooth):
+                wrote = True
+            if inc_lp and bg_final_export.FinalExportProcessor.export_chapter(
+                    base_name, hp_main, lp_main, [], parent_window=self, mode='lp',
+                    export_dir=export_dir, smooth_states=smooth):
+                wrote = True
+        if inc_cage and self._export_chapter_cage(pair, export_dir):
+            wrote = True
+        return wrote
+
+    def _scene_name_base(self):
+        scene = cmds.file(query=True, sceneName=True) or ""
+        base = os.path.splitext(os.path.basename(scene))[0]
+        return self._sanitize_export_name(base) if base else "Scene"
+
+    def _export_lp_combined(self, pairs, file_base, export_dir):
+        """Merge the LP of every given chapter into one {file_base}_LP.fbx
+        (triangulated). Used by the 'LP in one file' option. Returns the file
+        base name written, or None."""
+        chapters = []
+        for pair in pairs:
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            if not lp_main:
+                continue
+            base_name = pair.get('base', 'Chapter')
+            self.finalize_subgroup_naming(base_name, hp_main, lp_main)
+            chapters.append({'base': base_name, 'hp': hp_main, 'lp': lp_main,
+                             'smooth': pair.get('final_smooth_states', {})})
+        if not chapters:
+            return None
+        primary, extra = chapters[0], chapters[1:]
+        name = bg_final_export.FinalExportProcessor.export_chapter(
+            primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
+            export_dir=export_dir, smooth_states=primary['smooth'],
+            extra_chapters=extra, export_name_override=file_base)
+        if name:
+            self.log("LP (one file) exported: {}.fbx".format(name), "lightgreen")
+        return name
+
+    def build_export_panel(self, pair):
+        """Docked Export panel (under Cage Settings, Export Settings mode only).
+        Replaces the old right-click export menu."""
+        panel = QtWidgets.QWidget()
+        panel.setStyleSheet(bg_core.BakeConfig.STYLE_MAIN + " QCheckBox:disabled { color: #666666; }")
+        outer = QtWidgets.QVBoxLayout(panel)
+        outer.setContentsMargins(4, 4, 4, 4)
+
+        header = QtWidgets.QLabel(bg_l10n.text("EXPORT"))
+        header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setStyleSheet("font-weight: bold; background-color: #23402a; border: 1px solid #356b45; padding: 6px;")
+        outer.addWidget(header)
+
+        def _lbl(text_key):
+            lb = QtWidgets.QLabel(bg_l10n.text(text_key))
+            lb.setStyleSheet("color: #bbbbbb; margin-top: 4px;")
+            outer.addWidget(lb)
+
+        self.exp_scope = QtWidgets.QComboBox()
+        self.exp_scope.addItems([bg_l10n.text("Active Chapter"), bg_l10n.text("Active Book"), bg_l10n.text("All Books")])
+        self.exp_scope.setStyleSheet(
+            "QComboBox { background-color: #2f5d3a; color: #ffffff; font-weight: bold; font-size: 13px;"
+            " border: 1px solid #59a06e; border-radius: 4px; padding: 6px 10px; margin-top: 4px; }"
+            "QComboBox:hover { background-color: #367046; border: 1px solid #6fbf86; }"
+            "QComboBox QAbstractItemView { background-color: #223528; color: #eaeaea; selection-background-color: #367046; }")
+        outer.addWidget(self.exp_scope)
+
+        _lbl("Include")
+        inc_row = QtWidgets.QHBoxLayout()
+        self.exp_inc_hp = QtWidgets.QCheckBox("HP"); self.exp_inc_hp.setChecked(True)
+        self.exp_inc_lp = QtWidgets.QCheckBox("LP"); self.exp_inc_lp.setChecked(True)
+        self.exp_inc_cage = QtWidgets.QCheckBox(bg_l10n.text("Cage")); self.exp_inc_cage.setChecked(True)
+        for w in (self.exp_inc_hp, self.exp_inc_lp, self.exp_inc_cage):
+            inc_row.addWidget(w)
+        inc_row.addStretch(1)
+        outer.addLayout(inc_row)
+
+        _lbl("Files")
+        files_row = QtWidgets.QHBoxLayout()
+        self.exp_files_sep = QtWidgets.QRadioButton(bg_l10n.text("Separate")); self.exp_files_sep.setChecked(True)
+        self.exp_files_one = QtWidgets.QRadioButton(bg_l10n.text("HP+LP one file"))
+        self._exp_files_group = QtWidgets.QButtonGroup(panel)
+        self._exp_files_group.addButton(self.exp_files_sep)
+        self._exp_files_group.addButton(self.exp_files_one)
+        files_row.addWidget(self.exp_files_sep)
+        files_row.addWidget(self.exp_files_one)
+        files_row.addStretch(1)
+        outer.addLayout(files_row)
+
+        flags_row = QtWidgets.QHBoxLayout()
+        self.exp_bymat = QtWidgets.QCheckBox(bg_l10n.text("By material"))
+        self.exp_lp_one = QtWidgets.QCheckBox(bg_l10n.text("LP in one file"))
+        flags_row.addWidget(self.exp_bymat)
+        flags_row.addWidget(self.exp_lp_one)
+        flags_row.addStretch(1)
+        outer.addLayout(flags_row)
+
+        def _update_scope_flags():
+            # 'By material' and 'LP in one file' make no sense for one chapter -
+            # grey them out so the artist sees they are unavailable.
+            is_chapter = self.exp_scope.currentIndex() == 0
+            for cb in (self.exp_bymat, self.exp_lp_one):
+                cb.setEnabled(not is_chapter)
+                if is_chapter:
+                    cb.setChecked(False)
+        self.exp_scope.currentIndexChanged.connect(lambda _idx: _update_scope_flags())
+        _update_scope_flags()
+
+        self.exp_status = QtWidgets.QLabel("")
+        self.exp_status.setWordWrap(True)
+        self.exp_status.setStyleSheet("color: #a9d6b4;")
+        outer.addWidget(self.exp_status)
+        outer.addStretch(1)
+
+        # Note: no localize_widget_tree here - it rewrites QComboBox items via
+        # 'combo:' keys and would revert them to English. All texts are already
+        # set with bg_l10n.text() and the panel rebuilds on language change.
+        return panel
+
+    def _export_run(self):
+        """Launched by the main Export button. Reads the Export panel settings."""
+        if not hasattr(self, 'exp_scope'):
+            return self.export_final_group_ui('separate')  # panel not built (fallback)
+        inc_hp = self.exp_inc_hp.isChecked()
+        inc_lp = self.exp_inc_lp.isChecked()
+        inc_cage = self.exp_inc_cage.isChecked()
+        if not (inc_hp or inc_lp or inc_cage):
+            return cmds.warning("Nothing selected to export (Include HP / LP / Cage).")
+        single = self.exp_files_one.isChecked()
+        scope = self.exp_scope.currentIndex()
+        by_mat = self.exp_bymat.isChecked() and scope != 0
+        lp_one = self.exp_lp_one.isChecked() and scope != 0
+
+        books = []
+        targets = []
+        if scope == 0:
+            pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+            if not pair:
+                return cmds.warning("No active chapter selected.")
+            targets = [pair]
+        elif scope == 1:
+            pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+            if not pair:
+                return cmds.warning("No active chapter selected.")
+            book = pair.get('book')
+            if not book:
+                return cmds.warning("Active chapter is not in a book.")
+            books = [book]
+            targets = [p for p in self.root_pairs if p.get('book') == book]
+        else:
+            books = sorted(set(p.get('book') for p in self.root_pairs if p.get('book')))
+            targets = list(self.root_pairs)
+        if not targets:
+            return cmds.warning("Nothing to export in this scope.")
+
+        export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Export Directory"))
+        if not export_dirs:
+            return
+        export_dir = export_dirs[0]
+        self.disable_preview_smoothing_for_export()
+
+        # 'LP in one file' pulls LP out of the per-chapter/by-material loop into a
+        # single combined file; HP and Cage still follow the other settings.
+        eff_inc_lp = inc_lp and not lp_one
+        n = 0
+        with self.suspend_subgroup_color_preview():
+            with self.suspend_isolation():
+                if lp_one and inc_lp:
+                    if scope == 1:
+                        lp_base = self._sanitize_export_name(books[0])
+                        lp_pairs = targets
+                    else:
+                        lp_base = self._scene_name_base()
+                        lp_pairs = list(self.root_pairs)
+                    if self._export_lp_combined(lp_pairs, lp_base, export_dir):
+                        n += 1
+                if inc_hp or inc_cage or eff_inc_lp:
+                    if by_mat:
+                        for book in books:
+                            n += self._export_book_by_material(book, export_dir, inc_hp, eff_inc_lp, inc_cage)
+                    else:
+                        for p in targets:
+                            if self._export_chapter_files(p, export_dir, inc_hp, eff_inc_lp, inc_cage, single):
+                                n += 1
+        cmds.select(clear=True)
+        if hasattr(self, 'exp_status'):
+            self.exp_status.setText(bg_l10n.text("Exported {n} item(s).").format(n=n))
+        cmds.inViewMessage(amg="Export: {} item(s).".format(n), pos='midCenter', fade=True)
 
     def export_active_lp_only(self):
         if not self.active_root_id:
@@ -6459,6 +6778,137 @@ class SceneInteractionMixin:
                     keys.add(key)
         return len(keys)
 
+    # Fixed (non-localized) name of the special book for multi-material chapters.
+    # Kept ASCII so it stays filename-safe if later used for export naming.
+    MULTIMATERIAL_BOOK = "Multimaterial"
+
+    @staticmethod
+    def _clean_material_book_name(mat):
+        """Turn a material name into a clean book/chapter/file name: drop namespace
+        and DAG path, strip common material affixes (T_ / M_ / Mat_ prefixes and
+        _M / _MAT / _MATERIAL suffixes), keep only filename-safe chars."""
+        short = str(mat or "").split('|')[-1].split(':')[-1]
+        short = re.sub(r'^(?:T|M|MAT|Mat)_', '', short, flags=re.IGNORECASE)
+        short = re.sub(r'_(?:M|MAT|Mat|MATERIAL)$', '', short, flags=re.IGNORECASE)
+        short = re.sub(r'[^A-Za-z0-9_]+', '_', short).strip('_')
+        return short or "Material"
+
+    @staticmethod
+    def _sanitize_export_name(name):
+        return re.sub(r'[^A-Za-z0-9_\-]+', '_', str(name)).strip('_') or "Export"
+
+    def _material_split_slots(self, pair):
+        """For a multi-material chapter distributed by the artist into M01/M02...
+        subgroups, return {slot: {'hp': [groups], 'lp': [groups]}}. Returns None
+        when the chapter is NOT splittable: fewer than 2 material slots, or ANY LP
+        mesh carries more than one material (can't be cleanly separated)."""
+        if not pair:
+            return None
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not lp_main:
+            return None
+        slots = {}
+        for root, key in ((hp_main, 'hp'), (lp_main, 'lp')):
+            for g in (cmds.listRelatives(root, children=True, fullPath=True, type='transform') or []):
+                if cmds.listRelatives(g, shapes=True):
+                    return None  # a loose mesh under the root - not cleanly splittable
+                slot = self.material_slot_from_subgroup_name(g)
+                if not slot:
+                    return None  # a subgroup without a material slot - not fully distributed
+                slots.setdefault(slot, {'hp': [], 'lp': []})[key].append(g)
+        if len(slots) < 2:
+            return None
+        # Block if any LP mesh is multi-material (several materials on one mesh).
+        for mesh in self.mesh_transform_nodes_under(lp_main):
+            if len(self.lp_material_records_for_node(mesh, include_faces=False)) > 1:
+                return None
+        return slots
+
+    def split_chapter_by_material(self, pair_id):
+        """Split a distributed multi-material chapter into one chapter per material
+        slot (moving the existing M01/M02 subgroups into new chapters named after
+        the material), grouped in a new Book_NN. The original chapter is removed."""
+        pair = next((p for p in self.root_pairs if p['id'] == pair_id), None)
+        if not pair:
+            return
+        slots = self._material_split_slots(pair)
+        if not slots:
+            return cmds.warning("This chapter cannot be split by material "
+                                "(needs >=2 material slots and no multi-material LP mesh).")
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+
+        with bg_core.undo_chunk("SplitByMaterial"):
+            book_name = self._create_by_mat_next_book_name()
+            used_bases = set(str(p.get('base', '')) for p in self.root_pairs)
+            new_pairs = []
+            for slot in sorted(slots.keys()):
+                groups = slots[slot]
+                # Material name = the material sitting on this slot's LP meshes.
+                matname = slot
+                for lp_sub in groups['lp']:
+                    for mesh in self.mesh_transform_nodes_under(lp_sub):
+                        recs = self.lp_material_records_for_node(mesh, include_faces=False)
+                        if recs:
+                            matname = recs[0].get('material') or recs[0].get('key') or slot
+                            break
+                    if matname != slot:
+                        break
+                base = self._create_by_mat_safe_base(self._clean_material_book_name(matname), used_bases)
+
+                hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP)
+                lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP)
+                hp_root = (cmds.ls(hp_root, long=True) or [hp_root])[0]
+                lp_root = (cmds.ls(lp_root, long=True) or [lp_root])[0]
+                hp_move = [g for g in groups['hp'] if cmds.objExists(g)]
+                lp_move = [g for g in groups['lp'] if cmds.objExists(g)]
+                if hp_move:
+                    cmds.parent(hp_move, hp_root, absolute=True)
+                if lp_move:
+                    cmds.parent(lp_move, lp_root, absolute=True)
+                new_pairs.append({
+                    "id": str(uuid.uuid4()), "base": base,
+                    "hp_uuid": cmds.ls(hp_root, uuid=True)[0],
+                    "lp_uuid": cmds.ls(lp_root, uuid=True)[0],
+                    "locked": [], "book": book_name, "final_smooth_states": {}})
+
+            self.root_pairs.extend(new_pairs)
+            self.root_pairs = [p for p in self.root_pairs if p['id'] != pair_id]
+            for n in (hp_main, lp_main):
+                if n and cmds.objExists(n):
+                    try:
+                        cmds.delete(n)
+                    except Exception:
+                        pass
+            if hasattr(self.core, 'root_pairs'):
+                self.core.root_pairs = self.root_pairs
+            if hasattr(self.core, '_node_cache'):
+                self.core._node_cache.clear()
+            bg_core.BakeSessionModel.save(self.root_pairs)
+
+        self.refresh_right_panel()
+        if new_pairs:
+            self.activate_root(new_pairs[0])
+        self.log("Split by material: {} chapter(s) created in {}.".format(len(new_pairs), book_name), "lightgreen")
+
+    def _auto_book_name_for_lp(self, lp_node):
+        """Book name for a freshly created REGULAR chapter, from its LP
+        material(s): the cleaned material name for a single material, the special
+        'Multimaterial' book for several, or '' (no book) when none is found."""
+        names = set()
+        try:
+            for mesh_node in self.mesh_transform_nodes_under(lp_node):
+                for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+                    mat = rec.get("material") or rec.get("key")
+                    if mat:
+                        names.add(mat.split('|')[-1].split(':')[-1])
+        except Exception:
+            return ""
+        if not names:
+            return ""
+        if len(names) > 1:
+            return self.MULTIMATERIAL_BOOK
+        return self._clean_material_book_name(next(iter(names)))
+
     def create_pair_smart(self):
         """Create-pair entry point. Inspect how many materials the picked LP
         has: one -> a normal single chapter; several -> ask whether to keep it as
@@ -6541,6 +6991,14 @@ class SceneInteractionMixin:
                   "lp_uuid": cmds.ls(lp_node, uuid=True)[0],
                   "locked": [], "book": "", "final_smooth_states": {},
                   "material_slots": bool(material_slots)}
+            # Auto-book by LP material - ONLY for regular chapter creation (not the
+            # N_Mat 'one chapter' path, and not Create-by-material). Single material
+            # -> a book named after it; several -> the special 'Multimaterial' book;
+            # none -> left bookless.
+            if not material_slots:
+                auto_book = self._auto_book_name_for_lp(lp_node)
+                if auto_book:
+                    np['book'] = auto_book
             self.root_pairs.append(np)
             bg_core.BakeSessionModel.save(self.root_pairs)
             self.picked_hp, self.picked_lp = None, None
@@ -7696,6 +8154,14 @@ class TOCMixin:
             act_find_lost = QAction("Find Lost (beta)", self)
             act_find_lost.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Find Lost", self.find_lost_meshes_from_selection, p_id))
             menu.addAction(act_find_lost)
+
+            # Only for a multi-material chapter the artist already distributed into
+            # M01/M02... subgroups (and with no multi-material LP mesh).
+            if self._material_split_slots(clicked_pair):
+                act_split = QAction("Split by materials", self)
+                _f = act_split.font(); _f.setBold(True); act_split.setFont(_f)
+                act_split.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Split by Material", self.split_chapter_by_material, p_id))
+                menu.addAction(act_split)
 
             menu.addSeparator()
 
