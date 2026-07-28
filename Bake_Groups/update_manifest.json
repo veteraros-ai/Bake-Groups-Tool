@@ -1,7 +1,8 @@
 {
   "latest_version": "1.4.0",
+  "package_sha256": "d3502be7887eadbbf1541c0dd4abdb70c0466b38c4b3ebca5381051ecaa3838b",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/refs/heads/main",
+  "package_url": "https://codeload.github.com/veteraros-ai/Bake-Groups-Tool/zip/2a6496b9fb557f2496a53d267ae6963fd2c3b98d",
   "release_notes": "Cage/chapter visibility and localization fixes. FIXES: the Cage Vis/Hid state now sticks through Expansion and Sculpt - hiding a cage no longer gets silently undone and the button matches the cage; switching chapters inside Export Settings now keeps the new chapter's LP hidden instead of showing it; the whole Cage_BG hierarchy stays hidden outside Export Settings (re-checked on chapter switch and on HP/LP Visible). VISIBILITY: the HP Visible and LP Visible buttons now reveal meshes that were hidden at their own level inside subgroups and so were previously unreachable from the tool; clicking a chapter that was hidden via its Eye flag now reveals it and turns the flag back on. LOCALIZATION: completed the Japanese and Chinese translations - Cage Settings and Export panels, status messages and dialogs, and the last English tooltips (cage tool buttons, Cage Vis/Hid)."
 }
