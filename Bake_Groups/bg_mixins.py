@@ -3668,6 +3668,9 @@ class FinalViewMixin:
                 cmds.select(clear=True)
             except Exception:
                 pass
+            # Creating the cage is an explicit "show me the cage" action, so reset
+            # the Cage Vis/Hid preference to shown before _ensure_cage_visible.
+            self.cage_vis_pref = True
             self._ensure_cage_visible(pair)
             # The cage now exists: flip the LP Visible button to Cage Vis.
             self.sync_toggle_buttons(hp_main, lp_main)
@@ -3979,25 +3982,33 @@ class FinalViewMixin:
             pass
 
     def _ensure_cage_visible(self, pair):
-        """Make the whole chapter cage hierarchy (group, mirrored folders and all
-        cage meshes) plus its parents visible, then hide the cages of subgroups
-        the artist has toggled off via 'Vis'."""
+        """Set up the chapter cage hierarchy (mirrored folders and all cage
+        meshes) plus its parents visible, mirror the per-subgroup 'Vis' state
+        onto the cages, then pin the CHAPTER GROUP to the session-wide Cage
+        Vis/Hid preference as the final word - so a cage the artist hid stays
+        hidden across Expansion, Sculpt, chapter switches, etc. Callers that must
+        force the cage on (Create Cage, entering Export Settings) set
+        ``cage_vis_pref = True`` first."""
         base_name = pair.get('base', 'Chapter')
         chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
         if not cmds.objExists(chapter):
             return
-        # Whole subtree (folders + meshes).
-        for node in [chapter] + (cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []):
+        # Folders + meshes under the chapter. Their effective visibility is still
+        # gated by the chapter group, which is pinned to the preference below.
+        for node in cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []:
             self._set_visible(node, True)
-        # Parents up to the root.
+        # Parents up to the root always visible so the chapter CAN show at all.
         parents = cmds.listRelatives(chapter, parent=True, fullPath=True)
         node = parents[0] if parents else None
         while node and cmds.objExists(node):
             self._set_visible(node, True)
             parents = cmds.listRelatives(node, parent=True, fullPath=True)
             node = parents[0] if parents else None
-        # Mirror the current per-subgroup Vis state onto the cages.
+        # Mirror the current per-subgroup Vis state onto the cages (this can flip
+        # the chapter group via a mesh's immediate parent) ...
         self._sync_cage_visibility_to_subgroups(pair)
+        # ... so pin the chapter group to the Cage Vis/Hid preference LAST.
+        self._set_visible(chapter, bool(getattr(self, 'cage_vis_pref', True)))
         # The cage is built AFTER isolation is set up, so add it to the active
         # isolate set now or it would stay hidden / out of sync in isolation.
         self._isolate_add_cage(pair)
@@ -4684,6 +4695,63 @@ class ExportMixin:
         # set with bg_l10n.text() and the panel rebuilds on language change.
         return panel
 
+    def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage):
+        """One validation pass over the chapters about to be exported. Returns
+        (errors, warnings) as localized strings: errors BLOCK the export (broken
+        scene), warnings let the artist proceed after confirming. Consolidates
+        checks that were scattered/silent (missing roots, undistributed LP, empty
+        chapters, requested-but-missing cage) so the artist sees one clear list
+        instead of a partial or empty FBX."""
+        errors, warnings = [], []
+        gvmt = bg_final_export.FinalExportProcessor.get_valid_mesh_transforms
+        for pair in targets:
+            name = pair.get('base', '?')
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            if not hp_main or not lp_main:
+                errors.append(bg_l10n.text("Chapter '{name}': HP or LP root group not found.").format(name=name))
+                continue
+            loose = [t for t in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or [])
+                     if cmds.listRelatives(t, shapes=True, type='mesh', noIntermediate=True)]
+            if loose:
+                warnings.append(bg_l10n.text("Chapter '{name}': {n} LP mesh(es) not distributed (run Assign LP Meshes).").format(name=name, n=len(loose)))
+            if inc_hp and not gvmt(hp_main):
+                warnings.append(bg_l10n.text("Chapter '{name}': no HP meshes to export.").format(name=name))
+            if inc_lp and not gvmt(lp_main):
+                warnings.append(bg_l10n.text("Chapter '{name}': no LP meshes to export.").format(name=name))
+            if inc_cage and not bg_cage.CageProcessor.get_chapter_cage_meshes(name):
+                warnings.append(bg_l10n.text("Chapter '{name}': cage included but no cage exists.").format(name=name))
+        return errors, warnings
+
+    def _confirm_export_preflight(self, errors, warnings):
+        """Show every preflight issue in a single dialog. Errors -> block (only
+        Close, returns False). Warnings only -> Export anyway / Cancel. Returns
+        True to proceed with the export, False to abort."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Export preflight"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        parts = []
+        if errors:
+            parts.append(bg_l10n.text("Export is blocked by:"))
+            parts.extend(" - " + e for e in errors)
+        if warnings:
+            if parts:
+                parts.append("")
+            parts.append(bg_l10n.text("Warnings:"))
+            parts.extend(" - " + w for w in warnings)
+        box.setText("\n".join(parts))
+        box.setStyleSheet("QMessageBox { background-color: #242424; color: white; } QPushButton { background-color: #333; padding: 5px; }")
+        if errors:
+            box.setStandardButtons(QtWidgets.QMessageBox.Close)
+            box.exec_() if hasattr(box, 'exec_') else box.exec()
+            return False
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        yes_btn = box.button(QtWidgets.QMessageBox.Yes)
+        if yes_btn:
+            yes_btn.setText(bg_l10n.text("Export anyway"))
+        res = box.exec_() if hasattr(box, 'exec_') else box.exec()
+        return res == QtWidgets.QMessageBox.Yes
+
     def _export_run(self):
         """Launched by the main Export button. Reads the Export panel settings."""
         if not hasattr(self, 'exp_scope'):
@@ -4719,6 +4787,13 @@ class ExportMixin:
             targets = list(self.root_pairs)
         if not targets:
             return cmds.warning("Nothing to export in this scope.")
+
+        # Single preflight before the artist even picks a folder: block on broken
+        # scenes, and let them confirm past soft issues (undistributed LP, empty
+        # chapter, missing cage) instead of getting a silent/partial FBX.
+        errors, warnings = self._export_preflight(targets, inc_hp, inc_lp, inc_cage)
+        if (errors or warnings) and not self._confirm_export_preflight(errors, warnings):
+            return
 
         export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Export Directory"))
         if not export_dirs:

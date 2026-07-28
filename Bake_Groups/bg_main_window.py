@@ -2008,51 +2008,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                     self.sync_toggle_buttons(hp_main, lp_main)
         cmds.inViewMessage(amg=bg_l10n.text("Language switched to {name}").format(name=code), pos='midCenter', fade=True)
 
-    def load_custom_session(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, bg_l10n.text("Select session file"), "", bg_l10n.text("JSON Files (*.json)"))
-        if not file_path:
-            return
-        try:
-            import json
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            if isinstance(data, dict) and 'pairs' in data:
-                pairs = data['pairs']
-            elif isinstance(data, list):
-                pairs = data
-            else:
-                cmds.warning(bg_l10n.text("Invalid session file format: expected a list or a 'pairs' key."))
-                return
-
-            if not isinstance(pairs, list):
-                cmds.warning(bg_l10n.text("Invalid session file format: 'pairs' must be a list."))
-                return
-
-            seen_ids = set()
-            for pair in pairs:
-                if not isinstance(pair, dict):
-                    continue
-                if 'id' not in pair or pair['id'] in seen_ids:
-                    pair['id'] = str(uuid.uuid4())
-                if 'locked' not in pair:
-                    pair['locked'] = []
-                if 'final_smooth_states' not in pair or not isinstance(pair.get('final_smooth_states'), dict):
-                    pair['final_smooth_states'] = {}
-                seen_ids.add(pair['id'])
-
-            self.core._node_cache.clear()
-            self.root_pairs = [p for p in pairs if isinstance(p, dict)]
-            if hasattr(self.core, 'root_pairs'):
-                self.core.root_pairs = self.root_pairs
-            self.active_root_id = None
-            self.active_subgroup_name = None
-            self.is_isolated = False
-            self.refresh_right_panel()
-            self.refresh_left_panel()
-            cmds.inViewMessage(amg=bg_l10n.text("Session successfully loaded from: {name}").format(name=os.path.basename(file_path)), pos='midCenter', fade=True)
-        except Exception as e:
-            cmds.warning(bg_l10n.text("Error loading session: {error}").format(error=e))
-
     def manual_save_session(self):
         bg_core.BakeSessionModel.save(self.root_pairs)
         cmds.inViewMessage(amg=bg_l10n.text("Session Saved Successfully"), pos='midCenter', fade=True)
@@ -2265,6 +2220,15 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.is_isolated = True
             self.subgroup_color_index_map = {}
 
+        # Outside Export Settings the whole Cage_BG hierarchy must stay hidden;
+        # hide its root if it somehow ended up visible.
+        self._hide_cage_root_if_not_export()
+        # Clicking a chapter that was hidden via its Eye flag reveals it (you
+        # clicked it to work on it). Export Settings runs its own HP-visible /
+        # LP-hidden setup below, so only do this in normal mode.
+        if not getattr(self, 'is_final_view', False):
+            self._ensure_chapter_visible(hp_node, lp_node)
+
         panel = 'modelPanel4'
         if not cmds.modelEditor(panel, exists=True):
             panel = cmds.playblast(activeEditor=True)
@@ -2277,14 +2241,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(pair.get('base', ''))
                 if not cmds.objExists(cage_grp):
                     cage_grp = None
-                cmds.isolateSelect(panel, addDagObject=hp_node)
-                cmds.isolateSelect(panel, addDagObject=lp_node)
                 if iso_set:
                     set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
                     if cmds.objExists(set_name):
                         cmds.sets(clear=set_name)
-                nodes_to_add = [n for n in [hp_node, lp_node, cage_grp] if n and cmds.objExists(n)]
-                for node in nodes_to_add:
+                # In Export Settings the LP root is hidden and only HP (+cage) is
+                # previewed, so keep LP OUT of the isolate set there - otherwise a
+                # chapter switch re-adds and shows the new chapter's LP.
+                if getattr(self, 'is_final_view', False):
+                    nodes_to_add = [hp_node, cage_grp]
+                else:
+                    nodes_to_add = [hp_node, lp_node, cage_grp]
+                for node in [n for n in nodes_to_add if n and cmds.objExists(n)]:
                     cmds.isolateSelect(panel, addDagObject=node)
             cmds.isolateSelect(panel, update=True)
         else:
@@ -2306,19 +2274,20 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         # chapter. Without this the panel keeps the previous chapter's closures
         # and Expansion would inflate the OLD chapter's cage.
         if is_switch and getattr(self, 'is_final_view', False):
+            # Re-apply the Export Settings scene look to the NEW chapter: HP root
+            # visible, LP root hidden (LP is never previewed in Export Settings).
+            # Without this the switched-to chapter's LP stayed visible. Prior vis
+            # is remembered so leaving Export Settings can restore it.
+            if hp_node and cmds.objExists(hp_node):
+                self._saved_hp_root_vis = cmds.getAttr(hp_node + ".visibility")
+                cmds.setAttr(hp_node + ".visibility", True)
+            if lp_node and cmds.objExists(lp_node):
+                self._saved_lp_root_vis = cmds.getAttr(lp_node + ".visibility")
+                cmds.setAttr(lp_node + ".visibility", False)
             self.enter_cage_config()
-            # enter_cage_config force-shows the whole cage subtree
-            # (_ensure_cage_visible), so re-apply the session-wide Cage Vis/Hid
-            # preference to the chapter group here - AFTER the rebuild - and
-            # refresh the button so both the mesh and the button match (hiding
-            # the cage in one chapter stays hidden in the next).
-            new_cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(pair.get('base', ''))
-            if cmds.objExists(new_cage_grp):
-                try:
-                    cmds.setAttr(new_cage_grp + ".visibility",
-                                 bool(getattr(self, 'cage_vis_pref', True)))
-                except Exception:
-                    pass
+            # enter_cage_config -> _ensure_cage_visible pins the cage group to the
+            # session-wide Cage Vis/Hid preference; re-sync the buttons to the
+            # final HP / LP-or-cage state.
             self.sync_toggle_buttons(hp_node, lp_node)
 
     def select_meshes_in_group(self, hp_grp, lp_grp):
@@ -2686,6 +2655,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
         btn = self.btn_toggle_hp if type_str == "HP" else self.btn_toggle_lp
 
+        # Cage_BG must not linger visible outside Export Settings - hide it here
+        # too (no-op in Export Settings / when already hidden).
+        self._hide_cage_root_if_not_export()
+
         # Export Settings + a cage present: the "LP" button toggles the cage
         # group (labelled Cage Vis/Cage Hid) instead of the LP root.
         if type_str == "LP":
@@ -2704,6 +2677,63 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
         if parent_node and cmds.objExists(parent_node):
             cmds.setAttr("{}.visibility".format(parent_node), state)
+            # Turning a root Visible must actually reveal its geometry: mesh or
+            # subgroup transforms hidden at their OWN level stay hidden because
+            # the root toggle can't reach them. So on show, if anything under the
+            # root is hidden, un-hide the whole subtree (all meshes in all
+            # subgroups) and refresh the panel so the per-subgroup buttons match.
+            if state and self._reveal_hidden_transforms_under(parent_node):
+                self.refresh_left_panel()
+
+    def _reveal_hidden_transforms_under(self, root_node):
+        """Un-hide every transform under ``root_node`` that is hidden at its own
+        level - individual mesh transforms and subgroup transforms that the
+        root-visibility toggle can't reach. One scan of the subtree; only the
+        nodes that are actually hidden get a setAttr. Returns True if anything
+        was revealed (so the caller can refresh dependent UI)."""
+        if not root_node or not cmds.objExists(root_node):
+            return False
+        revealed = False
+        for node in cmds.listRelatives(root_node, allDescendents=True, type='transform', fullPath=True) or []:
+            try:
+                if cmds.objExists(node) and not cmds.getAttr(node + ".visibility"):
+                    cmds.setAttr(node + ".visibility", True)
+                    revealed = True
+            except Exception:
+                pass  # visibility locked/connected - skip, don't abort the pass
+        return revealed
+
+    def _hide_cage_root_if_not_export(self):
+        """The whole Cage_BG hierarchy is only meant to be seen inside Export
+        Settings. When NOT in Export Settings, hide its root if it is visible -
+        a cheap safety net run on chapter switch and on HP/LP Visible."""
+        if getattr(self, 'is_final_view', False):
+            return
+        cage_root = "|{}".format(bg_cage.CAGE_ROOT)
+        if cmds.objExists(cage_root):
+            try:
+                if cmds.getAttr(cage_root + ".visibility"):
+                    cmds.setAttr(cage_root + ".visibility", False)
+            except Exception:
+                pass
+
+    def _ensure_chapter_visible(self, hp_node, lp_node):
+        """Make a chapter's HP/LP roots (and their direct subgroups) visible if
+        it was hidden via its TOC Eye flag, so clicking a hidden chapter to
+        activate it also reveals it. Mirrors toggle_chapter_visibility's show
+        path; no-op when the roots are already visible."""
+        for p_node in [hp_node, lp_node]:
+            if p_node and cmds.objExists(p_node):
+                try:
+                    if not cmds.getAttr(p_node + ".visibility"):
+                        cmds.setAttr(p_node + ".visibility", True)
+                        for child in cmds.listRelatives(p_node, children=True, type='transform', fullPath=True) or []:
+                            try:
+                                cmds.setAttr(child + ".visibility", True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
     def set_all_subgroups_vis(self, state):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)

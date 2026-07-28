@@ -1252,9 +1252,9 @@ class GTWidget(QtWidgets.QWidget):
         item.setBackground(QtGui.QColor("#2e7d32"))
         item.setForeground(QtGui.QColor("white"))
         if selected_hps:
-            item.setToolTip("Manual HPs:\n" + "\n".join([m.split('|')[-1] for m in selected_hps]))
+            item.setToolTip(bg_l10n.text("Manual HPs:") + "\n" + "\n".join([m.split('|')[-1] for m in selected_hps]))
         else:
-            item.setToolTip("Empty manual cluster. Use Link later to replace it with selected HP meshes.")
+            item.setToolTip(bg_l10n.text("Empty manual cluster. Use Link later to replace it with selected HP meshes."))
         self.result_list.addItem(item)
         self.result_list.setCurrentItem(item)
 
