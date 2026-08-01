@@ -3244,6 +3244,33 @@ class FinalViewMixin:
 
         made = updated = 0
         expected = set()
+
+        # Progress bar for the build (stays up until the viewport redraw starts).
+        # No Cancel button: a half-built cage set is worse than waiting a beat.
+        cage_progress = None
+        try:
+            cage_progress = QtWidgets.QProgressDialog(
+                bg_l10n.text("Building cage..."), "", 0, 100, self)
+            cage_progress.setWindowModality(QtCore.Qt.WindowModal)
+            cage_progress.setMinimumDuration(0)
+            cage_progress.setCancelButton(None)
+            cage_progress.setValue(0)
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            cage_progress = None
+
+        def _cage_p(val, label=None):
+            if not cage_progress:
+                return
+            try:
+                if label is not None:
+                    cage_progress.setLabelText(label)
+                cage_progress.setValue(max(0, min(int(val), 100)))
+                cage_progress.repaint()
+                QtWidgets.QApplication.processEvents()
+            except Exception:
+                pass
+
         cmds.refresh(suspend=True)
         try:
             with bg_core.undo_chunk("BuildCage"):
@@ -3251,6 +3278,12 @@ class FinalViewMixin:
                 # One scan of the existing cage hierarchy instead of a full scan
                 # per LP mesh (was O(N^2)).
                 cage_index = bg_cage.CageProcessor.index_existing_cages(chapter_grp)
+                # Classify the work: a fresh DEFLATED cage (inflate=0, not fitted)
+                # - the plain "Create Cage" case - goes through the batched fast
+                # path (one duplicate + one shading assign for the whole chapter).
+                # Fits and existing-cage updates stay on the per-mesh path.
+                create_specs = []   # {'lp','name','folder','mode'}
+                individual = []     # (lp, cage_name, target_hp, obstacle_hp, params)
                 for sg, meshes in groups.items():
                     # Expected covers ALL subgroups so a selective rebuild does
                     # not prune the cages we intentionally skipped.
@@ -3264,22 +3297,66 @@ class FinalViewMixin:
                     obstacle_hp = [m for m in all_hp if m not in target_set]
                     if not target_hp:
                         self.log("Cage: subgroup '{}' has no HP.".format(sg), "orange")
+                    # inflate is the same for every LP of the subgroup (shared
+                    # ref_diag), so decide the batch eligibility once per subgroup.
+                    sg_inflate, _sg_gap = bg_cage.CageProcessor.resolve_amounts(
+                        (meshes['lp'][0] if meshes['lp'] else lp_main), params, ref_diag)
+                    batchable_sg = (not params.get('fitted')) and sg_inflate <= 1e-9
+                    sg_mode = params.get('display_mode', 'solid')
                     for lp in meshes['lp']:
                         cage_name = lp.split('|')[-1] + bg_cage.SUFFIX_CAGE
-                        if create_missing_only:
-                            existing = cage_index.get(cage_name)
-                            if existing and cmds.objExists(existing):
-                                continue  # keep the existing (possibly sculpted) cage untouched
-                        cage, created = bg_cage.CageProcessor.update_or_create_cage(
-                            lp, target_hp, obstacle_hp, params, chapter_grp, lp_main, ref_diag,
-                            existing_index=cage_index)
-                        if cage:
-                            cage_index[cage_name] = cage
-                            made += 1 if created else 0
-                            updated += 0 if created else 1
+                        existing = cage_index.get(cage_name)
+                        existing = existing if (existing and cmds.objExists(existing)) else None
+                        if create_missing_only and existing:
+                            continue  # keep the existing (possibly sculpted) cage untouched
+                        if batchable_sg and not existing:
+                            folder = bg_cage.CageProcessor.ensure_relative_folders(
+                                chapter_grp,
+                                bg_cage.CageProcessor.relative_folders_for_lp(lp, lp_main))
+                            create_specs.append({'lp': lp, 'name': cage_name,
+                                                 'folder': folder, 'mode': sg_mode})
+                        else:
+                            individual.append((lp, cage_name, target_hp, obstacle_hp, params))
+
+                # Progress advances 5 -> 80% across the created cages, then
+                # 80 -> 92% across the per-mesh updates.
+                total_units = max(len(create_specs) + len(individual), 1)
+                done_units = 0
+                _cage_p(5, bg_l10n.text("Building cage..."))
+
+                # Batched fast create, grouped by display mode and chunked so the
+                # bar advances (chunks stay large, keeping the batching win).
+                CHUNK = 50
+                by_mode = {}
+                for spec in create_specs:
+                    by_mode.setdefault(spec['mode'], []).append(spec)
+                for mode, specs in by_mode.items():
+                    for c in range(0, len(specs), CHUNK):
+                        chunk = specs[c:c + CHUNK]
+                        new_cages = bg_cage.CageProcessor.batch_create_cages(chunk, mode)
+                        for spec, cage in zip(chunk, new_cages):
+                            if cage:
+                                cage_index[spec['name']] = cage
+                                made += 1
+                        done_units += len(chunk)
+                        _cage_p(5 + int(75 * done_units / total_units))
+
+                # Per-mesh path for fits and existing-cage updates.
+                for (lp, cage_name, target_hp, obstacle_hp, params) in individual:
+                    cage, created = bg_cage.CageProcessor.update_or_create_cage(
+                        lp, target_hp, obstacle_hp, params, chapter_grp, lp_main, ref_diag,
+                        existing_index=cage_index)
+                    if cage:
+                        cage_index[cage_name] = cage
+                        made += 1 if created else 0
+                        updated += 0 if created else 1
+                    done_units += 1
+                    _cage_p(5 + int(75 * done_units / total_units))
                 t['build'] = _time.time() - _t0; _t0 = _time.time()
+                _cage_p(88, bg_l10n.text("Finalizing..."))
                 bg_cage.CageProcessor.prune_orphans(chapter_grp, expected)
                 t['prune'] = _time.time() - _t0; _t0 = _time.time()
+                _cage_p(95)
 
                 # Resolve intersections BETWEEN different subgroups' cages by
                 # shrinking them in the conflict zones (never wanted for baking).
@@ -3295,6 +3372,34 @@ class FinalViewMixin:
                 t['resolve'] = _time.time() - _t0
         finally:
             cmds.refresh(suspend=False)
+            _cage_p(100)
+            # Redraw the viewport so the freshly built cages appear right away.
+            # Deferred by 100 ms (same safe pattern as the Smooth preview) to let
+            # Maya settle the new geometry before drawing. Unlike Smooth preview -
+            # which only tweaks attributes on ALREADY-drawn meshes - Create Cage
+            # adds NEW meshes that Viewport 2.0 has no render items for yet, so a
+            # plain refresh() is skipped as "not needed" (the mesh only appears
+            # once the camera moves and forces a rebuild). force=True bypasses that
+            # check and forces a full redraw. The progress bar is closed here,
+            # right before the redraw starts, so it stays up for the whole build.
+            # Wrapped so it can never throw.
+            def _safe_cage_refresh():
+                if cage_progress:
+                    try:
+                        cage_progress.close()
+                    except Exception:
+                        pass
+                try:
+                    cmds.refresh(force=True)
+                except Exception:
+                    try:
+                        cmds.refresh()
+                    except Exception:
+                        pass
+            try:
+                QtCore.QTimer.singleShot(100, _safe_cage_refresh)
+            except Exception:
+                _safe_cage_refresh()
 
         if made or updated:
             self.log("Cage: {} created, {} adjusted under Cage_BG.".format(made, updated), "lightgreen")

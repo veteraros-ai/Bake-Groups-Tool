@@ -24,6 +24,8 @@
                   "Bake Groups Manual":  "Bake Groups 手册",
                   "Cage cleared.":  "已清除 Cage。",
                   "Cage created.":  "已创建 Cage。",
+                  "Building cage...":  "正在构建 Cage...",
+                  "Finalizing...":  "正在完成...",
                   "Cage fitted to HP (gap kept).":  "Cage 已贴合到 HP（保留间隙）。",
                   "Cage max offset override for this subgroup (blank = global). ":  "此子组的 Cage 最大偏移覆盖（留空 = 全局）。 ",
                   "Checking LP meshes for missing HP...":  "正在检查缺少 HP 的 LP 网格...",

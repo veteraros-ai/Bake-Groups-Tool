@@ -78,6 +78,20 @@ set_property(TARGET bg_math_core PROPERTY CXX_STANDARD 14)
 set_property(TARGET bg_math_core PROPERTY CXX_STANDARD_REQUIRED ON)
 set_property(TARGET bg_math_core PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Aggressive optimization for the math hot-paths (Release only):
+#   /O2 /Oi /Ot  - max speed + intrinsics
+#   /GL + /LTCG  - whole-program (link-time) optimization
+#   /arch:AVX2   - vectorize the distance loops (any CPU since ~2013)
+#   /fp:fast     - relaxed float assoc so those loops vectorize
+if(MSVC)
+    target_compile_options(bg_math_core PRIVATE
+        $<$<CONFIG:Release>:/O2 /Oi /Ot /GL /arch:AVX2 /fp:fast>
+    )
+    target_link_options(bg_math_core PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+    )
+endif()
+
 set(OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Bake_Groups/bin/${MAYA_VERSION}")
 set_target_properties(bg_math_core PROPERTIES
     PREFIX ""

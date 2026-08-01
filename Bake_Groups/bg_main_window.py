@@ -2961,6 +2961,14 @@ def main():
     except:
         pass
 
+    # Anonymous, fire-and-forget update ping (only when the version changed).
+    # Fully guarded so it can never affect tool startup.
+    try:
+        import bg_telemetry
+        bg_telemetry.report_async()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

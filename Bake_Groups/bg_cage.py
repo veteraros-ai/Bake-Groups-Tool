@@ -569,10 +569,80 @@ class CageProcessor(object):
                     pass
 
     @staticmethod
+    def apply_cage_display_batch(cage_transforms, mode='solid'):
+        """Batched apply_cage_display for many cages: the 'solid' shading-group
+        assignment is done in ONE cmds.sets call for all shapes (instead of one
+        per cage), which is the dominant cost when building a whole chapter."""
+        all_shapes = []
+        for c in cage_transforms or []:
+            if c and cmds.objExists(c):
+                all_shapes += cmds.listRelatives(c, shapes=True, fullPath=True) or []
+        if not all_shapes:
+            return
+        if mode == 'solid':
+            sg = CageProcessor._ensure_cage_material()
+            for shp in all_shapes:
+                try:
+                    cmds.setAttr(shp + ".overrideEnabled", 0)
+                except Exception:
+                    pass
+            try:
+                cmds.sets(all_shapes, edit=True, forceElement=sg)
+            except Exception:
+                pass
+        else:  # 'wire'
+            for shp in all_shapes:
+                try:
+                    cmds.setAttr(shp + ".overrideEnabled", 1)
+                    cmds.setAttr(shp + ".overrideShading", 0)
+                    cmds.setAttr(shp + ".overrideTexturing", 0)
+                    cmds.setAttr(shp + ".overrideRGBColors", 1)
+                    cmds.setAttr(shp + ".overrideColorRGB", *CageProcessor.CAGE_COLOR_RGB)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def batch_create_cages(specs, display_mode='solid'):
+        """Fast path for creating many DEFLATED (inflate=0) cages in one shot.
+
+        A plain 'Create Cage' duplicates the LP with NO vertex offset (the cage
+        starts identical to the LP). Doing that per mesh fires one cmds.duplicate,
+        one history-delete and one cmds.sets EACH - and every command is recorded
+        for undo and pokes the DG/viewport. This batches all of it: a single
+        duplicate for every source LP, then per-cage parent/rename, one
+        history-delete for all, and one batched shading assignment. No normals are
+        read and no setPoints runs (the duplicate already matches the LP 1:1, so
+        vertex order - the Substance requirement - is preserved).
+
+        ``specs`` = [{'lp':.., 'name':.., 'folder':..}]. Returns cage full paths
+        in the same order (None where a spec failed)."""
+        specs = [s for s in (specs or []) if s.get('lp') and cmds.objExists(s['lp'])]
+        if not specs:
+            return []
+        lp_list = [s['lp'] for s in specs]
+        dups = cmds.duplicate(lp_list, returnRootsOnly=True, inputConnections=False)
+        cages = []
+        for spec, dup in zip(specs, dups):
+            try:
+                d = cmds.parent(dup, spec['folder'], absolute=True)[0]
+                d = cmds.rename(d, spec['name'])
+                cages.append(cmds.ls(d, long=True)[0])
+            except Exception:
+                cages.append(None)
+        valid = [c for c in cages if c]
+        if valid:
+            try:
+                cmds.delete(valid, constructionHistory=True)
+            except Exception:
+                pass
+            CageProcessor.apply_cage_display_batch(valid, display_mode)
+        return cages
+
+    @staticmethod
     def set_chapter_cage_display(base_name, mode):
         """Apply a display mode ('wire' / 'solid') to every cage in the chapter."""
-        for cage in CageProcessor.get_chapter_cage_meshes(base_name):
-            CageProcessor.apply_cage_display(cage, mode)
+        CageProcessor.apply_cage_display_batch(
+            CageProcessor.get_chapter_cage_meshes(base_name), mode)
 
     @staticmethod
     def _apply_offsets(cage_transform, points, normals, offsets):
@@ -618,11 +688,7 @@ class CageProcessor(object):
             return None, False
 
         inflate, gap = CageProcessor.resolve_amounts(lp_transform, params, ref_diag)
-        if params.get('fitted'):
-            points, normals, offsets = CageProcessor.fit_offsets(
-                lp_transform, target_hp, obstacle_hp, inflate, gap)
-        else:
-            points, normals, offsets = CageProcessor.uniform_offsets(lp_transform, inflate)
+        fitted = bool(params.get('fitted'))
 
         cage_name = lp_transform.split('|')[-1] + SUFFIX_CAGE
         folders = CageProcessor.relative_folders_for_lp(lp_transform, lp_main)
@@ -634,6 +700,20 @@ class CageProcessor(object):
                 existing = None
         else:
             existing = CageProcessor.find_cage(chapter_grp, cage_name)
+
+        # Lazy geometry: a fresh DEFLATED cage (inflate=0, not fitted) is just the
+        # LP duplicate, so we skip reading normals and the per-vertex setPoints
+        # entirely. Offsets are computed only when they actually move vertices
+        # (fit or inflate>0) or when updating an EXISTING cage.
+        need_offsets = fitted or inflate > 1e-9 or bool(existing)
+        points = normals = offsets = None
+        if need_offsets:
+            if fitted:
+                points, normals, offsets = CageProcessor.fit_offsets(
+                    lp_transform, target_hp, obstacle_hp, inflate, gap)
+            else:
+                points, normals, offsets = CageProcessor.uniform_offsets(lp_transform, inflate)
+
         if existing:
             # Reparent into the mirrored folder if the LP grouping moved.
             parent = cmds.listRelatives(existing, parent=True, fullPath=True)
@@ -642,7 +722,7 @@ class CageProcessor(object):
                 existing = cmds.ls(existing, long=True)[0]
             # Topology changed on the LP (re-analysed)? Fall back to recreate.
             fn, _ = CageProcessor._fn_mesh(existing)
-            if fn.numVertices != len(points):
+            if points is not None and fn.numVertices != len(points):
                 cmds.delete(existing)
                 existing = None
 
@@ -660,7 +740,8 @@ class CageProcessor(object):
             cage = cmds.ls(dup, long=True)[0]
             created = True
 
-        CageProcessor._apply_offsets(cage, points, normals, offsets)
+        if points is not None:
+            CageProcessor._apply_offsets(cage, points, normals, offsets)
         CageProcessor.apply_cage_display(cage, params.get('display_mode', 'solid'))
         return cage, created
 

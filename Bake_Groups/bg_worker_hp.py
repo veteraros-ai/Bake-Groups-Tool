@@ -623,6 +623,10 @@ class HPGroupingWorker(QtCore.QThread):
             hp_verts = self.hp_verts_cache.get(hp_name, [])
             method = "single candidate"
             validation = "not tested"
+            # Мемоизация avg_distance(hp, lp) по кандидату: min() перебирает каждого
+            # один раз, а победитель переиспользуется в валидации ниже (без 2-3 лишних
+            # C++-вызовов на плотных мешах).
+            mat_score_cache = {}
 
             if len(candidates) == 1:
                 best_lp = candidates[0]
@@ -630,13 +634,18 @@ class HPGroupingWorker(QtCore.QThread):
                 material_candidates = [c for c in candidates if _lp_material_slot(c)]
                 if material_candidates and HAS_MATH_CORE and hp_verts:
                     def material_distance_score(lp_name):
+                        if lp_name in mat_score_cache:
+                            return mat_score_cache[lp_name]
                         lp_verts = self.lp_verts_cache.get(lp_name, [])
                         if not lp_verts:
+                            mat_score_cache[lp_name] = float('inf')
                             return float('inf')
                         try:
-                            return bg_math_core.calculate_avg_distance(hp_verts, lp_verts)
+                            score = bg_math_core.calculate_avg_distance(hp_verts, lp_verts)
                         except Exception:
-                            return float('inf')
+                            score = float('inf')
+                        mat_score_cache[lp_name] = score
+                        return score
 
                     best_lp = min(material_candidates, key=material_distance_score)
                     if material_distance_score(best_lp) == float('inf'):
@@ -682,7 +691,11 @@ class HPGroupingWorker(QtCore.QThread):
             if HAS_MATH_CORE and hp_verts:
                 best_lp_verts = self.lp_verts_cache.get(best_lp, [])
                 if best_lp_verts:
-                    avg_dist = bg_math_core.calculate_avg_distance(hp_verts, best_lp_verts)
+                    cached_score = mat_score_cache.get(best_lp)
+                    if cached_score is not None and cached_score != float('inf'):
+                        avg_dist = cached_score
+                    else:
+                        avg_dist = bg_math_core.calculate_avg_distance(hp_verts, best_lp_verts)
                     hp_info = self.hp_data[hp_name]
                     best_lp_info = self.lp_data[best_lp]
 

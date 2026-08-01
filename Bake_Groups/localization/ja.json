@@ -24,6 +24,8 @@
                   "Bake Groups Manual":  "Bake Groups マニュアル",
                   "Cage cleared.":  "Cage を削除しました。",
                   "Cage created.":  "Cage を作成しました。",
+                  "Building cage...":  "Cage を構築中...",
+                  "Finalizing...":  "最終処理中...",
                   "Cage fitted to HP (gap kept).":  "Cage を HP にフィットしました（ギャップ維持）。",
                   "Cage max offset override for this subgroup (blank = global). ":  "このサブグループの Cage 最大オフセットの上書き（空欄 = グローバル）。 ",
                   "Checking LP meshes for missing HP...":  "HP が欠けている LP メッシュを確認中...",

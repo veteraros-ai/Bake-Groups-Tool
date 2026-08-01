@@ -154,6 +154,7 @@ modules_to_reload = [
     'bg_ui_widgets',
     'bg_localization',
     'bg_update',
+    'bg_telemetry',
     'bg_mixins',
     'bg_main_window'
 ]

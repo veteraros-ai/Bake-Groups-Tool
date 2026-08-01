@@ -53,6 +53,8 @@
                   "selected cage mesh(es)":  "выбранные меши Cage",
                   "all subgroups":  "все сабгруппы",
                   "Cage created.":  "Cage создан.",
+                  "Building cage...":  "Построение Cage...",
+                  "Finalizing...":  "Завершение...",
                   "Expansion adjusted (sculpting preserved).":  "Раздутие применено (скульптинг сохранён).",
                   "No cage yet - press Create Cage.":  "Cage ещё не создан - нажмите Create Cage.",
                   "Create Cage":  "Создать Cage",
