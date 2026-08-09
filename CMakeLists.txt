@@ -4,6 +4,7 @@ project(bg_math_core LANGUAGES CXX)
 set(MAYA_VERSION "2024" CACHE STRING "Target Maya version")
 set(DEVKITS_ROOT "C:/Maya_Devkits" CACHE PATH "Maya devkits root")
 set(PYBIND11_SOURCE_DIR "" CACHE PATH "pybind11 source directory")
+set(BG_MATH_CORE_MODULE_NAME "bg_math_core" CACHE STRING "Python module name for the math core")
 
 if(PYBIND11_SOURCE_DIR STREQUAL "")
     if(MAYA_VERSION STREQUAL "2027")
@@ -71,6 +72,7 @@ set(PYBIND11_NOPYTHON ON CACHE BOOL "" FORCE)
 add_subdirectory("${PYBIND11_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/pybind11")
 
 add_library(bg_math_core MODULE "Bake_Groups/bg_math_core.cpp")
+target_compile_definitions(bg_math_core PRIVATE BG_MATH_CORE_MODULE_NAME=${BG_MATH_CORE_MODULE_NAME})
 target_include_directories(bg_math_core PRIVATE ${pybind11_INCLUDE_DIRS} "${PY_INCLUDE}")
 target_link_libraries(bg_math_core PRIVATE "${PY_LIB}")
 
@@ -96,6 +98,7 @@ set(OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Bake_Groups/bin/${MAYA_VERSION}")
 set_target_properties(bg_math_core PROPERTIES
     PREFIX ""
     SUFFIX ".pyd"
+    OUTPUT_NAME "${BG_MATH_CORE_MODULE_NAME}"
     LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
     LIBRARY_OUTPUT_DIRECTORY_RELEASE "${OUTPUT_DIR}"
     LIBRARY_OUTPUT_DIRECTORY_DEBUG "${OUTPUT_DIR}"

@@ -38,11 +38,15 @@ import bg_cage
 import bg_localization as bg_l10n
 
 try:
-    import bg_math_core
+    import bg_math_core_runtime as bg_math_core
     HAS_MATH_CORE = True
 except ImportError:
-    print("WARNING: bg_math_core (.pyd) not found! High-poly matching will use slow path.")
-    HAS_MATH_CORE = False
+    try:
+        import bg_math_core
+        HAS_MATH_CORE = True
+    except ImportError:
+        print("WARNING: bg_math_core (.pyd) not found! High-poly matching will use slow path.")
+        HAS_MATH_CORE = False
 
 # Maya 2020-2026 PySide Compatibility Layer
 try:
@@ -78,6 +82,7 @@ class HPAnalysisMixin:
             'threshold_pct': self.spin_collision_pct.value(),
             'strategy': self.combo_hp_strategy.currentIndex(),
             'use_symmetry': self.chk_use_symmetry.isChecked(),
+            'compound_link_enabled': bool(getattr(self, 'chk_compound_link', None) and self.chk_compound_link.isChecked()),
             'compound_link_verts': self.spin_compound_link_verts.value(),
             'compound_link_dist_pct': self.spin_compound_link_dist.value(),
             'ignore_floaters': self.chk_ignore_floaters.isChecked(),
@@ -467,6 +472,14 @@ class HPAnalysisMixin:
                 if len(candidates) > 8:
                     preview_lines.append("  ... +{} more".format(len(candidates) - 8))
 
+        separable_nodes = []
+        separable_seen = set()
+        for _label, candidates in combined:
+            for node, _info in candidates:
+                if node not in separable_seen and cmds.objExists(node):
+                    separable_seen.add(node)
+                    separable_nodes.append(node)
+
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle(bg_l10n.text("Combined Meshes Found"))
         box.setIcon(QtWidgets.QMessageBox.Warning)
@@ -478,7 +491,9 @@ class HPAnalysisMixin:
             )
         )
         select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
-        separate_btn = box.addButton(bg_l10n.text("Separate"), QtWidgets.QMessageBox.ActionRole)
+        separate_btn = None
+        if separable_nodes:
+            separate_btn = box.addButton(bg_l10n.text("Separate"), QtWidgets.QMessageBox.ActionRole)
         skip_chapter_btn = box.addButton(bg_l10n.text("Skip This Chapter"), QtWidgets.QMessageBox.ActionRole)
         skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
         bg_l10n.localize_widget_tree(box)
@@ -503,13 +518,13 @@ class HPAnalysisMixin:
                 )
             return False
 
-        if box.clickedButton() == separate_btn:
+        if separate_btn is not None and box.clickedButton() == separate_btn:
             # Corrected in-dialog (not "Select"/manual, not "Skip") - the
             # check must keep going to the remaining checks afterward either
             # way, so failures here are logged, never left to raise and
             # silently kill the rest of run_pre_analysis_checks.
             try:
-                separated = self._separate_mesh_transforms(problem_nodes, select_result=True)
+                separated = self._separate_mesh_transforms(separable_nodes, select_result=True)
             except Exception as exc:
                 message = bg_l10n.text("Combined mesh separation failed: {error}").format(error=exc)
                 cmds.warning(message)
@@ -817,6 +832,7 @@ class HPAnalysisMixin:
                 worker.stop()
             except Exception:
                 pass
+            self._release_analysis_worker('hp_worker')
         progress = getattr(self, 'progress_dlg', None)
         if progress:
             try:
@@ -824,6 +840,7 @@ class HPAnalysisMixin:
             except Exception:
                 pass
         self._revert_prep_undo('hp_analysis', "HP subgroup/mesh structure reverted to its state before Analyze HP.")
+        self._clear_analysis_runtime_caches(clear_geometry=True)
         self.log("HP Analysis canceled.", "orange")
 
     def _cancel_lp_matching(self):
@@ -833,6 +850,7 @@ class HPAnalysisMixin:
                 worker.stop()
             except Exception:
                 pass
+            self._release_analysis_worker('lp_worker')
         progress = getattr(self, 'progress_dlg_lp', None)
         if progress:
             try:
@@ -840,7 +858,60 @@ class HPAnalysisMixin:
             except Exception:
                 pass
         self._revert_prep_undo('lp_matching', "LP mesh structure reverted to its state before Assign LP Meshes.")
+        self._clear_analysis_runtime_caches(clear_geometry=True)
         self.log("Assign LP Meshes canceled.", "orange")
+
+    def _release_analysis_worker(self, attr_name):
+        worker = getattr(self, attr_name, None)
+        if not worker:
+            return
+        for name in (
+                'hp_verts_cache', 'lp_verts_cache', 'hp_holes_cache',
+                'lp_verts_cache_fast', 'lp_verts_cache_full',
+                'custom_clusters_dict', 'summary_lines', 'debug_lines'):
+            value = getattr(worker, name, None)
+            try:
+                if hasattr(value, 'clear'):
+                    value.clear()
+            except Exception:
+                pass
+            try:
+                setattr(worker, name, None)
+            except Exception:
+                pass
+        for name in ('hp_data', 'lp_data', 'hp_groups'):
+            try:
+                setattr(worker, name, None)
+            except Exception:
+                pass
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        setattr(self, attr_name, None)
+
+    def _clear_analysis_runtime_caches(self, clear_geometry=False):
+        for name in ('hp_data_cache', 'lp_data_cache'):
+            cache = getattr(self, name, None)
+            try:
+                if hasattr(cache, 'clear'):
+                    cache.clear()
+            except Exception:
+                pass
+        for name in ('_combined_mesh_check_cache',):
+            cache = getattr(self, name, None)
+            try:
+                if hasattr(cache, 'clear'):
+                    cache.clear()
+            except Exception:
+                pass
+        if clear_geometry:
+            cache = getattr(self, '_analyze_geo_cache', None)
+            try:
+                if hasattr(cache, 'clear'):
+                    cache.clear()
+            except Exception:
+                pass
 
     def _mark_chapter_pre_checked(self, pair_id):
         checked = getattr(self, '_hp_structure_checked_chapters', None)
@@ -1617,6 +1688,8 @@ class HPAnalysisMixin:
         hp_verts_cache = {}
         lp_verts_cache = {}
         hp_holes_cache = {}
+        hp_surface_cache = {}
+        lp_surface_cache = {}
 
         def build_hp_hole_cache_entry(mesh_path, mesh_center=None):
             """Collect open-border points and classify border normals.
@@ -1796,6 +1869,58 @@ class HPAnalysisMixin:
             except Exception:
                 return None
 
+        def build_surface_proxy(mesh_path, max_triangles=240):
+            try:
+                selection = om.MSelectionList()
+                selection.add(mesh_path)
+                dag_path = selection.getDagPath(0)
+                if dag_path.hasFn(om.MFn.kTransform):
+                    dag_path.extendToShape()
+                mesh_fn = om.MFnMesh(dag_path)
+                points = mesh_fn.getPoints(om.MSpace.kWorld)
+                _counts, triangle_vertices = mesh_fn.getTriangles()
+                triangle_count = len(triangle_vertices) // 3
+                if triangle_count <= 0 or not points:
+                    return None
+
+                target_count = min(triangle_count, max(1, int(max_triangles)))
+                samples = []
+                triangles = []
+                last_index = -1
+                for sample_index in range(target_count):
+                    triangle_index = min(
+                        triangle_count - 1,
+                        int(((sample_index + 0.5) * triangle_count) / float(target_count))
+                    )
+                    if triangle_index == last_index:
+                        continue
+                    last_index = triangle_index
+                    base = triangle_index * 3
+                    try:
+                        p0 = points[int(triangle_vertices[base])]
+                        p1 = points[int(triangle_vertices[base + 1])]
+                        p2 = points[int(triangle_vertices[base + 2])]
+                    except Exception:
+                        continue
+                    triangles.extend([
+                        float(p0.x), float(p0.y), float(p0.z),
+                        float(p1.x), float(p1.y), float(p1.z),
+                        float(p2.x), float(p2.y), float(p2.z)
+                    ])
+                    samples.extend([
+                        float((p0.x + p1.x + p2.x) / 3.0),
+                        float((p0.y + p1.y + p2.y) / 3.0),
+                        float((p0.z + p1.z + p2.z) / 3.0),
+                        float((p0.x * 0.20) + (p1.x * 0.30) + (p2.x * 0.50)),
+                        float((p0.y * 0.20) + (p1.y * 0.30) + (p2.y * 0.50)),
+                        float((p0.z * 0.20) + (p1.z * 0.30) + (p2.z * 0.50))
+                    ])
+                if not samples or not triangles:
+                    return None
+                return {"samples": samples, "triangles": triangles}
+            except Exception:
+                return None
+
         maya_main_window = QtWidgets.QApplication.activeWindow()
         if maya_main_window:
             maya_main_window.setEnabled(False)
@@ -1825,6 +1950,12 @@ class HPAnalysisMixin:
                     data["hash"] = cached.get("hash", "empty")
                     data["variance"] = cached.get("variance", 999.0)
                     data["mean_radius"] = cached.get("mean_radius", 0.0)
+                    surface_proxy = cached.get("surface_proxy")
+                    if surface_proxy is None:
+                        surface_proxy = build_surface_proxy(m_path)
+                        cached["surface_proxy"] = surface_proxy
+                    if surface_proxy:
+                        hp_surface_cache[m_path] = surface_proxy
                     cache_hits += 1
                     step += 1
                     self.progress_dlg.setValue(int((step / total_items) * 40))
@@ -1833,6 +1964,9 @@ class HPAnalysisMixin:
 
                 verts = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=density)
                 hp_verts_cache[m_path] = verts
+                surface_proxy = build_surface_proxy(m_path)
+                if surface_proxy:
+                    hp_surface_cache[m_path] = surface_proxy
 
                 # Boundary holes detection
                 hole_entry = None
@@ -1864,6 +1998,7 @@ class HPAnalysisMixin:
                     "hash": data["hash"],
                     "variance": data["variance"],
                     "mean_radius": data["mean_radius"],
+                    "surface_proxy": surface_proxy,
                 })
 
                 step += 1
@@ -1902,6 +2037,12 @@ class HPAnalysisMixin:
                     if lp_data is not None:
                         lp_data["hash"] = cached.get("hash", "empty")
                         lp_data["variance"] = cached.get("variance", 999.0)
+                    surface_proxy = cached.get("surface_proxy")
+                    if surface_proxy is None:
+                        surface_proxy = build_surface_proxy(m_path)
+                        cached["surface_proxy"] = surface_proxy
+                    if surface_proxy:
+                        lp_surface_cache[m_path] = surface_proxy
                     cache_hits += 1
                     step += 1
                     self.progress_dlg.setValue(int((step / total_items) * 40))
@@ -1910,6 +2051,9 @@ class HPAnalysisMixin:
 
                 lp_verts = bg_core.GeoMatcher.get_world_vertices(m_path, density_pct=density)
                 lp_verts_cache[m_path] = lp_verts
+                surface_proxy = build_surface_proxy(m_path)
+                if surface_proxy:
+                    lp_surface_cache[m_path] = surface_proxy
                 if lp_data is not None and HAS_MATH_CORE and lp_verts:
                     try:
                         lp_data["hash"] = bg_math_core.generate_fingerprint_data(
@@ -1928,6 +2072,7 @@ class HPAnalysisMixin:
                     "hash": (lp_data or {}).get("hash", "empty"),
                     "variance": (lp_data or {}).get("variance", 999.0),
                     "mean_radius": 0.0,
+                    "surface_proxy": surface_proxy,
                 })
 
                 step += 1
@@ -1990,10 +2135,13 @@ class HPAnalysisMixin:
             bolt_elongation=self.spin_bolt_elong.value(),
             bolt_symmetry=self.spin_bolt_sym.value(),
             wire_elongation=self.spin_wire_elong.value(),
+            compound_link_enabled=worker_params.get('compound_link_enabled', True),
             compound_link_verts=worker_params['compound_link_verts'],
             compound_link_dist_pct=worker_params['compound_link_dist_pct'],
             detect_floaters=not worker_params.get('ignore_floaters', True),
-            floater_radius=_floater_radius
+            floater_radius=_floater_radius,
+            hp_surface_cache=hp_surface_cache,
+            lp_surface_cache=lp_surface_cache
         )
 
         # Fingerprinting already filled 0-40%; the worker owns the 40-100% band.
@@ -2023,6 +2171,7 @@ class HPAnalysisMixin:
         debug_report.append("=== Explain Details ===")
         debug_report.extend(explain_lines)
         self.last_debug_lines = debug_report
+        self._release_analysis_worker('hp_worker')
 
         if summary_lines:
             for msg in summary_lines:
@@ -2567,11 +2716,14 @@ class LPMatchingMixin:
                         total_matched += len(vp)
 
         self.refresh_left_panel()
-        self.log("LP Matched: {} out of {} objects.".format(total_matched, len(self.lp_data_cache)), "lightgreen")
+        total_lp = len(self.lp_data_cache)
+        self.log("LP Matched: {} out of {} objects.".format(total_matched, total_lp), "lightgreen")
         if material_repair_count:
             self.log("Assign LP material check: repaired {} LP mesh(es).".format(material_repair_count), "lightblue")
         if hasattr(self, 'record_user_action'):
-            self.record_user_action("Assign LP finished", "matched={}/{} material_repairs={}".format(total_matched, len(self.lp_data_cache), material_repair_count))
+            self.record_user_action("Assign LP finished", "matched={}/{} material_repairs={}".format(total_matched, total_lp, material_repair_count))
+        self._release_analysis_worker('lp_worker')
+        self._clear_analysis_runtime_caches(clear_geometry=False)
 
 
 # ============================================================================
@@ -2882,7 +3034,7 @@ class FinalViewMixin:
 
         self.final_selected_names = set()
         sorted_subgroup_names = sorted(subgroup_names)
-        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked() and hasattr(self, 'ensure_subgroup_color_indices'):
+        if hasattr(self, 'ensure_subgroup_color_indices'):
             self.ensure_subgroup_color_indices(sorted_subgroup_names)
 
         for display_name in sorted_subgroup_names:
@@ -3101,7 +3253,9 @@ class FinalViewMixin:
     def show_final_row_context_menu(self, old_name):
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
-        rename_action = menu.addAction("Rename Final Group")
+        rename_action = menu.addAction(bg_l10n.text("Rename Final Group"))
+        color_action = menu.addAction(bg_l10n.text("Select Color"))
+        color_action.setEnabled(bool(hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked()))
         select_all_action = menu.addAction("Select All Subgroups")
         bg_l10n.localize_menu(menu)
         action = menu.exec_(QtGui.QCursor.pos())
@@ -3109,6 +3263,8 @@ class FinalViewMixin:
             new_name, ok = QtWidgets.QInputDialog.getText(self, bg_l10n.text("Rename Final Group"), bg_l10n.text("New Name:"), text=old_name)
             if ok and new_name and new_name != old_name:
                 self.rename_final_subgroup(old_name, new_name.strip().replace(".", "_"))
+        elif action == color_action:
+            self.choose_subgroup_color(old_name)
         elif action == select_all_action:
             self.select_all_final_subgroups()
 
@@ -4432,6 +4588,9 @@ class FinalViewMixin:
                 if short.startswith(old_name + "_low"):
                     cmds.rename(lp, short.replace(old_name, new_name, 1))
 
+        if hasattr(self, 'rename_subgroup_color_index'):
+            self.rename_subgroup_color_index(old_name, new_name, pair)
+
         self.refresh_left_panel()
 
 
@@ -5330,9 +5489,12 @@ class GroupManagementMixin:
                         cmds.rename(lp_node, "{}{}".format(new_name, bg_core.BakeConfig.SUFFIX_LP))
 
                     pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-                    if pair and old_name in pair.get('locked', []):
-                        pair['locked'].remove(old_name)
-                        pair['locked'].append(new_name)
+                    if pair:
+                        if old_name in pair.get('locked', []):
+                            pair['locked'].remove(old_name)
+                            pair['locked'].append(new_name)
+                        if hasattr(self, 'rename_subgroup_color_index'):
+                            self.rename_subgroup_color_index(old_name, new_name, pair)
                         bg_core.BakeSessionModel.save(self.root_pairs)
 
                     if self.active_subgroup_name == old_name:
@@ -5359,6 +5521,49 @@ class GroupManagementMixin:
         if hasattr(self, 'record_user_action'):
             state = "locked" if ui_name in locked_list else "unlocked"
             self.record_user_action("Toggle Group Lock", "{} {}".format(ui_name, state))
+
+    def isolate_subgroup_lock(self, ui_name):
+        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
+        if not pair:
+            return
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        keep_hp = bool(getattr(self, 'cb_keep_hp_structure', None) and self.cb_keep_hp_structure.isChecked())
+        hp_names = set()
+        lp_names = set()
+        for root, suffix, target in ((hp_main, bg_core.BakeConfig.SUFFIX_HP, hp_names), (lp_main, bg_core.BakeConfig.SUFFIX_LP, lp_names)):
+            if not root or not cmds.objExists(root):
+                continue
+            for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
+                if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                    continue
+                short_name = child.split('|')[-1]
+                if not keep_hp:
+                    attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                    group_type = cmds.getAttr(attr) if cmds.objExists(attr) else None
+                    if group_type and group_type != ("HP" if target is hp_names else "LP"):
+                        continue
+                    if not group_type and not short_name.endswith(suffix):
+                        continue
+                match = re.search(r'(_HP|_hp|HP|hp|_LP|_lp|LP|lp)(\d*)$', short_name)
+                name = short_name[:match.start()] + match.group(2) if match else short_name
+                target.add(name)
+        names = hp_names | (lp_names if keep_hp else (hp_names & lp_names))
+        if ui_name not in names:
+            return
+        locked = set(pair.get('locked', []) or []) & names
+        all_locked = bool(names) and locked == names
+        only_target_unlocked = locked == (names - set([ui_name]))
+        if all_locked or only_target_unlocked:
+            new_locked = set()
+            action = "Unlock All Groups"
+        else:
+            new_locked = names - set([ui_name])
+            action = "Lock All Except Group"
+        pair['locked'] = sorted(new_locked)
+        bg_core.BakeSessionModel.save(self.root_pairs)
+        self.refresh_left_panel()
+        if hasattr(self, 'record_user_action'):
+            self.record_user_action(action, ui_name)
 
     def set_active_subgroup(self, name):
         self.active_subgroup_name = name
@@ -7266,7 +7471,11 @@ class SceneInteractionMixin:
     def _separate_mesh_transforms(self, mesh_nodes, select_result=True):
         valid_nodes = []
         seen = set()
-        for node in mesh_nodes or []:
+        try:
+            mesh_nodes = cmds.ls(mesh_nodes or [], long=True, objectsOnly=True) or []
+        except Exception:
+            mesh_nodes = mesh_nodes or []
+        for node in mesh_nodes:
             if not node or not cmds.objExists(node):
                 continue
             node_type = cmds.nodeType(node)
@@ -7293,13 +7502,17 @@ class SceneInteractionMixin:
                 base_name = obj.split('|')[-1]
                 target_parent = self.get_parent_tool(obj)
                 try:
+                    cmds.select(obj, replace=True)
                     result = cmds.polySeparate(obj, ch=False) or []
+                    selection_result = cmds.ls(selection=True, long=True, objectsOnly=True) or []
                 except Exception as e:
                     cmds.warning("Separate failed for {}: {}".format(base_name, e))
                     continue
 
+                if not isinstance(result, (list, tuple)):
+                    result = [result]
                 parts = []
-                for item in result:
+                for item in list(result) + list(selection_result):
                     if not item or not cmds.objExists(item):
                         continue
                     if cmds.nodeType(item) == "mesh":
@@ -7313,7 +7526,13 @@ class SceneInteractionMixin:
                     if long_item not in parts:
                         parts.append(long_item)
 
-                if not parts:
+                if len(parts) < 2:
+                    try:
+                        info = self._combined_check_mesh_shells(obj)
+                    except Exception:
+                        info = None
+                    if info and info.get("meaningful_shell_count", 0) > 1:
+                        cmds.warning("Separate could not split {} into independent shells.".format(base_name))
                     continue
 
                 for index, part in enumerate(parts, 1):
@@ -7348,7 +7567,7 @@ class SceneInteractionMixin:
         return final_selection
 
     def tool_separate(self):
-        sel = cmds.ls(sl=True, l=True)
+        sel = cmds.ls(sl=True, l=True, objectsOnly=True)
         if not sel:
             return cmds.warning("Select an object to separate.")
         try:

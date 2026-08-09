@@ -156,6 +156,8 @@ class BakeSessionModel(object):
             # Global cage settings for this chapter (percent of bbox diagonal).
             if 'cage_settings' not in p or not isinstance(p.get('cage_settings'), dict):
                 p['cage_settings'] = {}
+            if 'subgroup_color_indices' not in p or not isinstance(p.get('subgroup_color_indices'), dict):
+                p['subgroup_color_indices'] = {}
             cs = p['cage_settings']
             cs.setdefault('inflate', 5.0)   # step 1: uniform inflation (% diag)
             cs.setdefault('gap', 0.5)       # kept gap between fitted cage and HP

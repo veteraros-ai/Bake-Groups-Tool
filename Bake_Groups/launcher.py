@@ -33,6 +33,18 @@ def _active_runtime_dir(script_dir):
     return script_dir
 
 
+def _apply_pending_math_core(bin_dir):
+    target = os.path.join(bin_dir, "bg_math_core.pyd")
+    pending = target + ".pending"
+    if not os.path.exists(pending):
+        return
+    try:
+        os.replace(pending, target)
+        print("Bake Groups math core updated: {}".format(target))
+    except Exception as exc:
+        print("Bake Groups math core pending update: {}".format(exc))
+
+
 def _prepare_versioned_math_core_path():
     script_dir = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
     runtime_dir = _active_runtime_dir(script_dir)
@@ -40,9 +52,16 @@ def _prepare_versioned_math_core_path():
     version_match = re.search(r"\d{4}", maya_version_raw)
     maya_version = version_match.group(0) if version_match else maya_version_raw
     bin_dir = os.path.join(runtime_dir, "bin", maya_version)
-    if os.path.exists(os.path.join(bin_dir, "bg_math_core.pyd")):
-        if bin_dir in sys.path:
-            sys.path.remove(bin_dir)
+    runtime_bin_dir = os.path.join(bin_dir, "runtime")
+    runtime_core = os.path.join(runtime_bin_dir, "bg_math_core.pyd")
+    if not os.path.exists(runtime_core):
+        _apply_pending_math_core(bin_dir)
+    for core_dir in (runtime_bin_dir, bin_dir):
+        if core_dir in sys.path:
+            sys.path.remove(core_dir)
+    if os.path.exists(runtime_core):
+        sys.path.insert(0, runtime_bin_dir)
+    elif os.path.exists(os.path.join(bin_dir, "bg_math_core.pyd")):
         sys.path.insert(0, bin_dir)
     for path in (runtime_dir, script_dir):
         if path in sys.path:

@@ -7,12 +7,16 @@ import time
 import bg_core
 
 try:
-    import bg_math_core
+    import bg_math_core_runtime as bg_math_core
     HAS_MATH_CORE = True
 except ImportError:
-    bg_math_core = None
-    HAS_MATH_CORE = False
-    print("WARNING: bg_math_core (.pyd) not found! LP matching will use bbox-center fallback logic.")
+    try:
+        import bg_math_core
+        HAS_MATH_CORE = True
+    except ImportError:
+        bg_math_core = None
+        HAS_MATH_CORE = False
+        print("WARNING: bg_math_core (.pyd) not found! LP matching will use bbox-center fallback logic.")
 
 try:
     from PySide6 import QtCore

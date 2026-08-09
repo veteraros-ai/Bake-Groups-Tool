@@ -26,6 +26,8 @@ import bg_version
 
 PACKAGE_DOWNLOAD_TIMEOUT = 300
 DEFAULT_PACKAGE_URL = "https://codeload.github.com/{}/zip/refs/heads/main".format(bg_version.GITHUB_REPOSITORY)
+DEVELOPER_MARKER_NAME = ".bake_groups_developer.json"
+KEEP_PREVIOUS_VERSIONS = 1
 
 
 def _version_tuple(value):
@@ -155,6 +157,85 @@ def _bootstrap_dir():
     return runtime_dir
 
 
+def _active_state(bootstrap_dir=None):
+    bootstrap_dir = bootstrap_dir or _bootstrap_dir()
+    path = os.path.join(bootstrap_dir, "active_version.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _developer_preserve_versions(bootstrap_dir):
+    marker = os.path.join(bootstrap_dir, DEVELOPER_MARKER_NAME)
+    if not os.path.exists(marker):
+        return False
+    try:
+        with open(marker, "r") as handle:
+            data = json.load(handle)
+        return data.get("preserve_versions", True) is not False
+    except Exception:
+        return True
+
+
+def _versioned_runtime_dirs(bootstrap_dir):
+    versions_dir = os.path.join(bootstrap_dir, "versions")
+    if not os.path.isdir(versions_dir):
+        return []
+    result = []
+    for name in os.listdir(versions_dir):
+        path = os.path.join(versions_dir, name)
+        if not os.path.isdir(path) or not re.match(r"^\d+\.\d+\.\d+$", name):
+            continue
+        if not os.path.exists(os.path.join(path, "bg_main_window.py")):
+            continue
+        result.append((name, path))
+    return sorted(result, key=lambda item: _version_tuple(item[0]), reverse=True)
+
+
+def get_rollback_info():
+    bootstrap_dir = _bootstrap_dir()
+    state = _active_state(bootstrap_dir)
+    current = str(state.get("active_version") or bg_version.__version__).strip()
+    previous = str(state.get("previous_version") or "").strip()
+    available = dict((name, path) for name, path in _versioned_runtime_dirs(bootstrap_dir))
+
+    if not previous or previous not in available or previous == current:
+        older = [
+            name for name, _path in _versioned_runtime_dirs(bootstrap_dir)
+            if name != current and is_newer_version(current, name)
+        ]
+        previous = older[0] if older else ""
+
+    return {
+        "available": bool(previous and previous in available),
+        "current_version": current,
+        "previous_version": previous,
+        "previous_path": available.get(previous),
+    }
+
+
+def _cleanup_old_versions(bootstrap_dir, active_version, previous_version):
+    if _developer_preserve_versions(bootstrap_dir):
+        return {"skipped": True, "removed": [], "reason": "developer_marker"}
+
+    protected = set([str(active_version or ""), str(previous_version or "")])
+    removed = []
+    for name, path in _versioned_runtime_dirs(bootstrap_dir):
+        if name in protected:
+            continue
+        try:
+            shutil.rmtree(path)
+            removed.append(name)
+        except Exception:
+            pass
+    return {"skipped": False, "removed": removed}
+
+
 def _progress(progress_callback, value, message_key):
     if progress_callback:
         progress_callback(value, bg_l10n.text(message_key))
@@ -255,12 +336,14 @@ def _find_runtime_source(extract_dir):
     raise RuntimeError("Bake_Groups runtime folder not found in update package")
 
 
-def _write_active_version(bootstrap_dir, version, target_dir):
+def _write_active_version(bootstrap_dir, version, target_dir, previous_version=None):
     data = {
         "active_version": version,
         "installed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "path": os.path.normpath(target_dir),
     }
+    if previous_version:
+        data["previous_version"] = str(previous_version)
     path = os.path.join(bootstrap_dir, "active_version.json")
     with open(path, "w") as handle:
         json.dump(data, handle, indent=2)
@@ -304,20 +387,25 @@ def install_update(update_info, progress_callback=None):
         raise RuntimeError("Update version is not available")
 
     bootstrap_dir = _bootstrap_dir()
+    current_state = _active_state(bootstrap_dir)
+    current_version = str(current_state.get("active_version") or bg_version.__version__).strip()
     versions_dir = os.path.join(bootstrap_dir, "versions")
     target_dir = os.path.join(versions_dir, version)
     package_url = update_info.get("package_url") or DEFAULT_PACKAGE_URL
 
     if os.path.exists(os.path.join(target_dir, "bg_main_window.py")):
         _progress(progress_callback, 90, "Activating update...")
-        _write_active_version(bootstrap_dir, version, target_dir)
+        previous_version = current_version if current_version != version else current_state.get("previous_version")
+        _write_active_version(bootstrap_dir, version, target_dir, previous_version)
         _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        cleanup = _cleanup_old_versions(bootstrap_dir, version, previous_version)
         _progress(progress_callback, 100, "Update installed.")
         return {
             "success": True,
             "version": version,
             "target_dir": target_dir,
             "already_installed": True,
+            "cleanup": cleanup,
         }
 
     if not os.path.exists(versions_dir):
@@ -360,19 +448,48 @@ def install_update(update_info, progress_callback=None):
             shutil.rmtree(target_dir)
         os.rename(staging_dir, target_dir)
         _progress(progress_callback, 90, "Activating update...")
-        _write_active_version(bootstrap_dir, version, target_dir)
+        previous_version = current_version if current_version != version else current_state.get("previous_version")
+        _write_active_version(bootstrap_dir, version, target_dir, previous_version)
         _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+        cleanup = _cleanup_old_versions(bootstrap_dir, version, previous_version)
         _progress(progress_callback, 100, "Update installed.")
         return {
             "success": True,
             "version": version,
             "target_dir": target_dir,
             "already_installed": False,
+            "cleanup": cleanup,
         }
     finally:
         if os.path.exists(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def rollback_to_previous(progress_callback=None):
+    _progress(progress_callback, 10, "Preparing rollback...")
+    info = get_rollback_info()
+    if not info.get("available"):
+        raise RuntimeError("No previous version is available.")
+
+    bootstrap_dir = _bootstrap_dir()
+    current = info.get("current_version")
+    previous = info.get("previous_version")
+    previous_path = info.get("previous_path")
+    if not previous_path or not os.path.exists(os.path.join(previous_path, "bg_main_window.py")):
+        raise RuntimeError("Previous version files are not available.")
+
+    _progress(progress_callback, 65, "Activating previous version...")
+    _write_active_version(bootstrap_dir, previous, previous_path, current)
+    _copy_bootstrap_launcher(previous_path, bootstrap_dir)
+    cleanup = _cleanup_old_versions(bootstrap_dir, previous, current)
+    _progress(progress_callback, 100, "Rollback installed.")
+    return {
+        "success": True,
+        "version": previous,
+        "previous_version": current,
+        "cleanup": cleanup,
+    }
 
 
 class UpdateCheckWorker(QtCore.QThread):
@@ -402,8 +519,21 @@ class UpdateInstallWorker(QtCore.QThread):
         self.install_result.emit(result)
 
 
+class RollbackWorker(QtCore.QThread):
+    rollback_progress = QtCore.Signal(int, str)
+    rollback_result = QtCore.Signal(dict)
+
+    def run(self):
+        try:
+            result = rollback_to_previous(self.rollback_progress.emit)
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+        self.rollback_result.emit(result)
+
+
 class UpdateAvailableDialog(QtWidgets.QDialog):
     update_requested = QtCore.Signal()
+    rollback_requested = QtCore.Signal()
     release_notes_requested = QtCore.Signal()
     check_requested = QtCore.Signal()
 
@@ -411,7 +541,9 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         super(UpdateAvailableDialog, self).__init__(parent)
         self.update_info = update_info or {}
         self.install_worker = None
+        self.rollback_worker = None
         self.install_success = False
+        self.rollback_info = {}
         self.setWindowTitle(bg_l10n.text("Bake Groups Tool Update"))
         self.setObjectName("BakeGroupsUpdateDialog")
         self.setModal(True)
@@ -419,6 +551,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.setMaximumWidth(560)
         self._build_ui()
         self._apply_style()
+        self.set_rollback_info(get_rollback_info())
         if update_info:
             self.set_result(update_info)
         else:
@@ -486,8 +619,10 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
 
         current_label = QtWidgets.QLabel(bg_l10n.text("Installed:"))
         latest_label = QtWidgets.QLabel(bg_l10n.text("Latest:"))
+        self.previous_label = QtWidgets.QLabel(bg_l10n.text("Previous:"))
         self.current_value = QtWidgets.QLabel(str(bg_version.__version__))
         self.latest_value = QtWidgets.QLabel("")
+        self.previous_value = QtWidgets.QLabel("")
         current_label.setObjectName("VersionLabel")
         latest_label.setObjectName("VersionLabel")
         self.current_value.setObjectName("VersionValue")
@@ -496,6 +631,8 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         versions_layout.addWidget(self.current_value, 0, 1)
         versions_layout.addWidget(latest_label, 1, 0)
         versions_layout.addWidget(self.latest_value, 1, 1)
+        versions_layout.addWidget(self.previous_label, 2, 0)
+        versions_layout.addWidget(self.previous_value, 2, 1)
         versions_layout.setColumnStretch(1, 1)
         layout.addWidget(self.versions_panel)
 
@@ -541,13 +678,16 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         buttons.addStretch(1)
 
         self.release_btn = QtWidgets.QPushButton(bg_l10n.text("Release Notes"))
+        self.rollback_btn = QtWidgets.QPushButton(bg_l10n.text("Rollback"))
         self.later_btn = QtWidgets.QPushButton(bg_l10n.text("Later"))
         self.update_btn = QtWidgets.QPushButton(bg_l10n.text("Update Now"))
         self.update_btn.setObjectName("PrimaryButton")
         self.release_btn.clicked.connect(self.release_notes_requested.emit)
+        self.rollback_btn.clicked.connect(self.rollback_requested.emit)
         self.later_btn.clicked.connect(self.reject)
         self.update_btn.clicked.connect(self.update_requested.emit)
         buttons.addWidget(self.release_btn)
+        buttons.addWidget(self.rollback_btn)
         buttons.addWidget(self.later_btn)
         buttons.addWidget(self.update_btn)
         layout.addLayout(buttons)
@@ -561,6 +701,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.body_label.setText(bg_l10n.text("Click Check to look for a newer build on GitHub."))
         self.current_value.setText(str(bg_version.__version__))
         self.latest_value.setText("?")
+        self.set_rollback_info(get_rollback_info())
         self.versions_panel.show()
         self.notes_title.hide()
         self.release_notes_box.hide()
@@ -578,6 +719,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.body_label.setText(bg_l10n.text("Looking for a newer build on GitHub..."))
         self.current_value.setText(str(bg_version.__version__))
         self.latest_value.setText("...")
+        self.set_rollback_info(get_rollback_info())
         self.versions_panel.show()
         self.notes_title.hide()
         self.release_notes_box.hide()
@@ -594,6 +736,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.check_btn.setEnabled(True)
         self.later_btn.setText(bg_l10n.text("Close"))
         self.current_value.setText(str(self.update_info.get("current_version") or bg_version.__version__))
+        self.set_rollback_info(get_rollback_info())
 
         if self.update_info.get("error"):
             self.message_label.setText(bg_l10n.text("Update check failed"))
@@ -627,6 +770,16 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.release_btn.hide()
             self.update_btn.hide()
 
+    def set_rollback_info(self, info=None):
+        self.rollback_info = info or get_rollback_info()
+        available = bool(self.rollback_info.get("available"))
+        previous = str(self.rollback_info.get("previous_version") or "")
+        self.previous_label.setVisible(available)
+        self.previous_value.setVisible(available)
+        self.previous_value.setText(previous)
+        self.rollback_btn.setVisible(available)
+        self.rollback_btn.setEnabled(available and not self.rollback_worker)
+
     def set_installing(self):
         self._set_status_warning(False)
         self.status_label.setText(bg_l10n.text("Installing update..."))
@@ -634,6 +787,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.show()
         self.update_btn.setEnabled(False)
+        self.rollback_btn.setEnabled(False)
         self.release_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
         self.later_btn.show()
@@ -659,6 +813,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.later_btn.hide()
             self._set_status_warning(True)
             self.status_label.setText(bg_l10n.text("Update installed. Restart Maya to complete the update."))
+            self.set_rollback_info(get_rollback_info())
         else:
             self.install_success = False
             self.update_btn.setEnabled(True)
@@ -668,9 +823,51 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.status_label.setText(bg_l10n.text("Update installation failed: {error}").format(error=result.get("error", "")))
         self.status_label.show()
 
+    def set_rollbacking(self):
+        self._set_status_warning(False)
+        self.status_label.setText(bg_l10n.text("Rolling back..."))
+        self.status_label.show()
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.rollback_btn.setEnabled(False)
+        self.update_btn.setEnabled(False)
+        self.release_btn.setEnabled(False)
+        self.later_btn.setEnabled(False)
+        self.check_btn.setEnabled(False)
+
+    def set_rollback_progress(self, value, message):
+        self._set_status_warning(False)
+        self.progress_bar.setValue(max(0, min(100, int(value or 0))))
+        if message:
+            self.status_label.setText(message)
+            self.status_label.show()
+
+    def set_rollback_result(self, result):
+        self.release_btn.setEnabled(True)
+        self.later_btn.setEnabled(True)
+        self.later_btn.setText(bg_l10n.text("Close"))
+        if result.get("success"):
+            self.install_success = True
+            self.progress_bar.setValue(100)
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(bg_l10n.text("Close"))
+            self.later_btn.hide()
+            self._set_status_warning(True)
+            self.status_label.setText(bg_l10n.text("Rollback installed. Restart Maya to complete the rollback."))
+            self.set_rollback_info(get_rollback_info())
+        else:
+            self.install_success = False
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(bg_l10n.text("Update Now"))
+            self.later_btn.show()
+            self._set_status_warning(False)
+            self.status_label.setText(bg_l10n.text("Rollback failed: {error}").format(error=result.get("error", "")))
+        self.status_label.show()
+
     def closeEvent(self, event):
         worker = self.install_worker
-        if worker and worker.isRunning():
+        rollback_worker = self.rollback_worker
+        if (worker and worker.isRunning()) or (rollback_worker and rollback_worker.isRunning()):
             event.ignore()
             return
         super(UpdateAvailableDialog, self).closeEvent(event)
@@ -854,6 +1051,26 @@ def _wire_update_dialog(dialog):
         worker.start()
 
     dialog.update_requested.connect(start_install)
+
+    def start_rollback():
+        if dialog.rollback_worker and dialog.rollback_worker.isRunning():
+            return
+        dialog.set_rollbacking()
+        worker = RollbackWorker()
+        dialog.rollback_worker = worker
+        worker.rollback_progress.connect(dialog.set_rollback_progress)
+        worker.rollback_result.connect(dialog.set_rollback_result)
+        worker.finished.connect(worker.deleteLater)
+        def clear_rollback_worker():
+            dialog.rollback_worker = None
+            try:
+                dialog.set_rollback_info(get_rollback_info())
+            except RuntimeError:
+                pass
+        worker.finished.connect(clear_rollback_worker)
+        worker.start()
+
+    dialog.rollback_requested.connect(start_rollback)
     return dialog
 
 

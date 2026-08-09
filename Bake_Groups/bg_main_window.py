@@ -89,7 +89,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.setObjectName("BakeManagerUI")
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setMinimumSize(320, 400)
-        self.resize(800, 800)
+        self.resize(640, 800)
         self.setAcceptDrops(False)
 
         self.core = bg_core.MayaCore()
@@ -116,6 +116,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.user_action_lines = []
         self.subgroup_color_override_cache = {}
         self.subgroup_color_index_map = {}
+        self.subgroup_custom_color_map = self.load_subgroup_custom_colors()
         self.active_material_visibility_filter = None
         self._is_closing = False
         self.update_worker = None
@@ -494,6 +495,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 if widget.isWindow():
                     continue
                 if isinstance(widget, QtWidgets.QLabel):
+                    if widget.property("bg_preserve_min_width"):
+                        continue
                     widget.setWordWrap(False)
                     widget.setMinimumWidth(0)
                     sp = widget.sizePolicy()
@@ -629,18 +632,30 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.algo_group.addWidget(self.combo_hp_cache_mode)
 
         grid = QtWidgets.QGridLayout()
-        grid.addWidget(QtWidgets.QLabel("HP Collision (%):"), 0, 0)
+        self.lbl_collision_pct = QtWidgets.QLabel("Collision (%):")
+        self.lbl_collision_pct.setProperty("bg_i18n_key", "Collision (%):")
+        self.lbl_collision_pct.setProperty("bg_preserve_min_width", True)
+        self.lbl_collision_pct.setMinimumWidth(82)
+        self.lbl_collision_pct.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         self.spin_threshold = QtWidgets.QSpinBox()
         self.spin_threshold.setRange(0, 100)
         self.spin_threshold.setValue(15)
         self.spin_threshold.setFixedWidth(50)
         self.spin_collision_pct = self.spin_threshold
-        grid.addWidget(self.spin_threshold, 0, 1)
+        collision_row = QtWidgets.QWidget()
+        collision_row.setMinimumWidth(134)
+        collision_layout = QtWidgets.QHBoxLayout(collision_row)
+        collision_layout.setContentsMargins(0, 0, 0, 0)
+        collision_layout.setSpacing(2)
+        collision_layout.addWidget(self.lbl_collision_pct)
+        collision_layout.addWidget(self.spin_threshold)
+        collision_layout.addStretch(1)
+        grid.addWidget(collision_row, 0, 0, 1, 3)
 
         self.hp_group_limit = 12
         self.chk_ignore_floaters = QtWidgets.QCheckBox("Ignore Floaters")
         self.chk_ignore_floaters.setChecked(True)
-        grid.addWidget(self.chk_ignore_floaters, 0, 2)
+        grid.addWidget(self.chk_ignore_floaters, 0, 3, 1, 2, QtCore.Qt.AlignRight)
 
         # N_Mat is no longer a visible flag: the multi-material choice is made in
         # a dialog at Create time and stored per chapter (pair['material_slots']).
@@ -649,30 +664,81 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.chk_material_slots.setChecked(False)
         self.chk_material_slots.setVisible(False)
 
-        self.lbl_hp_link_vtx = QtWidgets.QLabel("HP Link Vtx:")
-        grid.addWidget(self.lbl_hp_link_vtx, 1, 0)
+        self.chk_compound_link = QtWidgets.QCheckBox()
+        self.chk_compound_link.setFixedWidth(14)
+        self.chk_compound_link.setStyleSheet(
+            "QCheckBox { margin: 0px; padding: 0px; spacing: 0px; }"
+            "QCheckBox::indicator { width: 12px; height: 12px; margin: 0px; padding: 0px; }"
+        )
+        self.chk_compound_link.setProperty("bg_i18n_key", "Adjacent Vertex Link")
+        self.chk_compound_link.setChecked(False)
+        self.chk_compound_link.setToolTip(bg_l10n.tooltip("Adjacent Vertex Link"))
+        self.chk_compound_link.setStatusTip(bg_l10n.tooltip("Adjacent Vertex Link"))
+
+        self.lbl_hp_link_vtx = QtWidgets.QLabel("Link Vertex:")
+        self.lbl_hp_link_vtx.setProperty("bg_i18n_key", "Link Vertex:")
+        self.lbl_hp_link_vtx.setProperty("bg_preserve_min_width", True)
+        self.lbl_hp_link_vtx.setMinimumWidth(68)
+        self.lbl_hp_link_vtx.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         self.spin_compound_link_verts = QtWidgets.QSpinBox()
         self.spin_compound_link_verts.setRange(1, 500)
         self.spin_compound_link_verts.setValue(8)
-        self.spin_compound_link_verts.setObjectName("HP Link Vtx:")
+        self.spin_compound_link_verts.setObjectName("Link Vertex:")
         self.spin_compound_link_verts.setFixedWidth(50)
-        grid.addWidget(self.spin_compound_link_verts, 1, 1)
 
-        self.lbl_hp_link_dist = QtWidgets.QLabel("HP Link Dist (%):")
-        grid.addWidget(self.lbl_hp_link_dist, 1, 2)
+        self.lbl_hp_link_dist = QtWidgets.QLabel("Link Dist (%):")
+        self.lbl_hp_link_dist.setProperty("bg_i18n_key", "Link Dist (%):")
+        self.lbl_hp_link_dist.setProperty("bg_preserve_min_width", True)
+        self.lbl_hp_link_dist.setMinimumWidth(70)
+        self.lbl_hp_link_dist.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         self.spin_compound_link_dist = QtWidgets.QDoubleSpinBox()
         self.spin_compound_link_dist.setRange(0.01, 25.0)
         self.spin_compound_link_dist.setDecimals(2)
         self.spin_compound_link_dist.setValue(0.1)
         self.spin_compound_link_dist.setSingleStep(0.05)
-        self.spin_compound_link_dist.setObjectName("HP Link Dist (%):")
+        self.spin_compound_link_dist.setObjectName("Link Dist (%):")
         self.spin_compound_link_dist.setFixedWidth(58)
-        grid.addWidget(self.spin_compound_link_dist, 1, 3)
 
-        grid.setColumnStretch(0, 2)
+        link_row = QtWidgets.QWidget()
+        link_row.setObjectName("AdjacentLinkSettings")
+        link_layout = QtWidgets.QHBoxLayout(link_row)
+        link_layout.setContentsMargins(0, 0, 0, 0)
+        link_layout.setSpacing(2)
+        link_layout.addWidget(self.lbl_hp_link_vtx)
+        link_layout.addWidget(self.spin_compound_link_verts)
+        link_layout.addWidget(self.lbl_hp_link_dist)
+        link_layout.addWidget(self.spin_compound_link_dist)
+        link_layout.addStretch(1)
+        link_layout.addWidget(self.chk_compound_link)
+        grid.addWidget(link_row, 1, 0, 1, 5)
+
+        def update_compound_link_controls(enabled):
+            enabled = bool(enabled)
+            label_color = "#c7c7c7" if enabled else "#686868"
+            field_color = "#e0e0e0" if enabled else "#686868"
+            for widget in (self.lbl_hp_link_vtx, self.lbl_hp_link_dist):
+                widget.setEnabled(enabled)
+                palette = widget.palette()
+                if hasattr(QtGui.QPalette, "WindowText"):
+                    role = QtGui.QPalette.WindowText
+                else:
+                    role = QtGui.QPalette.ColorRole.WindowText
+                palette.setColor(role, QtGui.QColor(label_color))
+                widget.setPalette(palette)
+            for widget in (self.spin_compound_link_verts, self.spin_compound_link_dist):
+                widget.setEnabled(enabled)
+                widget.setStyleSheet(
+                    "QSpinBox, QDoubleSpinBox { color: %s; }" % field_color
+                )
+
+        self.chk_compound_link.toggled.connect(update_compound_link_controls)
+        update_compound_link_controls(self.chk_compound_link.isChecked())
+
+        grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 0)
-        grid.setColumnStretch(2, 2)
-        grid.setColumnStretch(3, 0)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(4, 0)
 
         self.algo_group.addLayout(grid)
 
@@ -798,6 +864,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.core._node_cache.clear()
         self.active_root_id = snapshot.get("active_root_id")
         self.active_subgroup_name = snapshot.get("active_subgroup_name")
+        active_pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+        self.subgroup_color_index_map = dict(active_pair.get('subgroup_color_indices') or {}) if active_pair else {}
         self.is_isolated = bool(snapshot.get("is_isolated", False))
         self.is_final_view = bool(snapshot.get("is_final_view", False))
         self.is_preview_active = bool(snapshot.get("is_preview_active", False))
@@ -1096,6 +1164,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 "material_slots": self.chk_material_slots.isChecked() if hasattr(self, "chk_material_slots") else None,
                 "hp_link_vtx": self.spin_compound_link_verts.value() if hasattr(self, "spin_compound_link_verts") else None,
                 "hp_link_dist_pct": self.spin_compound_link_dist.value() if hasattr(self, "spin_compound_link_dist") else None,
+                "adjacent_vertex_link": self.chk_compound_link.isChecked() if hasattr(self, "chk_compound_link") else None,
                 "color_groups": self.cb_color_subgroups.isChecked() if hasattr(self, "cb_color_subgroups") else None,
                 "keep_hp": self.cb_keep_hp_structure.isChecked() if hasattr(self, "cb_keep_hp_structure") else None,
             },
@@ -1326,7 +1395,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
     def on_color_by_subgroups_toggled(self, checked):
         with self._suspended_viewport_refresh():
             if checked:
-                self.subgroup_color_index_map = {}
+                self.ensure_subgroup_color_indices(self._subgroup_color_names_for_active_pair())
                 self.update_subgroup_colors()
             else:
                 self.restore_subgroup_colors(clean_history=True)
@@ -1336,8 +1405,72 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                     removed = self.cleanup_subgroup_preview_color_sets([hp_main, lp_main], clean_history=True)
                     if removed:
                         self.log("Color HP: removed {} old preview color set(s).".format(removed), "lightblue")
-                self.subgroup_color_index_map = {}
         self.refresh_left_panel()
+
+    def load_subgroup_custom_colors(self):
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        raw = settings.value("subgroup_custom_colors", "{}")
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                raw = "{}"
+        try:
+            data = json.loads(str(raw)) if raw else {}
+        except Exception:
+            data = {}
+        result = {}
+        if not isinstance(data, dict):
+            return result
+        for name, color in data.items():
+            if not isinstance(color, (list, tuple)) or len(color) < 3:
+                continue
+            try:
+                result[str(name)] = [max(0.0, min(1.0, float(color[0]))), max(0.0, min(1.0, float(color[1]))), max(0.0, min(1.0, float(color[2])))]
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def save_subgroup_custom_colors(self):
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        settings.setValue("subgroup_custom_colors", json.dumps(self.subgroup_custom_color_map, ensure_ascii=False, separators=(",", ":")))
+        settings.sync()
+
+    def choose_subgroup_color(self, subgroup_name):
+        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
+            return
+        current = self.subgroup_color_for_name(subgroup_name)
+        initial = QtGui.QColor.fromRgbF(current[0], current[1], current[2])
+        selected = QtWidgets.QColorDialog.getColor(initial, self, bg_l10n.text("Select Color"))
+        if not selected.isValid():
+            return
+        color = [selected.redF(), selected.greenF(), selected.blueF()]
+        self.subgroup_custom_color_map[str(subgroup_name)] = color
+        self.save_subgroup_custom_colors()
+        self.ensure_subgroup_color_indices([subgroup_name])
+        with self._suspended_viewport_refresh():
+            self.update_subgroup_colors()
+        self.refresh_left_panel()
+        self.log("Color HP: saved custom color for {}.".format(subgroup_name), "lightblue")
+
+    def show_subgroup_context_menu(self, button, subgroup_name, hp_node, lp_node):
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
+        rename_action = menu.addAction(bg_l10n.text("Rename Subgroup"))
+        rename_action.triggered.connect(
+            lambda checked=False: self.run_undoable_bg_action(
+                "Rename Group", self.rename_subgroup_ui, subgroup_name, hp_node, lp_node
+            )
+        )
+        color_action = menu.addAction(bg_l10n.text("Select Color"))
+        color_action.setEnabled(bool(hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked()))
+        color_action.triggered.connect(lambda checked=False: self.choose_subgroup_color(subgroup_name))
+        bg_l10n.localize_menu(menu)
+        global_pos = button.mapToGlobal(QtCore.QPoint(0, button.height()))
+        if hasattr(menu, 'exec_'):
+            menu.exec_(global_pos)
+        else:
+            menu.exec(global_pos)
 
     def subgroup_color_for_name(self, name):
         palette = [
@@ -1361,6 +1494,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             (0.518, 0.459, 0.404),
             (1.000, 0.945, 0.145),
         ]
+        custom_color = (getattr(self, 'subgroup_custom_color_map', {}) or {}).get(str(name))
+        if custom_color and len(custom_color) >= 3:
+            return tuple(max(0.0, min(1.0, float(channel))) for channel in custom_color[:3])
         index_map = getattr(self, 'subgroup_color_index_map', {}) or {}
         if name in index_map:
             index = index_map[name]
@@ -1374,19 +1510,104 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         shade = 1.0 if pass_index == 0 else max(0.38, 0.62 ** pass_index)
         return tuple(max(0.0, min(1.0, channel * shade)) for channel in base)
 
+    def _active_color_pair(self):
+        return next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
+
+    def _subgroup_color_names_for_pair(self, pair):
+        if not pair:
+            return []
+        hp_main, _, _ = self.core.resolve_main_nodes(pair)
+        if not hp_main or not cmds.objExists(hp_main):
+            return []
+        keep_hp = bool(getattr(self, 'cb_keep_hp_structure', None) and self.cb_keep_hp_structure.isChecked())
+        names = []
+        for child in cmds.listRelatives(hp_main, children=True, type='transform', fullPath=True) or []:
+            if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
+                continue
+            short_name = child.split('|')[-1]
+            is_hp = keep_hp
+            if not is_hp:
+                attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
+                is_hp = cmds.objExists(attr) and cmds.getAttr(attr) == "HP"
+                if not is_hp and short_name.endswith(bg_core.BakeConfig.SUFFIX_HP):
+                    is_hp = True
+            if not is_hp:
+                continue
+            match = re.search(r'(_HP|_hp|HP|hp)(\d*)$', short_name)
+            ui_name = short_name[:match.start()] + match.group(2) if match else short_name
+            if ui_name not in names:
+                names.append(ui_name)
+        return names
+
+    def _subgroup_color_names_for_active_pair(self):
+        return self._subgroup_color_names_for_pair(self._active_color_pair())
+
     def ensure_subgroup_color_indices(self, names, reset=False):
-        if reset:
-            self.subgroup_color_index_map = {}
-        index_map = getattr(self, 'subgroup_color_index_map', None)
-        if index_map is None:
-            index_map = {}
-            self.subgroup_color_index_map = index_map
-        next_index = max(index_map.values()) + 1 if index_map else 0
-        for name in names or []:
-            if name not in index_map:
-                index_map[name] = next_index
+        pair = self._active_color_pair()
+        requested_names = set(str(name) for name in (names or []) if name)
+        scene_names = set(self._subgroup_color_names_for_pair(pair)) if pair else set()
+        active_names = scene_names or requested_names
+        active_names.update(requested_names)
+
+        stored = pair.get('subgroup_color_indices', {}) if pair else {}
+        if not isinstance(stored, dict):
+            stored = {}
+        old_map = {}
+        for name, index in stored.items():
+            try:
+                old_map[str(name)] = max(0, int(index))
+            except (TypeError, ValueError):
+                continue
+
+        index_map = {name: old_map[name] for name in active_names if name in old_map}
+        used_indices = set(index_map.values())
+        next_index = 0
+        for name in sorted(active_names):
+            if name in index_map:
+                continue
+            while next_index in used_indices:
                 next_index += 1
-        return index_map
+            index_map[name] = next_index
+            used_indices.add(next_index)
+            next_index += 1
+
+        changed = old_map != index_map
+        self.subgroup_color_index_map = dict(index_map)
+        if pair:
+            pair['subgroup_color_indices'] = dict(index_map)
+            if changed:
+                bg_core.BakeSessionModel.save(self.root_pairs)
+        return self.subgroup_color_index_map
+
+    def rename_subgroup_color_index(self, old_name, new_name, pair=None):
+        pair = pair or self._active_color_pair()
+        if not pair or old_name == new_name:
+            return
+        custom_changed = False
+        custom_map = getattr(self, 'subgroup_custom_color_map', {}) or {}
+        if old_name in custom_map:
+            if new_name not in custom_map:
+                custom_map[new_name] = custom_map[old_name]
+            del custom_map[old_name]
+            self.subgroup_custom_color_map = custom_map
+            custom_changed = True
+        stored = pair.get('subgroup_color_indices', {})
+        if not isinstance(stored, dict) or old_name not in stored:
+            if custom_changed:
+                self.save_subgroup_custom_colors()
+            return
+        changed = False
+        if new_name not in stored:
+            stored[new_name] = stored[old_name]
+            changed = True
+        if old_name in stored:
+            del stored[old_name]
+            changed = True
+        self.subgroup_color_index_map = dict(stored)
+        if changed:
+            bg_core.BakeSessionModel.save(self.root_pairs)
+        if custom_changed:
+            self.save_subgroup_custom_colors()
 
     def color_to_qss_rgb(self, color, scale=255):
         return "rgb({}, {}, {})".format(
@@ -1404,11 +1625,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         )
 
     def viewport_subgroup_color(self, color):
-        neutral = 0.22
-        mix = 0.18
-        brightness = 0.68
+        neutral = 0.26
+        mix = 0.36
+        brightness = 0.79
         return tuple(
-            max(0.0, min(0.85, ((channel * (1.0 - mix)) + (neutral * mix)) * brightness))
+            max(0.0, min(0.92, ((channel * (1.0 - mix)) + (neutral * mix)) * brightness))
             for channel in color
         )
 
@@ -1704,12 +1925,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 self.update_subgroup_colors()
 
     def refresh_subgroup_color_preview(self, reset_indices=False):
+        self.ensure_subgroup_color_indices(self._subgroup_color_names_for_active_pair())
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
             return
         if not self.active_chapter_has_subgroups():
             return
-        if reset_indices:
-            self.subgroup_color_index_map = {}
         self.update_subgroup_colors()
 
     def active_chapter_has_subgroups(self, pair=None):
@@ -1848,6 +2068,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 return False
         except RuntimeError:
             pass
+        try:
+            self._release_analysis_worker(attr_name)
+        except Exception:
+            setattr(self, attr_name, None)
         return True
 
     def _stop_update_worker_for_close(self):
@@ -1924,6 +2148,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not self._stop_update_worker_for_close():
             self._is_closing = False
             return False
+        self._clear_analysis_runtime_caches(clear_geometry=True)
         if dialog:
             try:
                 dialog.close()
@@ -1959,6 +2184,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         except RuntimeError:
             return
         self.core._node_cache.clear()
+        self._clear_analysis_runtime_caches(clear_geometry=True)
         self.root_pairs = bg_core.BakeSessionModel.load()
         self.active_root_id = None
         self.active_subgroup_name = None
@@ -2110,7 +2336,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
 
         locked_list = pair.get('locked', [])
         sorted_group_names = sorted(groups.keys())
-        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+        if hasattr(self, 'ensure_subgroup_color_indices'):
             self.ensure_subgroup_color_indices(sorted_group_names)
         for ui_name in sorted_group_names:
             hp_node, lp_node = groups[ui_name]['hp'], groups[ui_name]['lp']
@@ -2136,7 +2362,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_name.setStyleSheet(self.subgroup_name_style(ui_name, is_active_subgroup))
             btn_name.clicked.connect(lambda checked=False, n=ui_name: self.set_active_subgroup(n))
             btn_name.doubleClicked.connect(lambda checked=False, h=hp_node, l=lp_node: self.select_meshes_in_group(h, l))
-            btn_name.rightClicked.connect(lambda checked=False, old_name=ui_name, h=hp_node, l=lp_node: self.run_undoable_bg_action("Rename Group", self.rename_subgroup_ui, old_name, h, l))
+            btn_name.rightClicked.connect(lambda checked=False, b=btn_name, old_name=ui_name, h=hp_node, l=lp_node: self.show_subgroup_context_menu(b, old_name, h, l))
             layout.addWidget(btn_name, stretch=1)
 
             btn_plus = QtWidgets.QPushButton()
@@ -2161,6 +2387,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_lock.setToolTip(bg_l10n.tooltip(lock_tip_key))
             btn_lock.setStatusTip(bg_l10n.tooltip(lock_tip_key))
             btn_lock.clicked.connect(lambda checked=False, n=ui_name: self.run_undoable_bg_action("Toggle Group Lock", self.toggle_lock, n))
+            btn_lock.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            btn_lock.customContextMenuRequested.connect(
+                lambda pos, n=ui_name: self.run_undoable_bg_action("Isolate Group Lock", self.isolate_subgroup_lock, n)
+            )
             layout.addWidget(btn_lock)
 
             btn_del = QtWidgets.QPushButton()
@@ -2212,13 +2442,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not is_switch:
             self.is_isolated = not self.is_isolated
         else:
+            self._clear_analysis_runtime_caches(clear_geometry=True)
             # Switching chapters drops the previous chapter's cage from the
             # viewport selection so it can't linger as the Expansion scope.
             self._deselect_cage_meshes()
             self.active_root_id = pair['id']
             self.active_subgroup_name = None
             self.is_isolated = True
-            self.subgroup_color_index_map = {}
+            self.subgroup_color_index_map = dict(pair.get('subgroup_color_indices') or {})
 
         # Outside Export Settings the whole Cage_BG hierarchy must stay hidden;
         # hide its root if it somehow ended up visible.

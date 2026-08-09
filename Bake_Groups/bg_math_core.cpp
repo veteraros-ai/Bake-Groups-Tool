@@ -293,6 +293,159 @@ float calculate_bidirectional_avg_distance(
 // Индексируем большее облако в сетку, обходим меньшее. Так как нужен только
 // глобальный минимум, текущий минимум пробрасывается в запрос как прунинг —
 // оболочки почти всегда обрываются на R=0..1.
+struct SurfaceDirectionMetrics {
+    float average_distance;
+    float coverage;
+};
+
+static inline float point_triangle_distance_sq(
+    float px, float py, float pz,
+    float ax, float ay, float az,
+    float bx, float by, float bz,
+    float cx, float cy, float cz)
+{
+    float abx = bx - ax, aby = by - ay, abz = bz - az;
+    float acx = cx - ax, acy = cy - ay, acz = cz - az;
+    float apx = px - ax, apy = py - ay, apz = pz - az;
+    float d1 = abx * apx + aby * apy + abz * apz;
+    float d2 = acx * apx + acy * apy + acz * apz;
+    if (d1 <= 0.0f && d2 <= 0.0f) return apx * apx + apy * apy + apz * apz;
+
+    float bpx = px - bx, bpy = py - by, bpz = pz - bz;
+    float d3 = abx * bpx + aby * bpy + abz * bpz;
+    float d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0.0f && d4 <= d3) return bpx * bpx + bpy * bpy + bpz * bpz;
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / std::max(d1 - d3, 1e-12f);
+        float qx = ax + v * abx, qy = ay + v * aby, qz = az + v * abz;
+        float dx = px - qx, dy = py - qy, dz = pz - qz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+    float d5 = abx * cpx + aby * cpy + abz * cpz;
+    float d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0.0f && d5 <= d6) return cpx * cpx + cpy * cpy + cpz * cpz;
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / std::max(d2 - d6, 1e-12f);
+        float qx = ax + w * acx, qy = ay + w * acy, qz = az + w * acz;
+        float dx = px - qx, dy = py - qy, dz = pz - qz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float bcx = cx - bx, bcy = cy - by, bcz = cz - bz;
+        float w = (d4 - d3) / std::max((d4 - d3) + (d5 - d6), 1e-12f);
+        float qx = bx + w * bcx, qy = by + w * bcy, qz = bz + w * bcz;
+        float dx = px - qx, dy = py - qy, dz = pz - qz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float denom = 1.0f / std::max(va + vb + vc, 1e-12f);
+    float v = vb * denom;
+    float w = vc * denom;
+    float qx = ax + abx * v + acx * w;
+    float qy = ay + aby * v + acy * w;
+    float qz = az + abz * v + acz * w;
+    float dx = px - qx, dy = py - qy, dz = pz - qz;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+SurfaceDirectionMetrics calculate_surface_direction(
+    const std::vector<float>& samples,
+    const std::vector<float>& triangles,
+    float tolerance)
+{
+    const size_t sample_count = samples.size() / 3;
+    const size_t triangle_count = triangles.size() / 9;
+    if (sample_count == 0 || triangle_count == 0) {
+        return {std::numeric_limits<float>::max(), 0.0f};
+    }
+
+    const float tolerance_sq = std::max(tolerance * tolerance, 1e-12f);
+    const int hardware_threads = static_cast<int>(std::thread::hardware_concurrency());
+    const int thread_count = sample_count < MIN_PARALLEL_QUERIES
+        ? 1
+        : std::max(1, std::min(hardware_threads > 0 ? hardware_threads : 4, static_cast<int>(sample_count)));
+    std::vector<double> distance_sums(thread_count, 0.0);
+    std::vector<size_t> covered_counts(thread_count, 0);
+
+    auto evaluate_range = [&](size_t start, size_t end, int worker_index) {
+        double sum = 0.0;
+        size_t covered = 0;
+        for (size_t sample_index = start; sample_index < end; ++sample_index) {
+            const float px = samples[sample_index * 3];
+            const float py = samples[sample_index * 3 + 1];
+            const float pz = samples[sample_index * 3 + 2];
+            float best_sq = std::numeric_limits<float>::max();
+            for (size_t triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
+                const size_t base = triangle_index * 9;
+                const float distance_sq = point_triangle_distance_sq(
+                    px, py, pz,
+                    triangles[base], triangles[base + 1], triangles[base + 2],
+                    triangles[base + 3], triangles[base + 4], triangles[base + 5],
+                    triangles[base + 6], triangles[base + 7], triangles[base + 8]
+                );
+                if (distance_sq < best_sq) best_sq = distance_sq;
+            }
+            sum += std::sqrt(best_sq);
+            if (best_sq <= tolerance_sq) ++covered;
+        }
+        distance_sums[worker_index] = sum;
+        covered_counts[worker_index] = covered;
+    };
+
+    if (thread_count == 1) {
+        evaluate_range(0, sample_count, 0);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(thread_count);
+        for (int worker_index = 0; worker_index < thread_count; ++worker_index) {
+            const size_t start = (sample_count * worker_index) / thread_count;
+            const size_t end = (sample_count * (worker_index + 1)) / thread_count;
+            threads.emplace_back(evaluate_range, start, end, worker_index);
+        }
+        for (std::thread& thread : threads) thread.join();
+    }
+
+    const double total_distance = std::accumulate(distance_sums.begin(), distance_sums.end(), 0.0);
+    const size_t total_covered = std::accumulate(covered_counts.begin(), covered_counts.end(), static_cast<size_t>(0));
+    return {
+        static_cast<float>(total_distance / static_cast<double>(sample_count)),
+        static_cast<float>(total_covered) / static_cast<float>(sample_count)
+    };
+}
+
+py::dict py_calculate_surface_match(
+    const std::vector<float>& hp_samples,
+    const std::vector<float>& hp_triangles,
+    const std::vector<float>& lp_samples,
+    const std::vector<float>& lp_triangles,
+    float tolerance)
+{
+    SurfaceDirectionMetrics hp_to_lp;
+    SurfaceDirectionMetrics lp_to_hp;
+    {
+        py::gil_scoped_release release;
+        hp_to_lp = calculate_surface_direction(hp_samples, lp_triangles, tolerance);
+        lp_to_hp = calculate_surface_direction(lp_samples, hp_triangles, tolerance);
+    }
+
+    py::dict result;
+    result["hp_to_lp_distance"] = hp_to_lp.average_distance;
+    result["lp_to_hp_distance"] = lp_to_hp.average_distance;
+    result["average_distance"] = (hp_to_lp.average_distance + lp_to_hp.average_distance) * 0.5f;
+    result["hp_coverage"] = hp_to_lp.coverage;
+    result["lp_coverage"] = lp_to_hp.coverage;
+    result["coverage"] = std::min(hp_to_lp.coverage, lp_to_hp.coverage);
+    return result;
+}
+
 float calculate_min_distance(const std::vector<float>& verts_a, const std::vector<float>& verts_b) {
     size_t count_a = verts_a.size() / 3;
     size_t count_b = verts_b.size() / 3;
@@ -805,7 +958,11 @@ MeshMetrics analyze_mesh_shape(const std::vector<float>& verts) {
 // ============================================================================
 // 4. РЕГИСТРАЦИЯ МОДУЛЯ ДЛЯ PYTHON
 // ============================================================================
-PYBIND11_MODULE(bg_math_core, m) {
+#ifndef BG_MATH_CORE_MODULE_NAME
+#define BG_MATH_CORE_MODULE_NAME bg_math_core
+#endif
+
+PYBIND11_MODULE(BG_MATH_CORE_MODULE_NAME, m) {
     m.doc() = "Optimized High-performance C++ math utilities for Bake Groups tool";
     
     m.def(
@@ -813,8 +970,13 @@ PYBIND11_MODULE(bg_math_core, m) {
         &py_calculate_bidirectional_avg_distance,
         "Symmetric average nearest-neighbor distance"
     );
+    m.def(
+        "calculate_surface_match",
+        &py_calculate_surface_match,
+        "Symmetric point-to-triangle surface match metrics"
+    );
 
-    py::class_<MeshMetrics>(m, "MeshMetrics")
+    py::class_<MeshMetrics>(m, "MeshMetrics", py::module_local())
         .def_readonly("elongation", &MeshMetrics::elongation)
         .def_readonly("symmetry_score", &MeshMetrics::symmetry_score)
         .def_readonly("dimensions", &MeshMetrics::dimensions)

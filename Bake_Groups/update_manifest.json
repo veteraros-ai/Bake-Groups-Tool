@@ -1,8 +1,8 @@
 {
-  "latest_version": "1.4.1",
-  "package_sha256": "f1696ef26e7731f3093a0ae4bf989f9de19ae1abab4eb009025cfceaf845d550",
+  "latest_version": "1.4.2",
+  "package_sha256": "187d7f8065e93c69d2993fe9180807e26d43d85de4a27fc87afb7e508a7b9e40",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.1/Bake_Groups_1.4.1.zip",
-  "release_notes": "Performance & Cage speed-ups, plus anonymous update stats. PERFORMANCE: the C++ math core behind HP/LP matching now uses a spatial-grid nearest-neighbour search instead of brute force - the heavy distance passes run 5-18x faster on dense meshes, with identical results; rebuilt with AVX2 + link-time optimization for every supported Maya version (2022-2027). CAGE: Create Cage is now near-instant even on chapters with many subgroups - cages are built in one batched pass (a single duplicate and a single shading assignment) instead of one-by-one, and deflated cages skip redundant per-vertex work; added a progress bar during the build and an automatic viewport refresh so new cages appear immediately without nudging the camera. ANONYMOUS STATS: starting with this version the tool sends a tiny, fully anonymous ping on update - a random id (not tied to you), the tool version, your Maya version and the UI language. Nothing else: no names, no files, no scene data. It only shows how many artists use the tool and which Maya versions to keep supporting."
+  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.2/Bake_Groups_1.4.2.zip",
+  "release_notes": "Improved HP/LP matching for dense and overlapping geometry. Surface Match now preserves excellent one-to-one HP/LP pairs before Link Vertex processing, reducing incorrect compound links. Updated the math-core runtime loading so the new matcher can start reliably alongside an already loaded core. Reduced the default tool width for a more compact startup layout."
 }

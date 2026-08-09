@@ -7,11 +7,15 @@ import re
 
 import bg_core
 try:
-    import bg_math_core
+    import bg_math_core_runtime as bg_math_core
     HAS_MATH_CORE = True
 except ImportError:
-    print("WARNING: bg_math_core not found! HP worker will use fallback logic.")
-    HAS_MATH_CORE = False
+    try:
+        import bg_math_core
+        HAS_MATH_CORE = True
+    except ImportError:
+        print("WARNING: bg_math_core not found! HP worker will use fallback logic.")
+        HAS_MATH_CORE = False
 
 try:
     from PySide6 import QtCore
@@ -28,8 +32,10 @@ class HPGroupingWorker(QtCore.QThread):
                  threshold_pct, group_limit, custom_clusters_dict=None, 
                  locked_names=None, strategy=1, use_symmetry=True,
                  bolt_elongation=2.5, bolt_symmetry=0.8, wire_elongation=6.0, # wire_elongation СѓРІРµР»РёС‡РµРЅ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ
+                 compound_link_enabled=True,
                  compound_link_verts=8, compound_link_dist_pct=0.1,
-                 detect_floaters=True, floater_radius=0.3): 
+                 detect_floaters=True, floater_radius=0.3,
+                 hp_surface_cache=None, lp_surface_cache=None):
         super(HPGroupingWorker, self).__init__()
         self.hp_data = hp_data
         self.lp_data = lp_data 
@@ -37,6 +43,8 @@ class HPGroupingWorker(QtCore.QThread):
         self.hp_verts_cache = hp_verts_cache
         self.lp_verts_cache = lp_verts_cache
         self.hp_holes_cache = hp_holes_cache
+        self.hp_surface_cache = hp_surface_cache or {}
+        self.lp_surface_cache = lp_surface_cache or {}
         
         self.threshold_pct = threshold_pct / 100.0
         self.threshold_delta = self.threshold_pct - 0.15
@@ -66,6 +74,7 @@ class HPGroupingWorker(QtCore.QThread):
         self.bolt_elongation = bolt_elongation
         self.bolt_symmetry = bolt_symmetry
         self.wire_elongation = wire_elongation
+        self.compound_link_enabled = bool(compound_link_enabled)
         self.compound_link_verts = max(1, int(compound_link_verts or 8))
         self.compound_link_dist_pct = max(0.01, float(compound_link_dist_pct or 0.1))
         
@@ -159,10 +168,11 @@ class HPGroupingWorker(QtCore.QThread):
             _debug("{}{}".format(prefix, ", ".join(values) if values else "none"))
 
         _debug("Bake Groups Analyze HP Debug")
-        _debug("Settings: collision={}%, strategy={}, symmetry={}, hp_link_vtx={}, hp_link_dist={}%, max_groups={}".format(
+        _debug("Settings: collision={}%, strategy={}, symmetry={}, adjacent_link={}, hp_link_vtx={}, hp_link_dist={}%, max_groups={}".format(
             int(round(self.threshold_pct * 100.0)),
             strategy_name,
             "on" if self.use_symmetry else "off",
+            "on" if self.compound_link_enabled else "off",
             self.compound_link_verts,
             self.compound_link_dist_pct,
             self.group_limit
@@ -525,21 +535,117 @@ class HPGroupingWorker(QtCore.QThread):
             compound_scene_diag = 1.0
 
         self.progress_value.emit(15)
-        self.progress_text.emit("Step 2.2: Compound HP vertex linking...")
+        self.progress_text.emit("Step 2.2: Compound HP vertex linking..." if self.compound_link_enabled else "Step 2.2: Compound HP vertex linking skipped...")
 
         lp_to_hp_candidates = {}
-        for hp_name, candidates in hp_candidates.items():
-            if _is_zbrush_hp(hp_name):
-                continue
-            hp_uid = self.hp_data.get(hp_name, {}).get('uuid')
-            if hp_uid and hp_uid in self.manual_uuid_set:
-                continue
-            if hp_name not in hp_point_cache:
-                hp_point_cache[hp_name] = _flat_to_points(self.hp_verts_cache.get(hp_name, []))
-            if not hp_point_cache[hp_name]:
-                continue
-            for lp_name in candidates:
-                lp_to_hp_candidates.setdefault(lp_name, []).append(hp_name)
+        compound_direct_matches = []
+        compound_excluded_hps = set()
+        compound_direct_owners = {}
+        if self.compound_link_enabled:
+            for hp_name, candidates in hp_candidates.items():
+                if _is_zbrush_hp(hp_name):
+                    continue
+                hp_uid = self.hp_data.get(hp_name, {}).get('uuid')
+                if hp_uid and hp_uid in self.manual_uuid_set:
+                    continue
+                if hp_name not in hp_point_cache:
+                    hp_point_cache[hp_name] = _flat_to_points(self.hp_verts_cache.get(hp_name, []))
+                if not hp_point_cache[hp_name]:
+                    continue
+                for lp_name in candidates:
+                    lp_to_hp_candidates.setdefault(lp_name, []).append(hp_name)
+
+            if HAS_MATH_CORE and hasattr(bg_math_core, 'calculate_surface_match'):
+                logs.append("Compound HP vertex linking: Surface Match enabled ({})".format(
+                    getattr(bg_math_core, '__file__', 'unknown core')))
+                direct_candidates_by_hp = {}
+                for lp_name, hp_names in lp_to_hp_candidates.items():
+                    hp_names = sorted(set(hp_names))
+                    if len(hp_names) < 2:
+                        continue
+                    lp_proxy = self.lp_surface_cache.get(lp_name) or {}
+                    lp_samples = lp_proxy.get('samples') or []
+                    lp_triangles = lp_proxy.get('triangles') or []
+                    if not lp_samples or not lp_triangles:
+                        continue
+                    lp_info = self.lp_data.get(lp_name, {})
+                    lp_diag = max(float(lp_info.get('diag', lp_info.get('radius', 1.0) * 2.0) or 0.0), 0.0001)
+                    for hp_name in hp_names:
+                        hp_proxy = self.hp_surface_cache.get(hp_name) or {}
+                        hp_samples = hp_proxy.get('samples') or []
+                        hp_triangles = hp_proxy.get('triangles') or []
+                        if not hp_samples or not hp_triangles:
+                            continue
+                        hp_info = self.hp_data.get(hp_name, {})
+                        hp_diag = max(float(hp_info.get('diag', hp_info.get('radius', 1.0) * 2.0) or 0.0), 0.0001)
+                        size_ratio = min(hp_diag, lp_diag) / max(hp_diag, lp_diag)
+                        if size_ratio < 0.35:
+                            continue
+                        if _center_dist(hp_info, lp_info) > max(min(hp_diag, lp_diag) * 0.20, 0.0001):
+                            continue
+                        surface_tolerance = max(min(hp_diag, lp_diag) * 0.025, 0.0001)
+                        try:
+                            metrics = bg_math_core.calculate_surface_match(
+                                hp_samples, hp_triangles,
+                                lp_samples, lp_triangles,
+                                surface_tolerance
+                            )
+                            avg_distance = float(metrics.get('average_distance', float('inf')))
+                            coverage = float(metrics.get('coverage', 0.0))
+                        except Exception:
+                            continue
+                        if coverage < 0.82 or avg_distance > surface_tolerance * 1.15:
+                            continue
+                        direct_candidates_by_hp.setdefault(hp_name, []).append({
+                            'lp_name': lp_name,
+                            'avg_distance': avg_distance,
+                            'coverage': coverage,
+                            'tolerance': surface_tolerance
+                        })
+
+                for hp_name, direct_candidates in direct_candidates_by_hp.items():
+                    direct_candidates.sort(key=lambda item: (-item['coverage'], item['avg_distance']))
+                    best = direct_candidates[0]
+                    runner_up = direct_candidates[1] if len(direct_candidates) > 1 else None
+                    if runner_up:
+                        coverage_margin = best['coverage'] - runner_up['coverage']
+                        distance_margin = runner_up['avg_distance'] - best['avg_distance']
+                        if coverage_margin < 0.08 and distance_margin < best['tolerance'] * 0.35:
+                            _debug("  DIRECT_MATCH_AMBIGUOUS: HP='{}' | LP='{}' vs LP='{}'".format(
+                                _short_name(hp_name),
+                                _short_name(best['lp_name']),
+                                _short_name(runner_up['lp_name'])
+                            ))
+                            continue
+                    compound_excluded_hps.add(hp_name)
+                    compound_direct_owners[hp_name] = best['lp_name']
+                    compound_direct_matches.append((
+                        hp_name,
+                        best['lp_name'],
+                        best['avg_distance'],
+                        best['tolerance'],
+                        best['coverage']
+                    ))
+            elif self.compound_link_enabled:
+                logs.append("Compound HP vertex linking: surface match core is unavailable; direct-match protection skipped.")
+        else:
+            logs.append("Compound HP vertex linking is disabled.")
+            _debug("Step 2.2: compound HP vertex linking skipped by user.")
+
+        if compound_direct_matches:
+            logs.append(
+                "Compound HP vertex linking: kept {} excellent one-to-one HP/LP match(es) outside compound linking.".format(
+                    len(compound_direct_matches)
+                )
+            )
+            for hp_name, lp_name, avg_distance, exact_threshold, coverage in compound_direct_matches:
+                _debug("  DIRECT_MATCH: HP='{}' -> LP='{}' | avg_distance={:.6f}, threshold={:.6f}, coverage={:.3f}".format(
+                    _short_name(hp_name),
+                    _short_name(lp_name),
+                    avg_distance,
+                    exact_threshold,
+                    coverage
+                ))
 
         compound_parent = {}
 
@@ -562,7 +668,7 @@ class HPGroupingWorker(QtCore.QThread):
             if lp_idx % max(1, len(compound_lp_items) // 20) == 0:
                 self.progress_value.emit(15 + int((lp_idx / float(max(len(compound_lp_items), 1))) * 7))
 
-            hp_names = sorted(set(hp_names))
+            hp_names = sorted(set(hp_names) - compound_excluded_hps)
             if len(hp_names) < 2:
                 continue
             for i in range(len(hp_names)):
@@ -610,9 +716,12 @@ class HPGroupingWorker(QtCore.QThread):
                     compound_pair_tests, compound_min_hits
                 )
             )
-        _debug("Step 2.2: tested {} HP pair(s), matched {} pair(s), built {} component(s).".format(
-            compound_pair_tests, compound_hit_pairs, len(compound_components)
-        ))
+        if self.compound_link_enabled:
+            _debug("Step 2.2: tested {} HP pair(s), matched {} pair(s), built {} component(s).".format(
+                compound_pair_tests, compound_hit_pairs, len(compound_components)
+            ))
+        else:
+            _debug("Step 2.2: disabled.")
         _debug("")
 
         def _resolve_hp_to_lp(hp_name, candidates):
@@ -789,6 +898,12 @@ class HPGroupingWorker(QtCore.QThread):
             driver_hp = None
             driver_reason = ""
             for hp_name in ordered_unit:
+                direct_owner = compound_direct_owners.get(hp_name)
+                if direct_owner:
+                    best_lp = direct_owner
+                    driver_hp = hp_name
+                    driver_reason = "surface direct match"
+                    break
                 candidate_lp, assigned, reason = _resolve_hp_to_lp(hp_name, hp_candidates.get(hp_name, []))
                 _debug("  RESOLVE: HP='{}' | unit_size={} | candidates={} | best_lp='{}' | assigned={} | reason={}".format(
                     _short_name(hp_name),
