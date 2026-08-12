@@ -3081,7 +3081,11 @@ class FinalViewMixin:
             combo.setStyleSheet("background-color: #444; color: white;")
             combo.setFocusPolicy(QtCore.Qt.NoFocus)
 
-            cached_level = self.final_smooth_states.get(display_name, 1)
+            # Prefer the unambiguous full prefix.  ``display_name`` remains a
+            # fallback for states saved by older tool versions.
+            cached_level = self.final_smooth_states.get(
+                full_prefix,
+                self.final_smooth_states.get(display_name, 1))
             combo.setCurrentIndex(cached_level)
             combo.currentIndexChanged.connect(lambda idx, prefix=full_prefix, name=display_name, c=combo:
                                                self.run_undoable_bg_action("Final Smooth Level", self.on_final_smooth_combo_changed, name, idx, prefix, c))
@@ -3277,6 +3281,21 @@ class FinalViewMixin:
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
+        # The live controls are authoritative.  Taking this small snapshot just
+        # before export prevents a queued UI signal or a view rebuild from
+        # leaving the persisted state behind the visible Smooth selection.
+        for widget_data in getattr(self, 'final_mesh_widgets', []):
+            combo = widget_data.get('combo')
+            name = widget_data.get('subgroup_name')
+            prefix = widget_data.get('full_prefix')
+            if not combo or not name or not prefix:
+                continue
+            try:
+                level = int(combo.currentIndex())
+            except Exception:
+                continue
+            self.final_smooth_states[name] = level
+            self.final_smooth_states[prefix] = level
         pair['final_smooth_states'] = dict(getattr(self, 'final_smooth_states', {}) or {})
         bg_core.BakeSessionModel.save(self.root_pairs)
 
@@ -4476,7 +4495,11 @@ class FinalViewMixin:
             self._saved_right_sizes = None
 
     def on_final_smooth_combo_changed(self, triggered_name, new_level, full_prefix, combo_widget):
+        # Keep both key forms during the migration from the old short-name-only
+        # state.  Export resolves by full prefix first, which cannot collide
+        # between chapters and is exactly how the finalized mesh names are read.
         self.final_smooth_states[triggered_name] = new_level
+        self.final_smooth_states[full_prefix] = new_level
         self.update_single_preview(full_prefix, combo_widget)
 
         selected_names = set(getattr(self, 'final_selected_names', set()))
@@ -4487,6 +4510,7 @@ class FinalViewMixin:
                 if name in selected_names and name != triggered_name:
                     target_combo = widget_data['combo']
                     self.final_smooth_states[name] = new_level
+                    self.final_smooth_states[widget_data['full_prefix']] = new_level
                     target_combo.blockSignals(True)
                     target_combo.setCurrentIndex(new_level)
                     target_combo.blockSignals(False)
@@ -4619,6 +4643,7 @@ class ExportMixin:
         # button can reuse it without prompting again.
         pair['export_dir'] = export_dir
         bg_core.BakeSessionModel.save(self.root_pairs)
+        self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
 
         with self.suspend_subgroup_color_preview():
@@ -4666,6 +4691,7 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
 
         success_count = 0
@@ -4724,6 +4750,7 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
 
         total = 0

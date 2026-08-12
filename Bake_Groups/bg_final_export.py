@@ -107,21 +107,30 @@ class FinalExportProcessor(object):
         return 0
 
     @staticmethod
-    def _smooth_level_from_states(smooth_states, base_name, prefix, default_level=2):
+    def _smooth_level_from_states(smooth_states, base_name, prefix, default_level=0):
+        """Return the saved Smooth level for one export subgroup.
+
+        ``final_smooth_states`` historically used the short subgroup name as its
+        key, while the export path works with the full ``{chapter}_{subgroup}``
+        prefix.  Support both representations (and the temporary ``prefix:``
+        representation used by the exporter).  Crucially, an unknown state must
+        mean *no smoothing*, never an implicit Smooth 2 export.
+        """
         if not smooth_states:
             return default_level
 
-        keys = [prefix]
-        base_prefix = base_name + "_"
-        if prefix.startswith(base_prefix):
-            keys.append(prefix[len(base_prefix):])
+        prefix_key = str(prefix).strip().lower()
+        base_prefix = str(base_name).strip().lower() + "_"
+        keys = [prefix_key, "prefix:{}".format(prefix_key)]
+        if prefix_key.startswith(base_prefix):
+            keys.append(prefix_key[len(base_prefix):])
 
         lower_map = {}
         for key, value in smooth_states.items():
-            lower_map[str(key).lower()] = value
+            lower_map[str(key).strip().lower()] = value
 
         for key in keys:
-            value = lower_map.get(str(key).lower())
+            value = lower_map.get(str(key).strip().lower())
             if value is not None:
                 try:
                     return int(value)
@@ -446,7 +455,9 @@ class FinalExportProcessor(object):
                     'hp_nodes': item.get('hp_nodes') or []
                 })
         else:
-            # Batch mode: use saved UI state when available; otherwise keep UI default Smooth 2.
+            # Batch mode has no live combo boxes.  Use the saved state only;
+            # missing/legacy-unresolvable data must not silently export at
+            # Smooth 2.
             for lp in lp_all:
                 lp_short = lp.split('|')[-1].lower()
                 if "_low" in lp_short:
@@ -456,7 +467,7 @@ class FinalExportProcessor(object):
                         prefixes_to_process.append({
                             'prefix': prefix,
                             'smooth_level': FinalExportProcessor._smooth_level_from_states(
-                                ch['smooth'], ch['base'], prefix, default_level=2
+                                ch['smooth'], ch['base'], prefix, default_level=0
                             )
                         })
         
