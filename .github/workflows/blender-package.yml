@@ -1,0 +1,39 @@
+name: Build Blender package
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Bake_Tools_Blender/**"
+      - ".github/workflows/blender-package.yml"
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build release archive
+        shell: powershell
+        run: >-
+          .\Bake_Tools_Blender\tools\build_release.ps1
+          -OutputDirectory "$env:RUNNER_TEMP\release"
+          -PythonExecutable "python"
+
+      - name: Validate release archive
+        shell: powershell
+        run: |
+          $archive = Get-ChildItem "$env:RUNNER_TEMP\release\Bake_Tools_Blender-*-win64.zip" | Select-Object -First 1
+          python .\Bake_Tools_Blender\tools\validate_release.py $archive.FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bake-Tools-Blender-Windows
+          path: |
+            ${{ runner.temp }}/release/*.zip
+            ${{ runner.temp }}/release/*.sha256
+          if-no-files-found: error

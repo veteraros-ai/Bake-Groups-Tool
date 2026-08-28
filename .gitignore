@@ -9,3 +9,9 @@ Thumbs.db
 .vs/
 out/
 build/
+dist/
+Bake_Tools_Blender/addon/bake_tools_blender/vendor/
+Bake_Tools_Blender_Releases/
+# Internal post-port milestones were renumbered into the first public 1.0.0.
+Bake_Tools_Blender/docs/RELEASE_NOTES_1.0.[1-9].md
+Bake_Tools_Blender/docs/RELEASE_NOTES_1.[1-9].*.md

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Anonymous update telemetry for the Bake Groups Tool.
+"""Privacy-minimal version telemetry for the Bake Groups Tool.
 
-On startup the tool sends ONE tiny, fully anonymous ping the first time it runs
-on a new version: a random per-user id (uuid4, not tied to any identity), the
-tool version, whether this is a fresh install or an update, the Maya version and
-the UI language. Nothing else - no names, no hostnames, no paths, no scene data.
+On startup the tool sends one pseudonymous ping the first time it runs on a new
+version.  Maya and Blender share the same client UUID but keep independent
+per-product version state, so installing one product never suppresses the other.
+No names, hostnames, paths or scene data are sent.
 
 Design / safety:
 * The random id lives in ``~/.bake_groups_tool/client.json`` - OUTSIDE the
@@ -27,7 +27,9 @@ from __future__ import print_function, division, absolute_import
 
 import json
 import os
+import platform
 import re
+import sys
 import threading
 import uuid
 from datetime import datetime
@@ -48,10 +50,17 @@ TELEMETRY_ENABLED = True
 FORM_URL = ("https://docs.google.com/forms/d/e/"
             "1FAIpQLScd-eeYmLD-6S9fNBnOfWHYcwu9r3cIE5lfGHGpqGjG8yyCGA/formResponse")
 FIELD_CLIENT_ID = "entry.262576988"
+FIELD_PRODUCT = "entry.1531946019"
 FIELD_VERSION = "entry.849043429"
 FIELD_EVENT = "entry.228195919"
-FIELD_MAYA = "entry.303840386"
+FIELD_HOST_APP = "entry.1291035306"
+FIELD_HOST_VERSION = "entry.303840386"
 FIELD_LANG = "entry.2055707732"
+FIELD_PLATFORM = "entry.1726983759"
+FIELD_SCHEMA_VERSION = "entry.463430998"
+
+PRODUCT_KEY = "maya"
+SCHEMA_VERSION = "2"
 
 _POST_TIMEOUT = 5  # seconds
 
@@ -79,10 +88,24 @@ def _load_state():
     except Exception:
         state = {}
 
+    changed = False
     if not state.get("client_id"):
         state["client_id"] = str(uuid.uuid4())
         state.setdefault("created_at", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
-        state.setdefault("last_reported_version", None)
+        changed = True
+
+    products = state.get("products")
+    if not isinstance(products, dict):
+        products = {}
+        state["products"] = products
+        changed = True
+    if PRODUCT_KEY not in products and state.get("last_reported_version"):
+        products[PRODUCT_KEY] = {
+            "last_reported_version": state.get("last_reported_version"),
+            "last_reported_at": state.get("last_reported_at"),
+        }
+        changed = True
+    if changed:
         _save_state(state)
     return state
 
@@ -119,17 +142,35 @@ def _safe_lang():
         return ""
 
 
+def _safe_platform():
+    system = str(platform.system() or sys.platform or "unknown").lower()
+    if system.startswith("win"):
+        system = "windows"
+    elif system.startswith("darwin"):
+        system = "macos"
+    machine = str(platform.machine() or "unknown").lower()
+    if machine in ("amd64", "x86_64"):
+        machine = "x64"
+    elif machine in ("aarch64", "arm64"):
+        machine = "arm64"
+    return "{}-{}".format(system, machine)
+
+
 # ==========================================================================
 # Network (worker thread only: file I/O + urllib, both thread-safe)
 # ==========================================================================
-def _post(client_id, version, event, maya_ver, lang):
-    """POST one anonymous row to the Google Form. Return True on HTTP 200."""
+def _post(client_id, version, event, maya_ver, lang, platform_name):
+    """POST one privacy-minimal row to the Google Form. Return True on HTTP 200."""
     data = urlencode({
         FIELD_CLIENT_ID: client_id,
+        FIELD_PRODUCT: PRODUCT_KEY,
         FIELD_VERSION: version,
         FIELD_EVENT: event,
-        FIELD_MAYA: maya_ver,
+        FIELD_HOST_APP: "Maya",
+        FIELD_HOST_VERSION: maya_ver,
         FIELD_LANG: lang,
+        FIELD_PLATFORM: platform_name,
+        FIELD_SCHEMA_VERSION: SCHEMA_VERSION,
     }).encode("utf-8")
     request = Request(
         FORM_URL,
@@ -152,14 +193,23 @@ def _report(maya_ver, lang):
         return
     current_version = str(bg_version.__version__)
     state = _load_state()
-    if state.get("last_reported_version") == current_version:
+    products = state.setdefault("products", {})
+    product_state = products.setdefault(PRODUCT_KEY, {})
+    previous_version = product_state.get("last_reported_version")
+    if previous_version == current_version:
         return  # already reported this version -> no network
 
-    event = "install" if not state.get("last_reported_version") else "update"
-    ok = _post(state["client_id"], current_version, event, maya_ver, lang)
+    event = "install" if not previous_version else "update"
+    ok = _post(
+        state["client_id"], current_version, event, maya_ver, lang,
+        _safe_platform(),
+    )
     if ok:
+        product_state["last_reported_version"] = current_version
+        product_state["last_reported_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Keep legacy keys until all installed Maya builds understand schema 2.
         state["last_reported_version"] = current_version
-        state["last_reported_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        state["last_reported_at"] = product_state["last_reported_at"]
         _save_state(state)
 
 

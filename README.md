@@ -1,6 +1,6 @@
 # Bake Groups Tool
 
-Bake Groups Tool is a Maya helper for preparing high-poly and low-poly geometry for baking and FBX export.
+Bake Groups Tool prepares high-poly and low-poly geometry for baking and FBX export in Maya and Blender.
 
 The package is intended for artists working with bake groups, ZBrush HP meshes, final triangulated low meshes, and Marmoset-friendly HP/LP naming.
 
@@ -22,6 +22,11 @@ Bake_Groups/
   icons
   bg_math_core.cpp source file
   bg_math_core.pyd builds for Maya 2022-2027
+
+Bake_Tools_Blender/
+  Blender 4.2+ add-on source
+  bundled-PySide6 release builder
+  manuals, privacy notice and update manifest
 ```
 
 ## Supported Maya Versions
@@ -34,6 +39,17 @@ The package includes `bg_math_core.pyd` builds for:
 - Maya 2025
 - Maya 2026
 - Maya 2027
+
+## Blender 1.0.0
+
+The first public Blender build supports Blender 4.2+ on Windows x64. Install the
+published `Bake_Tools_Blender-1.0.0-win64.zip` from Blender Preferences without
+unpacking it. The release archive bundles the matching PySide6 Essentials and
+shiboken6 runtime; the large binary runtime is intentionally not committed to Git.
+
+Blender telemetry is disabled until the artist explicitly opts in. It sends one
+pseudonymous installation/update event per version and never sends scene data,
+object names or file paths. See `Bake_Tools_Blender/PRIVACY.md`.
 
 ## Installation
 

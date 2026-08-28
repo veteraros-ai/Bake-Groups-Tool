@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "bake_groups_tool"
+version = "1.0.0"
+name = "Bake Groups Tool"
+tagline = "Prepare HP and LP bake groups, cages and FBX exports"
+maintainer = "Veteraros AI <veteraros@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/veteraros-ai/Bake-Groups-Tool"
+tags = ["3D View", "Object"]
+blender_version_min = "4.2.0"
+platforms = ["windows-x64"]
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Veteraros AI"]
+
+[permissions]
+files = "Export FBX files and save diagnostics or support packages"
+network = "Check updates and send opt-in installation statistics"

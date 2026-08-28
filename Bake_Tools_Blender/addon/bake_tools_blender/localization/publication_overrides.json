@@ -1,0 +1,62 @@
+{
+  "en": {
+    "texts": {
+      "Send anonymous usage statistics": "Send anonymous usage statistics",
+      "Send one opt-in installation/update event per version. No scene data, names, or file paths.": "Send one opt-in installation/update event per version. No scene data, names, or file paths.",
+      "Anonymous usage statistics": "Anonymous usage statistics",
+      "Help improve Bake Groups Tool?": "Help improve Bake Groups Tool?",
+      "Allow one installation/update event per version. The event contains a random client ID, product and host versions, interface language, and platform. It never contains scene data, names, or file paths. You can change this later in About.": "Allow one installation/update event per version. The event contains a random client ID, product and host versions, interface language, and platform. It never contains scene data, names, or file paths. You can change this later in About.",
+      "Update": "Update",
+      "Update installation failed": "Update installation failed",
+      "Update ready": "Update ready",
+      "Restart Blender to finish installing version {version}.": "Restart Blender to finish installing version {version}.",
+      "Preparing verified update...": "Preparing verified update..."
+    },
+    "tooltips": {}
+  },
+  "ru": {
+    "texts": {
+      "Send anonymous usage statistics": "Отправлять анонимную статистику использования",
+      "Send one opt-in installation/update event per version. No scene data, names, or file paths.": "Отправлять одно событие установки или обновления на версию. Данные сцены, имена и пути не передаются.",
+      "Anonymous usage statistics": "Анонимная статистика использования",
+      "Help improve Bake Groups Tool?": "Помочь улучшить Bake Groups Tool?",
+      "Allow one installation/update event per version. The event contains a random client ID, product and host versions, interface language, and platform. It never contains scene data, names, or file paths. You can change this later in About.": "Разрешить одно событие установки или обновления на версию. Передаются случайный ID клиента, версии продукта и программы, язык интерфейса и платформа. Данные сцены, имена и пути никогда не передаются. Настройку можно изменить позже в окне «О программе».",
+      "Update": "Обновить",
+      "Update installation failed": "Не удалось установить обновление",
+      "Update ready": "Обновление готово",
+      "Restart Blender to finish installing version {version}.": "Перезапустите Blender, чтобы завершить установку версии {version}.",
+      "Preparing verified update...": "Подготовка проверенного обновления..."
+    },
+    "tooltips": {}
+  },
+  "ja": {
+    "texts": {
+      "Send anonymous usage statistics": "匿名の使用統計を送信",
+      "Send one opt-in installation/update event per version. No scene data, names, or file paths.": "バージョンごとに、同意済みのインストール／更新イベントを1回送信します。シーンデータ、名前、ファイルパスは送信しません。",
+      "Anonymous usage statistics": "匿名の使用統計",
+      "Help improve Bake Groups Tool?": "Bake Groups Tool の改善に協力しますか？",
+      "Allow one installation/update event per version. The event contains a random client ID, product and host versions, interface language, and platform. It never contains scene data, names, or file paths. You can change this later in About.": "バージョンごとにインストール／更新イベントを1回許可します。ランダムなクライアントID、製品とホストのバージョン、UI言語、プラットフォームだけを送信します。シーンデータ、名前、ファイルパスは送信しません。この設定は「About」で後から変更できます。",
+      "Update": "更新",
+      "Update installation failed": "更新のインストールに失敗しました",
+      "Update ready": "更新の準備ができました",
+      "Restart Blender to finish installing version {version}.": "Blender を再起動してバージョン {version} のインストールを完了してください。",
+      "Preparing verified update...": "検証済みの更新を準備中..."
+    },
+    "tooltips": {}
+  },
+  "zh-CN": {
+    "texts": {
+      "Send anonymous usage statistics": "发送匿名使用统计",
+      "Send one opt-in installation/update event per version. No scene data, names, or file paths.": "每个版本仅发送一次经同意的安装或更新事件。不发送场景数据、名称或文件路径。",
+      "Anonymous usage statistics": "匿名使用统计",
+      "Help improve Bake Groups Tool?": "帮助改进 Bake Groups Tool？",
+      "Allow one installation/update event per version. The event contains a random client ID, product and host versions, interface language, and platform. It never contains scene data, names, or file paths. You can change this later in About.": "允许每个版本发送一次安装或更新事件。事件仅包含随机客户端 ID、产品和宿主版本、界面语言及平台；绝不包含场景数据、名称或文件路径。稍后可在“关于”中更改此设置。",
+      "Update": "更新",
+      "Update installation failed": "更新安装失败",
+      "Update ready": "更新已就绪",
+      "Restart Blender to finish installing version {version}.": "请重启 Blender 以完成版本 {version} 的安装。",
+      "Preparing verified update...": "正在准备已验证的更新..."
+    },
+    "tooltips": {}
+  }
+}
