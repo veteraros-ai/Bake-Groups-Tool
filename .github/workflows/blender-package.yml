@@ -3,6 +3,8 @@ name: Build Blender package
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
       - "Bake_Tools_Blender/**"
       - ".github/workflows/blender-package.yml"
