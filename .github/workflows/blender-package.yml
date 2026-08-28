@@ -13,9 +13,9 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -32,7 +32,7 @@ jobs:
           $archive = Get-ChildItem "$env:RUNNER_TEMP\release\Bake_Tools_Blender-*-win64.zip" | Select-Object -First 1
           python .\Bake_Tools_Blender\tools\validate_release.py $archive.FullName
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Bake-Tools-Blender-Windows
           path: |
