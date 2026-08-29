@@ -2,7 +2,7 @@ BAKE GROUPS TOOL FOR BLENDER 1.0.0
 INSTALLATION / УСТАНОВКА
 
 РУССКИЙ
-=======
+-------
 
 Поддерживается: Blender 4.2 или новее, Windows x64.
 Рекомендуемая версия: Blender 5.1.
@@ -34,7 +34,7 @@ Bake_Tools_Blender\docs\Manual.pur и открывается в PureRef. Кно�
 
 
 ENGLISH
-=======
+-------
 
 Supported: Blender 4.2 or newer on Windows x64.
 Recommended version: Blender 5.1.
