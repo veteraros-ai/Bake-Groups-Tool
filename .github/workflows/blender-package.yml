@@ -31,6 +31,8 @@ jobs:
         run: |
           $archive = Get-ChildItem "$env:RUNNER_TEMP\release\Bake_Tools_Blender-*-win64.zip" | Select-Object -First 1
           python .\Bake_Tools_Blender\tools\validate_release.py $archive.FullName
+          $marketplace = Get-ChildItem "$env:RUNNER_TEMP\release\Bake_Groups_Tool_Blender_*_Marketplace_Windows_x64.zip" | Select-Object -First 1
+          python .\Bake_Tools_Blender\tools\validate_release.py $marketplace.FullName
 
       - uses: actions/upload-artifact@v7
         with:

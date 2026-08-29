@@ -206,7 +206,9 @@ class AboutUpdateDialog(QtWidgets.QDialog):
     def _open_manual(self):
         path = update_service.manual_path()
         if path:
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+            opened = QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+            if not opened:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent)))
 
     def _open_releases(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(update_service.RELEASES_URL))

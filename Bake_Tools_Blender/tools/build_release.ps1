@@ -20,8 +20,12 @@ $Version = $VersionMatch.Groups[1].Value
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path $OutputDirectory).Path
 $Archive = Join-Path $OutputDirectory "Bake_Tools_Blender-$Version-win64.zip"
+$MarketplaceArchive = Join-Path $OutputDirectory "Bake_Groups_Tool_Blender_${Version}_Marketplace_Windows_x64.zip"
 if (Test-Path -LiteralPath $Archive) {
     Remove-Item -LiteralPath $Archive -Force
+}
+if (Test-Path -LiteralPath $MarketplaceArchive) {
+    Remove-Item -LiteralPath $MarketplaceArchive -Force
 }
 
 $TempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
@@ -100,8 +104,20 @@ try {
     Compress-Archive -LiteralPath $StageAddon -DestinationPath $Archive -CompressionLevel Optimal
     $Hash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath "$Archive.sha256" -Value "$Hash  $([IO.Path]::GetFileName($Archive))" -Encoding ASCII
+
+    $MarketplaceInstructions = Join-Path $StageRoot "INSTALLATION.txt"
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "MARKETPLACE_INSTALLATION.txt") `
+        -Destination $MarketplaceInstructions -Force
+    Compress-Archive -LiteralPath $StageAddon,$MarketplaceInstructions `
+        -DestinationPath $MarketplaceArchive -CompressionLevel Optimal
+    $MarketplaceHash = (Get-FileHash -LiteralPath $MarketplaceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath "$MarketplaceArchive.sha256" `
+        -Value "$MarketplaceHash  $([IO.Path]::GetFileName($MarketplaceArchive))" -Encoding ASCII
+
     Write-Host "Release package: $Archive"
     Write-Host "SHA-256: $Hash"
+    Write-Host "Marketplace package: $MarketplaceArchive"
+    Write-Host "Marketplace SHA-256: $MarketplaceHash"
 }
 finally {
     if ((Test-Path -LiteralPath $StageRoot) -and $StageRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase)) {

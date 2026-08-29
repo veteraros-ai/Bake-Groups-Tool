@@ -35,8 +35,14 @@ def update_state_dir():
 
 
 def manual_path():
-    path = addon_root() / "docs" / "MANUAL.md"
-    return path if path.is_file() else None
+    docs = addon_root() / "docs"
+    # The artist-authored PureRef board is the primary manual. Keep the compact
+    # Markdown guide as a readable fallback for systems without that asset.
+    for name in ("Manual.pur", "MANUAL.md"):
+        path = docs / name
+        if path.is_file():
+            return path
+    return None
 
 
 def privacy_path():

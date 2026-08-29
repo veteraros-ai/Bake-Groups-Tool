@@ -8,6 +8,7 @@
 
 Документы:
 
+- [Основной визуальный мануал PureRef](docs/Manual.pur)
 - [Детальный поэтапный план переноса](docs/PORTING_PLAN.md)
 - [Аудит оригинала, текущего порта и различий Maya/Blender](docs/MAYA_TO_BLENDER_ANALYSIS.md)
 - [Фактическая архитектура Blender-порта](docs/ARCHITECTURE.md)
@@ -106,3 +107,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\build_release.ps1"
 ```
 
 Сборщик создаёт Windows x64 ZIP на Desktop в папке `Bake_Tools_Blender_Releases`; bundled Qt runtime входит в пакет и не требует установки PySide6 художниками.
+Одновременно создаётся отдельный marketplace ZIP с внешним `INSTALLATION.txt`
+рядом с папкой аддона. Кнопка `Show manual` открывает `docs/Manual.pur` в
+PureRef; если файловая ассоциация недоступна, открывается папка руководства.

@@ -18,6 +18,11 @@ def main():
     if not path.is_file():
         raise SystemExit("Release archive not found: {}".format(path))
     match = re.search(r"Bake_Tools_Blender-(\d+\.\d+\.\d+)-win64\.zip$", path.name)
+    marketplace = re.search(
+        r"Bake_Groups_Tool_Blender_(\d+\.\d+\.\d+)_Marketplace_Windows_x64\.zip$",
+        path.name,
+    )
+    match = match or marketplace
     if not match:
         raise SystemExit("Unexpected release filename")
     version = match.group(1)
@@ -32,6 +37,7 @@ def main():
             "Bake_Tools_Blender/LICENSE",
             "Bake_Tools_Blender/PRIVACY.md",
             "Bake_Tools_Blender/THIRD_PARTY_NOTICES.md",
+            "Bake_Tools_Blender/docs/Manual.pur",
             "Bake_Tools_Blender/addon/bake_tools_blender/__init__.py",
             "Bake_Tools_Blender/addon/bake_tools_blender/vendor/PySide6/QtCore.pyd",
             "Bake_Tools_Blender/addon/bake_tools_blender/vendor/PySide6/Qt6Core.dll",
@@ -40,6 +46,8 @@ def main():
         missing = sorted(required - names)
         if missing:
             raise SystemExit("Missing release files: {}".format(", ".join(missing)))
+        if marketplace and "INSTALLATION.txt" not in names:
+            raise SystemExit("Marketplace archive is missing root INSTALLATION.txt")
         forbidden = [name for name in names if "__pycache__" in name or Path(name).suffix.lower() in {".pyc", ".obj", ".lib", ".exp"}]
         if forbidden:
             raise SystemExit("Developer artifact in release: {}".format(forbidden[0]))

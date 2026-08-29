@@ -1,0 +1,66 @@
+BAKE GROUPS TOOL FOR BLENDER 1.0.0
+INSTALLATION / УСТАНОВКА
+
+РУССКИЙ
+=======
+
+Поддерживается: Blender 4.2 или новее, Windows x64.
+Рекомендуемая версия: Blender 5.1.
+
+Вариант 1 — установка ZIP через Blender:
+
+1. Не распаковывайте этот архив.
+2. Откройте Blender.
+3. Перейдите Edit -> Preferences -> Add-ons.
+4. В меню справа сверху выберите Install from Disk.
+5. Укажите этот ZIP-архив и подтвердите установку.
+6. Включите аддон Bake Groups Tool, если Blender не включил его автоматически.
+7. В окне 3D View нажмите N -> Bake Tools -> Open Bake Group Manager.
+
+Вариант 2 — ручная установка:
+
+1. Распакуйте архив.
+2. Скопируйте папку Bake_Tools_Blender в:
+   %APPDATA%\Blender Foundation\Blender\<версия Blender>\scripts\addons\
+3. Перезапустите Blender и включите Bake Groups Tool в Preferences -> Add-ons.
+
+Дополнительная установка Python или PySide6 не требуется — нужный runtime уже
+входит в комплект. Основной визуальный мануал находится в
+Bake_Tools_Blender\docs\Manual.pur и открывается в PureRef. Кнопка Show manual
+в окне About открывает этот файл.
+
+При первом запуске Blender отдельно спросит разрешение на анонимную статистику.
+Отказ не ограничивает функциональность и позже меняется в окне About.
+
+
+ENGLISH
+=======
+
+Supported: Blender 4.2 or newer on Windows x64.
+Recommended version: Blender 5.1.
+
+Option 1 — install the ZIP from Blender:
+
+1. Do not unpack this archive.
+2. Open Blender.
+3. Go to Edit -> Preferences -> Add-ons.
+4. Open the top-right menu and choose Install from Disk.
+5. Select this ZIP archive and confirm the installation.
+6. Enable Bake Groups Tool if Blender did not enable it automatically.
+7. In the 3D View press N -> Bake Tools -> Open Bake Group Manager.
+
+Option 2 — manual installation:
+
+1. Unpack the archive.
+2. Copy the Bake_Tools_Blender folder to:
+   %APPDATA%\Blender Foundation\Blender\<Blender version>\scripts\addons\
+3. Restart Blender and enable Bake Groups Tool in Preferences -> Add-ons.
+
+No separate Python or PySide6 installation is required; the required runtime is
+bundled. The main visual manual is Bake_Tools_Blender\docs\Manual.pur and opens
+in PureRef. The Show manual button in About opens this file.
+
+On first launch Blender separately asks for anonymous telemetry consent. Declining
+does not limit any functionality and the setting can be changed later in About.
+
+Project: https://github.com/veteraros-ai/Bake-Groups-Tool
