@@ -6,6 +6,7 @@ import bpy
 
 from .blender_bridge import operator_context
 from .material_distribution import inspect_picked_lp
+from .object_repository import ObjectRepository
 from .store import BlenderStateStore
 
 
@@ -54,6 +55,28 @@ class ManagerController:
         return self._call(
             "bake_tools", "subgroup_action", action=action, subgroup_id=subgroup_id, value=value
         )
+
+    def subgroup_add_selection_status(self, subgroup_id=""):
+        """Return ``(mesh_count, has_outside_members)`` for the Qt role prompt."""
+        state = self.store.settings()
+        if state is None:
+            return 0, False
+        pair = next(
+            (
+                item for item in state.pairs
+                if item.item_id == state.active_pair_id
+                and any(group.item_id == subgroup_id for group in item.subgroups)
+            ),
+            None,
+        )
+        if pair is None:
+            return 0, False
+        try:
+            with operator_context():
+                selected = tuple(ObjectRepository.selected_meshes(bpy.context))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            selected = ()
+        return len(selected), any(ObjectRepository.classify(pair, obj) is None for obj in selected)
 
     def set_setting(self, setting, value):
         if isinstance(value, bool):

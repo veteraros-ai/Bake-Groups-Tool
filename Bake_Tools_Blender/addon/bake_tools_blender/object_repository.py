@@ -13,6 +13,15 @@ import bpy
 
 class ObjectRepository:
     @staticmethod
+    def _append_ref(refs, obj):
+        if obj is None or any(ref.target == obj for ref in refs if ref.target is not None):
+            return False
+        ref = refs.add()
+        ref.target = obj
+        ref.last_name = obj.name
+        return True
+
+    @staticmethod
     def root(pair, side):
         role = side.lower()
         kind = getattr(pair, "{}_root_kind".format(role), "OBJECT")
@@ -114,6 +123,13 @@ class ObjectRepository:
 
     @classmethod
     def classify(cls, pair, obj):
+        # Explicit subgroup membership is authoritative.  This matters for
+        # meshes deliberately added from outside the original HP/LP roots:
+        # Blender membership is metadata/Collection based and must not require
+        # destructive parenting under an artist's root object.
+        subgroup, side = cls.membership(pair, obj)
+        if subgroup is not None:
+            return side
         if getattr(pair, "scope_by_members", False):
             hp_refs = getattr(pair, "hp_scope_members")
             lp_refs = getattr(pair, "lp_scope_members")
@@ -129,6 +145,54 @@ class ObjectRepository:
         if in_hp == in_lp:
             return None
         return "HP" if in_hp else "LP"
+
+    @classmethod
+    def ensure_explicit_scope(cls, pair):
+        """Freeze the current chapter boundary into durable Object refs.
+
+        A normal chapter can derive its scope from Object/Collection roots.
+        Once an outside mesh is added, root ancestry alone can no longer
+        represent the chapter.  Converting once to explicit scope preserves all
+        current root meshes and lets the new member join without reparenting.
+        """
+        if getattr(pair, "scope_by_members", False):
+            return False
+        captured = {
+            side: tuple(obj for obj in cls.root_objects(pair, side) if obj.type == "MESH")
+            for side in ("HP", "LP")
+        }
+        pair.hp_scope_members.clear()
+        pair.lp_scope_members.clear()
+        for side, objects in captured.items():
+            refs = getattr(pair, "{}_scope_members".format(side.lower()))
+            for obj in objects:
+                cls._append_ref(refs, obj)
+        pair.scope_by_members = True
+        return True
+
+    @classmethod
+    def assign_scope_side(cls, pair, obj, side):
+        """Place ``obj`` on exactly one side of an explicit chapter scope."""
+        normalized = str(side or "").upper()
+        if normalized not in {"HP", "LP"}:
+            raise ValueError("Scope side must be HP or LP")
+        cls.ensure_explicit_scope(pair)
+        opposite = "LP" if normalized == "HP" else "HP"
+        cls._remove_from_collection(
+            getattr(pair, "{}_scope_members".format(opposite.lower())), obj
+        )
+        cls._append_ref(
+            getattr(pair, "{}_scope_members".format(normalized.lower())), obj
+        )
+
+    @classmethod
+    def remove_scope_member(cls, pair, obj):
+        if not getattr(pair, "scope_by_members", False):
+            return False
+        removed = False
+        for refs in (pair.hp_scope_members, pair.lp_scope_members):
+            removed = cls._remove_from_collection(refs, obj) or removed
+        return removed
 
     @staticmethod
     def valid_members(subgroup, side):
@@ -166,16 +230,32 @@ class ObjectRepository:
         return None, None
 
     @classmethod
-    def assign_selected(cls, context, pair, target_subgroup, state=None):
-        """Move selected mesh objects into one HP/LP side of the target group."""
+    def assign_selected(cls, context, pair, target_subgroup, state=None, external_side=""):
+        """Move selected meshes into the target subgroup.
+
+        Objects already belonging to the chapter keep their classified HP/LP
+        role.  ``external_side`` is used only for objects outside that chapter;
+        adding the first such object converts the target chapter to explicit
+        scope so the operation stays non-destructive in Blender.
+        """
+        fallback = str(external_side or "").upper()
+        if fallback not in {"", "HP", "LP"}:
+            raise ValueError("External side must be HP or LP")
         moved = []
         unchanged = []
         skipped = []
         for obj in cls.selected_meshes(context):
             side = cls.classify(pair, obj)
             if side is None:
-                skipped.append(obj.name)
-                continue
+                if not fallback:
+                    skipped.append(obj.name)
+                    continue
+                side = fallback
+                if state is not None:
+                    for owner_pair in state.pairs:
+                        if owner_pair.item_id != pair.item_id:
+                            cls.remove_scope_member(owner_pair, obj)
+                cls.assign_scope_side(pair, obj, side)
             current_subgroup, current_side = cls.membership(pair, obj)
             if current_subgroup == target_subgroup and current_side == side:
                 unchanged.append(obj.name)

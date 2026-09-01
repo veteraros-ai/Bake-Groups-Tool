@@ -227,6 +227,8 @@ BakeTools
 
 Пользовательские source objects могут быть linked в эти collections без обязательного parenting. Нужна политика для objects, уже входящих в другие collections.
 
+Статус 1.0: при входе в Export Settings membership синхронизируется в управляемую иерархию `BakeTools/BakeTools_Chapters/<Chapter>/HP|LP/<Subgroup>`. Это дополнительные links: пользовательские Collections, parenting, rigs и transforms сохраняются.
+
 ### 3.3. Трансформации
 
 - различать object transform и baked mesh coordinates;
@@ -255,6 +257,7 @@ Fixtures: обычный object, parented object, non-uniform/negative scale, in
 
 - create pair of HP/LP subgroup collections;
 - Add Selected классифицирует selection по роли;
+- для selection вне главы роль берётся из единственной видимой HP/LP-секции, а при обеих видимых секциях запрашивается у художника; первая такая операция фиксирует chapter scope Object pointers без reparent;
 - rename синхронизирует metadata/display names;
 - delete с confirm и понятной политикой: unlink members или delete data;
 - lock блокирует автоматическое перераспределение;

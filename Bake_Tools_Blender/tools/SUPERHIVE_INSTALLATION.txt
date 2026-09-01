@@ -1,0 +1,43 @@
+BAKE GROUPS TOOL FOR BLENDER 1.0.0 - SUPERHIVE EDITION
+INSTALLATION / УСТАНОВКА
+
+РУССКИЙ
+-------
+
+Поддерживается: Blender 4.2 или новее, Windows x64.
+
+1. Не распаковывайте ZIP с плагином.
+2. Откройте Blender.
+3. Перейдите Edit -> Preferences -> Add-ons.
+4. В меню справа сверху выберите Install from Disk.
+5. Выберите ZIP и подтвердите установку.
+6. Включите Bake Groups Tool, если Blender не сделал этого автоматически.
+7. В 3D View нажмите N -> Bake Tools -> Open Bake Group Manager.
+
+PySide6 уже включён в пакет. Дополнительная установка Python или PySide6 не
+требуется. Мануал PureRef находится в
+Bake_Tools_Blender\assets\Manual.pur и открывается кнопкой Show manual.
+
+Эта редакция не содержит телеметрию и систему внешнего самообновления.
+Обновления распространяются только через Superhive.
+
+
+ENGLISH
+-------
+
+Supported: Blender 4.2 or newer on Windows x64.
+
+1. Do not unpack the add-on ZIP.
+2. Open Blender.
+3. Go to Edit -> Preferences -> Add-ons.
+4. Open the top-right menu and choose Install from Disk.
+5. Select the ZIP and confirm the installation.
+6. Enable Bake Groups Tool if Blender did not enable it automatically.
+7. In a 3D View press N -> Bake Tools -> Open Bake Group Manager.
+
+PySide6 is bundled. No separate Python or PySide6 installation is required.
+The PureRef manual is stored at Bake_Tools_Blender\assets\Manual.pur and opens
+from the Show manual button.
+
+This edition contains no telemetry and no external self-updater. Updates are
+distributed exclusively through Superhive.

@@ -47,6 +47,7 @@ Popup lifecycle разделён на быстрый и согласующий �
 
 - `properties.py` — сериализуемое состояние сцены, стабильные ID глав/сабгрупп, UI-, Matcher-, Cage- и Export-настройки;
 - `object_repository.py` — устойчивые Object/Collection pointers, рекурсивная классификация относительно HP/LP roots, эксклюзивное membership, selection, visibility и Maya-подобная изоляция активной главы;
+- `export_grouping.py` — недеструктивное зеркало membership в служебной иерархии Blender Collections при входе в Export Settings; исходные Collections, parenting и transforms художника не изменяются;
 - `mesh_tools.py` — Blender-native Join/Separate, evaluated geometry audit и ZBrush Collection/Object-pointer registry;
 - `find_similar.py` — evaluated topology/connectivity, нормализованный C++/Python shape fingerprint и one-to-one layout для Find Sim/All;
 - `smooth_preview.py` — обратимые служебные Subdivision Surface modifiers по subgroup smooth level;
@@ -81,6 +82,7 @@ Popup lifecycle разделён на быстрый и согласующий �
 - books → chapters в TOC;
 - создание, активация, переименование и удаление subgroup;
 - реальный HP/LP membership: Add Selected, move между группами, select members, release-on-delete;
+- Add Selected принимает меши вне исходных root-границ: видимая HP/LP-секция задаёт роль, а при обеих видимых секциях Qt запрашивает HP или LP; глава при этом атомарно переходит на explicit scope;
 - Object pointers для roots и members, устойчивые к rename и `.blend` roundtrip;
 - устойчивые eye/lock states;
 - глобальная HP/LP visibility для root и его дочерних Blender Objects;

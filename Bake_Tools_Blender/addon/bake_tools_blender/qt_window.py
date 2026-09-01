@@ -1594,7 +1594,10 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         name.doubleClicked.connect(lambda: self.controller.subgroup_action("SELECT_MESHES", subgroup.item_id))
         name.setStyleSheet(self._subgroup_name_style(subgroup, active)); name.setMinimumWidth(48)
         name.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed); layout.addWidget(name, 1)
-        add = self._icon_button("Plus.png", "Add selected mesh", lambda: self.controller.subgroup_action("ADD_SELECTED", subgroup.item_id), "#315c3a")
+        add = self._icon_button(
+            "Plus.png", "Add selected mesh",
+            lambda: self._add_selected_to_subgroup(subgroup.item_id), "#315c3a"
+        )
         layout.addWidget(add)
         lock = self._icon_button(
             "Look_Icon_Button.png" if subgroup.locked else "Unlook_Icon_Button.png",
@@ -1894,6 +1897,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         subgroup_id = subgroup_id or self._selected_subgroup_id()
         menu = QtWidgets.QMenu(self); self._add_subgroup_menu_action(menu)
         if subgroup_id:
+            menu.addAction("Add selected meshes", lambda: self._add_selected_to_subgroup(subgroup_id))
             menu.addAction("Rename subgroup", lambda: self._rename_subgroup(subgroup_id))
             menu.addAction("Select subgroup meshes", lambda: self.controller.subgroup_action("SELECT_MESHES", subgroup_id))
             menu.addAction("Select Color", lambda: self._choose_subgroup_color(subgroup_id)); menu.addSeparator()
@@ -1901,6 +1905,42 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             menu.addAction("Group search by mesh", lambda: self.controller.action("FIND_SUBGROUP")); menu.addSeparator()
             menu.addAction("Delete", lambda: self._confirm_delete_subgroup(subgroup_id, "subgroup"))
         self._popup_menu(menu, global_pos)
+
+    def _add_selected_to_subgroup(self, subgroup_id):
+        """Add selection, asking for a side only for meshes outside the chapter."""
+        count, needs_side = self.controller.subgroup_add_selection_status(subgroup_id)
+        if not count or not needs_side:
+            self.controller.subgroup_action("ADD_SELECTED", subgroup_id)
+            return
+
+        hp_visible = bool(self._snapshot and self._snapshot.hp_visible)
+        lp_visible = bool(self._snapshot and self._snapshot.lp_visible)
+        if hp_visible != lp_visible:
+            side = "HP" if hp_visible else "LP"
+            self.controller.subgroup_action("ADD_SELECTED", subgroup_id, side)
+            return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(self._tr("Add Meshes to Subgroup"))
+        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setText(self._tr(
+            "The selection contains meshes outside the active chapter. "
+            "Which section should they be added to?"
+        ))
+        hp_button = box.addButton("HP", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        lp_button = box.addButton("LP", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+
+        def finished(_result):
+            clicked = box.clickedButton()
+            side = "HP" if clicked == hp_button else "LP" if clicked == lp_button else ""
+            if side:
+                self._defer_dialog_action(
+                    lambda: self.controller.subgroup_action("ADD_SELECTED", subgroup_id, side)
+                )
+
+        box.finished.connect(finished)
+        self._open_nonblocking(box)
 
     def _show_final_subgroup_menu(self, global_pos, subgroup_id):
         menu = QtWidgets.QMenu(self)
@@ -2055,9 +2095,9 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self._save_diagnostics_dialog("SUPPORT")
 
     def _show_about(self):
-        from .about_update import AboutUpdateDialog
+        from .release_channel import create_about_dialog
 
-        self._open_nonblocking(AboutUpdateDialog(self, self._tr))
+        self._open_nonblocking(create_about_dialog(self, self._tr))
 
 
 def notify_store_changed():
@@ -2153,55 +2193,10 @@ def show_manager(context=None):
     window._sync_pseudo_dock()
     window.raise_()
     _qt_window_manager.start_pump(_pump_events, first_interval=0.02)
-    QtCore.QTimer.singleShot(250, lambda: _offer_telemetry_consent(window))
+    from .release_channel import schedule_post_show
+
+    schedule_post_show(window)
     return window
-
-
-def _offer_telemetry_consent(window):
-    """Ask once, non-modally, before the Blender port sends any telemetry."""
-    from . import telemetry
-
-    if telemetry.consent_value() is not None:
-        if telemetry.consent_value() is True:
-            try:
-                state = getattr(bpy.context.scene, "bake_tools_settings", None)
-                telemetry.report_async(getattr(state, "language", ""))
-            except (AttributeError, RuntimeError):
-                pass
-        return
-    existing = getattr(window, "_telemetry_consent_box", None)
-    if existing is not None and existing.isVisible():
-        return
-    box = QtWidgets.QMessageBox(window)
-    box.setWindowTitle(window._tr("Anonymous usage statistics"))
-    box.setIcon(QtWidgets.QMessageBox.Icon.Information)
-    box.setText(window._tr("Help improve Bake Groups Tool?"))
-    box.setInformativeText(window._tr(
-        "Allow one installation/update event per version. The event contains a random client ID, "
-        "product and host versions, interface language, and platform. It never contains scene data, "
-        "names, or file paths. You can change this later in About."
-    ))
-    box.setStandardButtons(
-        QtWidgets.QMessageBox.StandardButton.Yes |
-        QtWidgets.QMessageBox.StandardButton.No
-    )
-    box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
-    box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
-    window._telemetry_consent_box = box
-
-    def finished(result):
-        enabled = result == int(QtWidgets.QMessageBox.StandardButton.Yes)
-        telemetry.set_consent(enabled)
-        if enabled:
-            try:
-                state = getattr(bpy.context.scene, "bake_tools_settings", None)
-                telemetry.report_async(getattr(state, "language", ""))
-            except (AttributeError, RuntimeError):
-                pass
-        window._telemetry_consent_box = None
-
-    box.finished.connect(finished)
-    box.open()
 
 
 def hide_manager():

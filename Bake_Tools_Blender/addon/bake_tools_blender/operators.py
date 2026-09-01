@@ -767,7 +767,11 @@ class BAKE_TOOLS_OT_subgroup_action(bpy.types.Operator):
             subgroup.use_custom_color = True
             message = "{} color updated".format(subgroup.name)
         elif self.action == "ADD_SELECTED":
-            moved, unchanged, skipped = ObjectRepository.assign_selected(context, pair, subgroup, state)
+            external_side = str(self.value or "").upper()
+            moved, unchanged, skipped = ObjectRepository.assign_selected(
+                context, pair, subgroup, state,
+                external_side=external_side if external_side in {"HP", "LP"} else "",
+            )
             ObjectRepository.sync_pair_visibility(state, pair)
             hp_count = sum(1 for _obj, side in moved if side == "HP")
             lp_count = sum(1 for _obj, side in moved if side == "LP")
@@ -1341,10 +1345,13 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
         elif self.action == "EXPORT_SETTINGS":
             state.final_view = not state.final_view
             naming = None
+            grouping = None
             if state.final_view:
                 pair = active_pair(state)
                 if pair is not None:
+                    from .export_grouping import synchronize_export_grouping
                     from .export_service import finalize_subgroup_naming
+                    grouping = synchronize_export_grouping(context.scene, pair)
                     naming = finalize_subgroup_naming(pair)
             if not state.final_view and state.preview_smoothing:
                 from .smooth_preview import clear_preview
@@ -1356,6 +1363,10 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                 message += "; finalized naming: HP {}, LP {}, renamed {}".format(
                     naming["hp"], naming["lp"], naming["changed"]
                 )
+                if grouping is not None:
+                    message += "; regrouped: HP {}, LP {}, collections {}".format(
+                        grouping["hp"], grouping["lp"], grouping["collections"]
+                    )
                 if naming["unassigned_hp"]:
                     log(state, "Export naming warning: {} unassigned HP mesh(es)".format(len(naming["unassigned_hp"])))
                 if naming["unassigned_lp"]:
@@ -1389,9 +1400,11 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
             )
         elif self.action == "EXPORT":
             from .export_service import build_export_plan, execute_export, finalize_subgroup_naming, resolve_scope
+            from .export_grouping import synchronize_export_grouping
             pair = active_pair(state)
             try:
                 for export_pair in resolve_scope(state, pair):
+                    synchronize_export_grouping(context.scene, export_pair)
                     finalize_subgroup_naming(export_pair)
                 plan = build_export_plan(state, pair, state.export_directory)
                 with progress_scope("Export", "Preparing FBX export") as progress:
