@@ -3648,7 +3648,7 @@ class FinalViewMixin:
         except Exception as e:
             cmds.warning("Could not activate the sculpting brush: {}".format(e))
 
-    def export_chapter_cage_if_enabled(self, pair, export_dir):
+    def export_chapter_cage_if_enabled(self, pair, export_dir, snapshot=None):
         """Export the chapter's cage as its own {base}_cage.fbx into
         ``export_dir`` - always a separate file, alongside the regular HP/LP
         export, whenever a cage exists AND the chapter's 'export cage' flag
@@ -3658,7 +3658,8 @@ class FinalViewMixin:
         settings = pair.get('cage_settings') or {}
         if not settings.get('export_enabled', True):
             return False
-        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
+                       else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
         if not cage_meshes:
             return False
         export_name = "{}_cage".format(base_name)
@@ -4624,6 +4625,57 @@ class FinalViewMixin:
 class ExportMixin:
     """Methods for final export, batch export, and combine."""
 
+    @staticmethod
+    def _export_snapshot_key(pair):
+        return pair.get('id') if pair and pair.get('id') is not None else id(pair)
+
+    def _prepare_export_snapshots(self, pairs, finalize_names=True, final_widgets_by_key=None):
+        """Collect each chapter once and reuse it across preflight/HP/LP/Cage."""
+        snapshots = {}
+        seen = set()
+        for pair in pairs or []:
+            key = self._export_snapshot_key(pair)
+            if key in seen:
+                continue
+            seen.add(key)
+            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            if finalize_names and hp_main and lp_main:
+                self.finalize_subgroup_naming(pair.get('base', 'Chapter'), hp_main, lp_main)
+            widgets = (final_widgets_by_key or {}).get(key)
+            snapshot = bg_final_export.FinalExportProcessor.build_chapter_snapshot(
+                pair.get('base', 'Chapter'), hp_main, lp_main,
+                pair.get('final_smooth_states', {}), widgets)
+            snapshot['pair'] = pair
+            snapshot['loose_lp'] = [
+                node for node in (cmds.listRelatives(
+                    lp_main, children=True, fullPath=True, type='transform') or [])
+                if cmds.listRelatives(
+                    node, shapes=True, type='mesh', noIntermediate=True)
+            ] if lp_main and cmds.objExists(lp_main) else []
+            snapshot['cage_meshes'] = bg_cage.CageProcessor.get_chapter_cage_meshes(
+                pair.get('base', 'Chapter'))
+            snapshot['material_names'] = None
+            snapshots[key] = snapshot
+        return snapshots
+
+    def _snapshot_for_pair(self, snapshots, pair):
+        if not snapshots:
+            return None
+        return snapshots.get(self._export_snapshot_key(pair))
+
+    def _snapshot_material_names(self, snapshot):
+        cached = snapshot.get('material_names')
+        if cached is not None:
+            return cached
+        names = set()
+        for mesh_node in snapshot.get('lp_all', []):
+            for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+                material = rec.get("material") or rec.get("key")
+                if material:
+                    names.add(self._clean_material_book_name(material).lower())
+        snapshot['material_names'] = names
+        return names
+
     def export_final_group_ui(self, mode='separate'):
         if isinstance(mode, bool):
             mode = 'separate'
@@ -4645,33 +4697,37 @@ class ExportMixin:
         bg_core.BakeSessionModel.save(self.root_pairs)
         self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
+        snapshots = self._prepare_export_snapshots(
+            [pair], final_widgets_by_key={self._export_snapshot_key(pair): widgets})
+        snapshot = self._snapshot_for_pair(snapshots, pair)
 
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                self.log("Suspended viewport isolation for export...", "lightblue")
-                if mode == 'separate':
-                    exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, widgets, parent_window=self, mode='hp', export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, widgets, parent_window=self, mode='lp', export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    if exp_hp or exp_lp:
-                        cmds.inViewMessage(amg="Chapter exported: Separate HP and LP", pos='midCenter', fade=True)
-                else:
-                    exported_name = bg_final_export.FinalExportProcessor.export_chapter(
-                        base_name, hp_main, lp_main, widgets, parent_window=self, mode=mode, export_dir=export_dir,
-                        smooth_states=pair.get('final_smooth_states', {})
-                    )
-                    if exported_name:
-                        cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
+                with bg_final_export.FinalExportProcessor.export_session():
+                    self.log("Suspended viewport isolation for export...", "lightblue")
+                    if mode == 'separate':
+                        exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, widgets, parent_window=self, mode='hp', export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                        )
+                        exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, widgets, parent_window=self, mode='lp', export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                        )
+                        if exp_hp or exp_lp:
+                            cmds.inViewMessage(amg="Chapter exported: Separate HP and LP", pos='midCenter', fade=True)
+                    else:
+                        exported_name = bg_final_export.FinalExportProcessor.export_chapter(
+                            base_name, hp_main, lp_main, widgets, parent_window=self, mode=mode, export_dir=export_dir,
+                            smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                        )
+                        if exported_name:
+                            cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
 
-                # No separate Export Cage button anymore: whenever a cage exists
-                # for this chapter and its "export cage" flag is on (default),
-                # it goes out too - always as its own {base}_cage.fbx file.
-                self.export_chapter_cage_if_enabled(pair, export_dir)
+                    # No separate Export Cage button anymore: whenever a cage exists
+                    # for this chapter and its "export cage" flag is on (default),
+                    # it goes out too - always as its own {base}_cage.fbx file.
+                    self.export_chapter_cage_if_enabled(pair, export_dir, snapshot=snapshot)
 
     def batch_export_book(self, mode='separate'):
         if not self.active_root_id:
@@ -4693,35 +4749,38 @@ class ExportMixin:
         export_dir = export_dirs[0]
         self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
+        snapshots = self._prepare_export_snapshots(book_pairs)
 
         success_count = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                self.log("Batch Exporting Book (Isolation Disabled)...", "lightblue")
-                for pair in book_pairs:
-                    hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-                    base_name = pair.get('base', 'Chapter_Export')
-                    if mode == 'separate':
-                        exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                            base_name, hp_main, lp_main, [], parent_window=self, mode='hp', export_dir=export_dir,
-                            smooth_states=pair.get('final_smooth_states', {})
-                        )
-                        exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                            base_name, hp_main, lp_main, [], parent_window=self, mode='lp', export_dir=export_dir,
-                            smooth_states=pair.get('final_smooth_states', {})
-                        )
-                        if exp_hp or exp_lp:
-                            success_count += 1
-                    else:
-                        exported = bg_final_export.FinalExportProcessor.export_chapter(
-                            base_name, hp_main, lp_main, [], parent_window=self, mode=mode, export_dir=export_dir,
-                            smooth_states=pair.get('final_smooth_states', {})
-                        )
-                        if exported:
-                            success_count += 1
-                    # Same as the single-chapter export: cage goes out too, as
-                    # its own file, whenever it exists and is enabled.
-                    self.export_chapter_cage_if_enabled(pair, export_dir)
+                with bg_final_export.FinalExportProcessor.export_session():
+                    self.log("Batch Exporting Book (Isolation Disabled)...", "lightblue")
+                    for pair in book_pairs:
+                        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+                        base_name = pair.get('base', 'Chapter_Export')
+                        snapshot = self._snapshot_for_pair(snapshots, pair)
+                        if mode == 'separate':
+                            exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
+                                base_name, hp_main, lp_main, [], parent_window=self, mode='hp', export_dir=export_dir,
+                                smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                            )
+                            exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
+                                base_name, hp_main, lp_main, [], parent_window=self, mode='lp', export_dir=export_dir,
+                                smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                            )
+                            if exp_hp or exp_lp:
+                                success_count += 1
+                        else:
+                            exported = bg_final_export.FinalExportProcessor.export_chapter(
+                                base_name, hp_main, lp_main, [], parent_window=self, mode=mode, export_dir=export_dir,
+                                smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
+                            )
+                            if exported:
+                                success_count += 1
+                        # Same as the single-chapter export: cage goes out too, as
+                        # its own file, whenever it exists and is enabled.
+                        self.export_chapter_cage_if_enabled(pair, export_dir, snapshot=snapshot)
         cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
 
     def export_by_material(self, scope='active'):
@@ -4752,37 +4811,38 @@ class ExportMixin:
         export_dir = export_dirs[0]
         self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
+        target_pairs = [p for p in self.root_pairs if p.get('book') in books]
+        snapshots = self._prepare_export_snapshots(target_pairs)
 
         total = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                self.log("Export by material (isolation disabled)...", "lightblue")
-                for book in books:
-                    total += self._export_book_by_material(book, export_dir)
+                with bg_final_export.FinalExportProcessor.export_session():
+                    self.log("Export by material (isolation disabled)...", "lightblue")
+                    for book in books:
+                        total += self._export_book_by_material(
+                            book, export_dir, snapshots=snapshots)
         cmds.select(clear=True)
         cmds.inViewMessage(amg="Export by material: {} FBX pair(s) written.".format(total), pos='midCenter', fade=True)
 
-    def _export_book_by_material(self, book, export_dir, inc_hp=True, inc_lp=True, inc_cage=True):
+    def _export_book_by_material(self, book, export_dir, inc_hp=True, inc_lp=True,
+                                 inc_cage=True, snapshots=None,
+                                 status_callback=None, file_callback=None,
+                                 cancel_check=None):
         """Export one book by material. If the book name IS a material, merge all
         chapters into one {book}_HP/LP/cage; otherwise the book is a container so
         each chapter goes out on its own (named by chapter). ``inc_*`` pick which
         parts to write. Returns how many chapters/files groups were written."""
         book_pairs = [p for p in self.root_pairs if p.get('book') == book]
-        chapters = []
+        if snapshots is None:
+            snapshots = self._prepare_export_snapshots(book_pairs)
+        chapters = [
+            self._snapshot_for_pair(snapshots, pair) for pair in book_pairs
+            if self._snapshot_for_pair(snapshots, pair)
+        ]
         material_names = set()
-        for pair in book_pairs:
-            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-            if not hp_main or not lp_main:
-                continue
-            base_name = pair.get('base', 'Chapter')
-            self.finalize_subgroup_naming(base_name, hp_main, lp_main)
-            chapters.append({'base': base_name, 'hp': hp_main, 'lp': lp_main,
-                             'smooth': pair.get('final_smooth_states', {}), 'pair': pair})
-            for mesh_node in self.mesh_transform_nodes_under(lp_main):
-                for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
-                    mat = rec.get("material") or rec.get("key")
-                    if mat:
-                        material_names.add(self._clean_material_book_name(mat).lower())
+        for chapter in chapters:
+            material_names.update(self._snapshot_material_names(chapter))
         if not chapters:
             self.log("Export by material: book '{}' has no exportable chapters.".format(book), "orange")
             return 0
@@ -4791,20 +4851,28 @@ class ExportMixin:
         file_base = self._sanitize_export_name(book)
 
         if book_is_material:
-            primary, extra = chapters[0], chapters[1:]
+            primary = chapters[0]
             wrote = False
-            if inc_hp and bg_final_export.FinalExportProcessor.export_chapter(
+            if inc_hp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='hp',
                     export_dir=export_dir, smooth_states=primary['smooth'],
-                    extra_chapters=extra, export_name_override=file_base):
+                    export_name_override=file_base, prepared_chapters=chapters,
+                    status_callback=status_callback, file_callback=file_callback,
+                    cancel_check=cancel_check):
                 wrote = True
-            if inc_lp and bg_final_export.FinalExportProcessor.export_chapter(
+            if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
                     export_dir=export_dir, smooth_states=primary['smooth'],
-                    extra_chapters=extra, export_name_override=file_base):
+                    export_name_override=file_base, prepared_chapters=chapters,
+                    status_callback=status_callback, file_callback=file_callback,
+                    cancel_check=cancel_check):
                 wrote = True
-            if inc_cage:
-                self._export_book_cage_merged(chapters, file_base, export_dir)
+            if inc_cage and not (cancel_check and cancel_check()):
+                if self._export_book_cage_merged(
+                        chapters, file_base, export_dir,
+                        status_callback=status_callback,
+                        file_callback=file_callback):
+                    wrote = True
             if wrote:
                 self.log("Export by material: book '{}' (material) -> {}_*.fbx.".format(book, file_base), "lightgreen")
                 return 1
@@ -4813,68 +4881,97 @@ class ExportMixin:
         # Container book -> each chapter as its own file (named by chapter).
         done = 0
         for ch in chapters:
-            if self._export_chapter_files(ch['pair'], export_dir, inc_hp, inc_lp, inc_cage, single=False):
+            if cancel_check and cancel_check():
+                break
+            if self._export_chapter_files(
+                    ch['pair'], export_dir, inc_hp, inc_lp, inc_cage,
+                    single=False, snapshot=ch, status_callback=status_callback,
+                    file_callback=file_callback, cancel_check=cancel_check):
                 done += 1
         self.log("Export by material: book '{}' (container) -> {} chapter(s).".format(book, done), "lightgreen")
         return done
 
-    def _export_book_cage_merged(self, chapters, file_base, export_dir):
+    def _export_book_cage_merged(self, chapters, file_base, export_dir,
+                                 status_callback=None, file_callback=None):
         """Merge every chapter's cage into one {file_base}_cage.fbx (used when a
         book is exported as a single material file)."""
         cage_meshes = []
         for ch in chapters:
-            cage_meshes.extend(bg_cage.CageProcessor.get_chapter_cage_meshes(ch['base']))
+            cage_meshes.extend(ch.get('cage_meshes') or [])
         if not cage_meshes:
-            return
+            return False
         export_name = "{}_cage".format(file_base)
         export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        if status_callback:
+            status_callback(bg_l10n.text("Preparing: {name}").format(name=export_name))
         if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+            if file_callback:
+                file_callback(export_name)
             self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
+            return True
         else:
             cmds.warning("Cage export failed for '{}'.".format(file_base))
+            return False
 
-    def _export_chapter_cage(self, pair, export_dir):
+    def _export_chapter_cage(self, pair, export_dir, snapshot=None,
+                             status_callback=None, file_callback=None):
         """Export the chapter's cage as {base}_cage.fbx (triangulated). Cage
         inclusion is now decided by the Export panel's Cage checkbox, so this
         always exports when a cage exists (no per-chapter flag)."""
         base_name = pair.get('base', 'Chapter')
-        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
+        cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
+                       else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
         if not cage_meshes:
             return False
         export_name = "{}_cage".format(base_name)
         export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+        if status_callback:
+            status_callback(bg_l10n.text("Preparing: {name}").format(name=export_name))
         if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
+            if file_callback:
+                file_callback(export_name)
             self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
             return True
         cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
         return False
 
-    def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage, single):
+    def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage,
+                              single, snapshot=None, status_callback=None,
+                              file_callback=None, cancel_check=None):
         """Export one chapter's requested parts. ``single`` merges HP+LP into one
         file only when both are included; otherwise HP and LP go to separate
         files. Returns True if anything was written."""
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        if snapshot is None:
+            snapshot = self._snapshot_for_pair(self._prepare_export_snapshots([pair]), pair)
+        hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
         if not hp_main or not lp_main:
             return False
         base_name = pair.get('base', 'Chapter')
-        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
         smooth = pair.get('final_smooth_states', {})
         wrote = False
         if single and inc_hp and inc_lp:
             if bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='both',
-                    export_dir=export_dir, smooth_states=smooth):
+                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
+                    status_callback=status_callback, file_callback=file_callback,
+                    cancel_check=cancel_check):
                 wrote = True
         else:
-            if inc_hp and bg_final_export.FinalExportProcessor.export_chapter(
+            if inc_hp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='hp',
-                    export_dir=export_dir, smooth_states=smooth):
+                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
+                    status_callback=status_callback, file_callback=file_callback,
+                    cancel_check=cancel_check):
                 wrote = True
-            if inc_lp and bg_final_export.FinalExportProcessor.export_chapter(
+            if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='lp',
-                    export_dir=export_dir, smooth_states=smooth):
+                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
+                    status_callback=status_callback, file_callback=file_callback,
+                    cancel_check=cancel_check):
                 wrote = True
-        if inc_cage and self._export_chapter_cage(pair, export_dir):
+        if inc_cage and not (cancel_check and cancel_check()) and self._export_chapter_cage(
+                pair, export_dir, snapshot=snapshot,
+                status_callback=status_callback, file_callback=file_callback):
             wrote = True
         return wrote
 
@@ -4883,26 +4980,27 @@ class ExportMixin:
         base = os.path.splitext(os.path.basename(scene))[0]
         return self._sanitize_export_name(base) if base else "Scene"
 
-    def _export_lp_combined(self, pairs, file_base, export_dir):
+    def _export_lp_combined(self, pairs, file_base, export_dir, snapshots=None,
+                            status_callback=None, file_callback=None,
+                            cancel_check=None):
         """Merge the LP of every given chapter into one {file_base}_LP.fbx
         (triangulated). Used by the 'LP in one file' option. Returns the file
         base name written, or None."""
-        chapters = []
-        for pair in pairs:
-            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-            if not lp_main:
-                continue
-            base_name = pair.get('base', 'Chapter')
-            self.finalize_subgroup_naming(base_name, hp_main, lp_main)
-            chapters.append({'base': base_name, 'hp': hp_main, 'lp': lp_main,
-                             'smooth': pair.get('final_smooth_states', {})})
+        if snapshots is None:
+            snapshots = self._prepare_export_snapshots(pairs)
+        chapters = [
+            self._snapshot_for_pair(snapshots, pair) for pair in pairs
+            if self._snapshot_for_pair(snapshots, pair)
+        ]
         if not chapters:
             return None
-        primary, extra = chapters[0], chapters[1:]
+        primary = chapters[0]
         name = bg_final_export.FinalExportProcessor.export_chapter(
             primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
             export_dir=export_dir, smooth_states=primary['smooth'],
-            extra_chapters=extra, export_name_override=file_base)
+            export_name_override=file_base, prepared_chapters=chapters,
+            status_callback=status_callback, file_callback=file_callback,
+            cancel_check=cancel_check)
         if name:
             self.log("LP (one file) exported: {}.fbx".format(name), "lightgreen")
         return name
@@ -4986,7 +5084,7 @@ class ExportMixin:
         # set with bg_l10n.text() and the panel rebuilds on language change.
         return panel
 
-    def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage):
+    def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage, snapshots=None):
         """One validation pass over the chapters about to be exported. Returns
         (errors, warnings) as localized strings: errors BLOCK the export (broken
         scene), warnings let the artist proceed after confirming. Consolidates
@@ -4994,22 +5092,23 @@ class ExportMixin:
         chapters, requested-but-missing cage) so the artist sees one clear list
         instead of a partial or empty FBX."""
         errors, warnings = [], []
-        gvmt = bg_final_export.FinalExportProcessor.get_valid_mesh_transforms
+        if snapshots is None:
+            snapshots = self._prepare_export_snapshots(targets, finalize_names=False)
         for pair in targets:
             name = pair.get('base', '?')
-            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+            snapshot = self._snapshot_for_pair(snapshots, pair) or {}
+            hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
             if not hp_main or not lp_main:
                 errors.append(bg_l10n.text("Chapter '{name}': HP or LP root group not found.").format(name=name))
                 continue
-            loose = [t for t in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or [])
-                     if cmds.listRelatives(t, shapes=True, type='mesh', noIntermediate=True)]
+            loose = snapshot.get('loose_lp') or []
             if loose:
                 warnings.append(bg_l10n.text("Chapter '{name}': {n} LP mesh(es) not distributed (run Assign LP Meshes).").format(name=name, n=len(loose)))
-            if inc_hp and not gvmt(hp_main):
+            if inc_hp and not snapshot.get('hp_all'):
                 warnings.append(bg_l10n.text("Chapter '{name}': no HP meshes to export.").format(name=name))
-            if inc_lp and not gvmt(lp_main):
+            if inc_lp and not snapshot.get('lp_meshes_all'):
                 warnings.append(bg_l10n.text("Chapter '{name}': no LP meshes to export.").format(name=name))
-            if inc_cage and not bg_cage.CageProcessor.get_chapter_cage_meshes(name):
+            if inc_cage and not snapshot.get('cage_meshes'):
                 warnings.append(bg_l10n.text("Chapter '{name}': cage included but no cage exists.").format(name=name))
         return errors, warnings
 
@@ -5079,10 +5178,14 @@ class ExportMixin:
         if not targets:
             return cmds.warning("Nothing to export in this scope.")
 
+        self.save_final_smooth_states()
+        snapshots = self._prepare_export_snapshots(targets)
+
         # Single preflight before the artist even picks a folder: block on broken
         # scenes, and let them confirm past soft issues (undistributed LP, empty
         # chapter, missing cage) instead of getting a silent/partial FBX.
-        errors, warnings = self._export_preflight(targets, inc_hp, inc_lp, inc_cage)
+        errors, warnings = self._export_preflight(
+            targets, inc_hp, inc_lp, inc_cage, snapshots=snapshots)
         if (errors or warnings) and not self._confirm_export_preflight(errors, warnings):
             return
 
@@ -5096,29 +5199,101 @@ class ExportMixin:
         # single combined file; HP and Cage still follow the other settings.
         eff_inc_lp = inc_lp and not lp_one
         n = 0
-        with self.suspend_subgroup_color_preview():
-            with self.suspend_isolation():
-                if lp_one and inc_lp:
-                    if scope == 1:
-                        lp_base = self._sanitize_export_name(books[0])
-                        lp_pairs = targets
-                    else:
-                        lp_base = self._scene_name_base()
-                        lp_pairs = list(self.root_pairs)
-                    if self._export_lp_combined(lp_pairs, lp_base, export_dir):
-                        n += 1
-                if inc_hp or inc_cage or eff_inc_lp:
-                    if by_mat:
-                        for book in books:
-                            n += self._export_book_by_material(book, export_dir, inc_hp, eff_inc_lp, inc_cage)
-                    else:
-                        for p in targets:
-                            if self._export_chapter_files(p, export_dir, inc_hp, eff_inc_lp, inc_cage, single):
+        chapter_file_count = (1 if single and inc_hp and eff_inc_lp
+                              else int(bool(inc_hp)) + int(bool(eff_inc_lp)))
+        total_files = int(bool(lp_one and inc_lp)) + len(targets) * (
+            chapter_file_count + int(bool(inc_cage)))
+        total_files = max(1, total_files)
+        progress = QtWidgets.QProgressDialog(
+            bg_l10n.text("Preparing export..."), bg_l10n.text("Cancel"),
+            0, total_files, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        files_written = [0]
+        was_cancelled = [False]
+        progress_closed = [False]
+
+        def status_callback(label):
+            progress.setLabelText(label)
+            QtWidgets.QApplication.processEvents()
+
+        def file_callback(export_name):
+            files_written[0] += 1
+            progress.setLabelText("{}.fbx".format(export_name))
+            progress.setValue(min(files_written[0], total_files))
+            QtWidgets.QApplication.processEvents()
+
+        def cancel_check():
+            return was_cancelled[0] or progress.wasCanceled()
+
+        try:
+            with self.suspend_subgroup_color_preview():
+                with self.suspend_isolation():
+                    # The progress reaches its final value inside this session,
+                    # before export_session resumes and redraws the viewport.
+                    with bg_final_export.FinalExportProcessor.export_session():
+                        if lp_one and inc_lp and not cancel_check():
+                            if scope == 1:
+                                lp_base = self._sanitize_export_name(books[0])
+                                lp_pairs = targets
+                            else:
+                                lp_base = self._scene_name_base()
+                                lp_pairs = list(self.root_pairs)
+                            if self._export_lp_combined(
+                                    lp_pairs, lp_base, export_dir, snapshots=snapshots,
+                                    status_callback=status_callback,
+                                    file_callback=file_callback,
+                                    cancel_check=cancel_check):
                                 n += 1
+                        if inc_hp or inc_cage or eff_inc_lp:
+                            if by_mat:
+                                for book in books:
+                                    if cancel_check():
+                                        break
+                                    n += self._export_book_by_material(
+                                        book, export_dir, inc_hp, eff_inc_lp, inc_cage,
+                                        snapshots=snapshots,
+                                        status_callback=status_callback,
+                                        file_callback=file_callback,
+                                        cancel_check=cancel_check)
+                            else:
+                                for pair in targets:
+                                    if cancel_check():
+                                        break
+                                    if self._export_chapter_files(
+                                            pair, export_dir, inc_hp, eff_inc_lp,
+                                            inc_cage, single,
+                                            snapshot=self._snapshot_for_pair(snapshots, pair),
+                                            status_callback=status_callback,
+                                            file_callback=file_callback,
+                                            cancel_check=cancel_check):
+                                        n += 1
+                        was_cancelled[0] = cancel_check()
+                        if not was_cancelled[0]:
+                            progress.setLabelText(bg_l10n.text("Export complete"))
+                            progress.setValue(total_files)
+                            QtWidgets.QApplication.processEvents()
+                        progress.close()
+                        progress_closed[0] = True
+        finally:
+            if not progress_closed[0]:
+                was_cancelled[0] = was_cancelled[0] or progress.wasCanceled()
+                progress.close()
         cmds.select(clear=True)
         if hasattr(self, 'exp_status'):
-            self.exp_status.setText(bg_l10n.text("Exported {n} item(s).").format(n=n))
-        cmds.inViewMessage(amg="Export: {} item(s).".format(n), pos='midCenter', fade=True)
+            if was_cancelled[0]:
+                self.exp_status.setText(bg_l10n.text("Export cancelled"))
+            else:
+                self.exp_status.setText(bg_l10n.text("Exported {n} item(s).").format(n=n))
+        if was_cancelled[0]:
+            cmds.inViewMessage(amg="Export cancelled", pos='midCenter', fade=True)
+        else:
+            cmds.inViewMessage(amg="Export: {} item(s).".format(n), pos='midCenter', fade=True)
 
     def export_active_lp_only(self):
         if not self.active_root_id:
@@ -5132,13 +5307,16 @@ class ExportMixin:
             return
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
+        snapshots = self._prepare_export_snapshots([pair])
+        snapshot = self._snapshot_for_pair(snapshots, pair)
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                self.log("Exporting Active LP Only (Isolation Disabled)...", "lightblue")
-                if self._export_lp_for_pair(pair, export_dir):
-                    cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
-                else:
-                    cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
+                with bg_final_export.FinalExportProcessor.export_session():
+                    self.log("Exporting Active LP Only (Isolation Disabled)...", "lightblue")
+                    if self._export_lp_for_pair(pair, export_dir, snapshot=snapshot):
+                        cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
+                    else:
+                        cmds.warning("Combined LP meshes not found. Press 'Combine Fin' first.")
         cmds.select(clear=True)
 
     def batch_export_all_lp_only(self):
@@ -5157,13 +5335,17 @@ class ExportMixin:
             return
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
+        snapshots = self._prepare_export_snapshots(self.root_pairs)
         success_count = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                self.log("Batch Exporting All LP (Isolation Disabled)...", "lightblue")
-                for pair in self.root_pairs:
-                    if self._export_lp_for_pair(pair, export_dir):
-                        success_count += 1
+                with bg_final_export.FinalExportProcessor.export_session():
+                    self.log("Batch Exporting All LP (Isolation Disabled)...", "lightblue")
+                    for pair in self.root_pairs:
+                        if self._export_lp_for_pair(
+                                pair, export_dir,
+                                snapshot=self._snapshot_for_pair(snapshots, pair)):
+                            success_count += 1
         cmds.inViewMessage(amg="Batch LP export completed! Successful: {} chapters".format(success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
@@ -5184,57 +5366,36 @@ class ExportMixin:
             return
         export_dir = export_dirs[0]
         self.disable_preview_smoothing_for_export()
+        snapshots = self._prepare_export_snapshots(book_pairs)
         success_count = 0
         with self.suspend_subgroup_color_preview():
-            for pair in book_pairs:
-                if self._export_lp_for_pair(pair, export_dir):
-                    success_count += 1
+            with bg_final_export.FinalExportProcessor.export_session():
+                for pair in book_pairs:
+                    if self._export_lp_for_pair(
+                            pair, export_dir,
+                            snapshot=self._snapshot_for_pair(snapshots, pair)):
+                        success_count += 1
         cmds.inViewMessage(amg="LP Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
         cmds.select(clear=True)
 
     def _export_meshes_with_lp_triangulation(self, meshes, export_path):
-        """Triangulate the given LP originals in place inside an undo chunk,
-        export the selection to FBX, then cmds.undo() the chunk so the LP
-        originals revert to quads. The FBX file write is not undoable, so only
-        the in-scene triangulation is rolled back."""
+        """Export triangulated temporary copies; never modify scene originals."""
         meshes = [m for m in (meshes or []) if m and cmds.objExists(m)]
         if not meshes:
             return False
-        ok = False
-        cmds.undoInfo(openChunk=True, chunkName="LPExportTriangulate")
         try:
-            for m in meshes:
-                try:
-                    cmds.polyTriangulate(m, constructionHistory=False)
-                except Exception:
-                    pass
-            cmds.select(meshes, replace=True)
-            bg_final_export.FinalExportProcessor.export_selected_fbx(export_path)
-            ok = True
+            with bg_final_export.FinalExportProcessor.export_session():
+                return bg_final_export.FinalExportProcessor._export_with_lp_triangulation_rollback(
+                    meshes, export_path, triangulate_all=True)
         except Exception as e:
             cmds.warning("LP export/triangulation failed: {}".format(e))
-        finally:
-            cmds.undoInfo(closeChunk=True)
-            try:
-                cmds.undo()  # roll back the triangulation; leaves originals as quads
-            except Exception:
-                pass
-        return ok
-
-    def _export_lp_for_pair(self, pair, export_dir):
-        base_name = pair.get('base', 'Chapter_Export')
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        if not lp_main or not cmds.objExists(lp_main):
             return False
-        # Ensure the finalized _low_NNN naming exists even if the user runs an
-        # LP-only export without entering Export Settings first.
-        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
-        to_export = []
-        for child in (cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []):
-            if not cmds.listRelatives(child, shapes=True):
-                continue
-            if "_low" in child.split('|')[-1]:
-                to_export.append(child)
+
+    def _export_lp_for_pair(self, pair, export_dir, snapshot=None):
+        base_name = pair.get('base', 'Chapter_Export')
+        if snapshot is None:
+            snapshot = self._snapshot_for_pair(self._prepare_export_snapshots([pair]), pair)
+        to_export = (snapshot or {}).get('lp_all') or []
         if not to_export:
             return False
         export_name = "{}_LP".format(base_name)
