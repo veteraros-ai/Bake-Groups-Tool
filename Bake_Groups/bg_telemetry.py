@@ -37,9 +37,11 @@ from datetime import datetime
 try:
     from urllib.request import Request, urlopen
     from urllib.parse import urlencode
+    from html.parser import HTMLParser
 except ImportError:  # Python 2 (older Maya)
     from urllib2 import Request, urlopen
     from urllib import urlencode
+    from HTMLParser import HTMLParser
 
 import bg_version
 
@@ -49,6 +51,7 @@ TELEMETRY_ENABLED = True
 # --- Google Form endpoint + field ids (from the pre-filled link) ----------
 FORM_URL = ("https://docs.google.com/forms/d/e/"
             "1FAIpQLScd-eeYmLD-6S9fNBnOfWHYcwu9r3cIE5lfGHGpqGjG8yyCGA/formResponse")
+FORM_VIEW_URL = FORM_URL.rsplit("/", 1)[0] + "/viewform"
 FIELD_CLIENT_ID = "entry.262576988"
 FIELD_PRODUCT = "entry.1531946019"
 FIELD_VERSION = "entry.849043429"
@@ -63,6 +66,10 @@ PRODUCT_KEY = "maya"
 SCHEMA_VERSION = "2"
 
 _POST_TIMEOUT = 5  # seconds
+_FORM_CONTEXT_FIELDS = (
+    "fvv", "partialResponse", "pageHistory", "fbzx",
+    "submissionTimestamp",
+)
 
 
 # ==========================================================================
@@ -159,9 +166,85 @@ def _safe_platform():
 # ==========================================================================
 # Network (worker thread only: file I/O + urllib, both thread-safe)
 # ==========================================================================
+class _HiddenInputParser(HTMLParser):
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.fields = {}
+
+    def handle_starttag(self, tag, attrs):
+        if str(tag).lower() != "input":
+            return
+        values = dict(attrs)
+        if str(values.get("type") or "").lower() != "hidden":
+            return
+        name = values.get("name")
+        if name:
+            self.fields[str(name)] = str(values.get("value") or "")
+
+
+def _user_agent():
+    return "Bake-Groups-Tool/{}".format(bg_version.__version__)
+
+
+def _read_response(response):
+    try:
+        try:
+            code = response.getcode()
+        except Exception:
+            code = 200
+        try:
+            final_url = response.geturl()
+        except Exception:
+            final_url = ""
+        body = response.read()
+        if not isinstance(body, str):
+            body = body.decode("utf-8", "replace")
+        return code, str(final_url or ""), body
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def _fetch_form_context():
+    """Fetch Google's per-request hidden fields required by the live form."""
+    request = Request(FORM_VIEW_URL, headers={"User-Agent": _user_agent()})
+    code, _final_url, body = _read_response(
+        urlopen(request, timeout=_POST_TIMEOUT))
+    if code != 200:
+        raise RuntimeError("Google Form context request failed: HTTP {}".format(code))
+
+    parser = _HiddenInputParser()
+    parser.feed(body)
+    context = {
+        name: parser.fields[name]
+        for name in _FORM_CONTEXT_FIELDS
+        if name in parser.fields
+    }
+    missing = [name for name in _FORM_CONTEXT_FIELDS if name not in context]
+    if missing:
+        raise RuntimeError(
+            "Google Form context is incomplete: {}".format(", ".join(missing)))
+    return context
+
+
+def _is_submission_confirmation(final_url, body):
+    """Reject HTTP 200 responses that merely redisplay the input form."""
+    if "/formResponse" not in str(final_url or ""):
+        return False
+    lowered = str(body or "").lower()
+    if not lowered.strip():
+        return False
+    if 'id="mg61hd"' in lowered or 'name="entry.' in lowered:
+        return False
+    return True
+
+
 def _post(client_id, version, event, maya_ver, lang, platform_name):
-    """POST one privacy-minimal row to the Google Form. Return True on HTTP 200."""
-    data = urlencode({
+    """POST one row and return True only for a real confirmation page."""
+    payload = _fetch_form_context()
+    payload.update({
         FIELD_CLIENT_ID: client_id,
         FIELD_PRODUCT: PRODUCT_KEY,
         FIELD_VERSION: version,
@@ -171,21 +254,19 @@ def _post(client_id, version, event, maya_ver, lang, platform_name):
         FIELD_LANG: lang,
         FIELD_PLATFORM: platform_name,
         FIELD_SCHEMA_VERSION: SCHEMA_VERSION,
-    }).encode("utf-8")
+    })
+    data = urlencode(payload).encode("utf-8")
     request = Request(
         FORM_URL,
         data=data,
         headers={
-            "User-Agent": "Bake-Groups-Tool/{}".format(bg_version.__version__),
+            "User-Agent": _user_agent(),
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
-    response = urlopen(request, timeout=_POST_TIMEOUT)
-    try:
-        code = response.getcode()
-    except Exception:
-        code = 200
-    return code == 200
+    code, final_url, body = _read_response(
+        urlopen(request, timeout=_POST_TIMEOUT))
+    return code == 200 and _is_submission_confirmation(final_url, body)
 
 
 def _report(maya_ver, lang):
