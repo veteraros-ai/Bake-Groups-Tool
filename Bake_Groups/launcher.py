@@ -33,16 +33,24 @@ def _active_runtime_dir(script_dir):
     return script_dir
 
 
-def _apply_pending_math_core(bin_dir):
-    target = os.path.join(bin_dir, "bg_math_core.pyd")
-    pending = target + ".pending"
-    if not os.path.exists(pending):
-        return
-    try:
-        os.replace(pending, target)
-        print("Bake Groups math core updated: {}".format(target))
-    except Exception as exc:
-        print("Bake Groups math core pending update: {}".format(exc))
+def _apply_pending_math_cores(bin_dir):
+    """Install native updates before either module can be imported by Maya."""
+    runtime_bin_dir = os.path.join(bin_dir, "runtime")
+    targets = (
+        os.path.join(runtime_bin_dir, "bg_math_core_runtime.pyd"),
+        os.path.join(runtime_bin_dir, "bg_math_core.pyd"),
+        os.path.join(bin_dir, "bg_math_core_runtime.pyd"),
+        os.path.join(bin_dir, "bg_math_core.pyd"),
+    )
+    for target in targets:
+        pending = target + ".pending"
+        if not os.path.exists(pending):
+            continue
+        try:
+            os.replace(pending, target)
+            print("Bake Groups math core updated: {}".format(target))
+        except Exception as exc:
+            print("Bake Groups math core pending update for {}: {}".format(target, exc))
 
 
 def _prepare_versioned_math_core_path():
@@ -53,9 +61,10 @@ def _prepare_versioned_math_core_path():
     maya_version = version_match.group(0) if version_match else maya_version_raw
     bin_dir = os.path.join(runtime_dir, "bin", maya_version)
     runtime_bin_dir = os.path.join(bin_dir, "runtime")
-    runtime_core = os.path.join(runtime_bin_dir, "bg_math_core.pyd")
+    runtime_core = os.path.join(runtime_bin_dir, "bg_math_core_runtime.pyd")
     if not os.path.exists(runtime_core):
-        _apply_pending_math_core(bin_dir)
+        runtime_core = os.path.join(runtime_bin_dir, "bg_math_core.pyd")
+    _apply_pending_math_cores(bin_dir)
     for core_dir in (runtime_bin_dir, bin_dir):
         if core_dir in sys.path:
             sys.path.remove(core_dir)

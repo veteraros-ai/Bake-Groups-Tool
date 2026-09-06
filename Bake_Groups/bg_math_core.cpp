@@ -528,14 +528,20 @@ float py_calculate_min_distance(const std::vector<float>& verts_a, const std::ve
 bool check_mesh_collision(const std::vector<float>& verts_a, const std::vector<float>& verts_b, float threshold) {
     if (verts_a.empty() || verts_b.empty()) return false;
 
-    float cell_size = threshold * 2.0f;
-    std::unordered_map<std::tuple<int, int, int>, bool, PosHash> grid;
+    // Broad-phase cell adjacency alone used to report a collision even when
+    // the closest points were several thresholds apart.  Keep the hash-grid
+    // speed, but finish every candidate with an exact squared-distance test.
+    threshold = std::max(threshold, 0.0f);
+    const float cell_size = std::max(threshold, 1e-6f);
+    const float threshold_sq = threshold * threshold;
+    std::unordered_map<std::tuple<int, int, int>, std::vector<size_t>, PosHash> grid;
+    grid.reserve(verts_a.size() / 3);
 
     for (size_t i = 0; i < verts_a.size(); i += 3) {
         int gx = static_cast<int>(std::floor(verts_a[i] / cell_size));
         int gy = static_cast<int>(std::floor(verts_a[i+1] / cell_size));
         int gz = static_cast<int>(std::floor(verts_a[i+2] / cell_size));
-        grid[{gx, gy, gz}] = true;
+        grid[{gx, gy, gz}].push_back(i);
     }
 
     for (size_t i = 0; i < verts_b.size(); i += 3) {
@@ -546,8 +552,15 @@ bool check_mesh_collision(const std::vector<float>& verts_a, const std::vector<f
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
-                    if (grid.count({gx + dx, gy + dy, gz + dz})) {
-                        return true; 
+                    auto it = grid.find({gx + dx, gy + dy, gz + dz});
+                    if (it == grid.end()) continue;
+                    for (size_t a_index : it->second) {
+                        float ddx = verts_b[i] - verts_a[a_index];
+                        float ddy = verts_b[i + 1] - verts_a[a_index + 1];
+                        float ddz = verts_b[i + 2] - verts_a[a_index + 2];
+                        if (ddx * ddx + ddy * ddy + ddz * ddz <= threshold_sq) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -954,6 +967,162 @@ MeshMetrics analyze_mesh_shape(const std::vector<float>& verts) {
     return m;
 }
 
+// Rotation- and scale-invariant shape metrics for Analyze HP. The legacy
+// function above remains available for compatibility with older callers.
+static void jacobi_eigen_3x3(double matrix[3][3], double vectors[3][3]) {
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            vectors[row][col] = row == col ? 1.0 : 0.0;
+        }
+    }
+
+    for (int iteration = 0; iteration < 24; ++iteration) {
+        int p = 0;
+        int q = 1;
+        double largest = std::fabs(matrix[0][1]);
+        if (std::fabs(matrix[0][2]) > largest) {
+            p = 0;
+            q = 2;
+            largest = std::fabs(matrix[0][2]);
+        }
+        if (std::fabs(matrix[1][2]) > largest) {
+            p = 1;
+            q = 2;
+            largest = std::fabs(matrix[1][2]);
+        }
+        if (largest < 1e-12) break;
+
+        const double angle = 0.5 * std::atan2(
+            2.0 * matrix[p][q], matrix[q][q] - matrix[p][p]);
+        const double c = std::cos(angle);
+        const double s = std::sin(angle);
+        const double app = matrix[p][p];
+        const double aqq = matrix[q][q];
+        const double apq = matrix[p][q];
+
+        matrix[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        matrix[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        matrix[p][q] = matrix[q][p] = 0.0;
+
+        for (int axis = 0; axis < 3; ++axis) {
+            if (axis == p || axis == q) continue;
+            const double aip = matrix[axis][p];
+            const double aiq = matrix[axis][q];
+            matrix[axis][p] = matrix[p][axis] = c * aip - s * aiq;
+            matrix[axis][q] = matrix[q][axis] = s * aip + c * aiq;
+        }
+        for (int row = 0; row < 3; ++row) {
+            const double vip = vectors[row][p];
+            const double viq = vectors[row][q];
+            vectors[row][p] = c * vip - s * viq;
+            vectors[row][q] = s * vip + c * viq;
+        }
+    }
+}
+
+MeshMetrics analyze_mesh_shape_v2(const std::vector<float>& verts) {
+    MeshMetrics metrics;
+    metrics.elongation = 1.0f;
+    metrics.symmetry_score = 0.0f;
+    metrics.dimensions = {0.0f, 0.0f, 0.0f};
+    metrics.center = {0.0f, 0.0f, 0.0f};
+
+    const size_t point_count = verts.size() / 3;
+    if (point_count < 3) return metrics;
+
+    double center[3] = {0.0, 0.0, 0.0};
+    for (size_t point = 0; point < point_count; ++point) {
+        center[0] += static_cast<double>(verts[point * 3]);
+        center[1] += static_cast<double>(verts[point * 3 + 1]);
+        center[2] += static_cast<double>(verts[point * 3 + 2]);
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        center[axis] /= static_cast<double>(point_count);
+    }
+
+    double covariance[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    for (size_t point = 0; point < point_count; ++point) {
+        const double value[3] = {
+            static_cast<double>(verts[point * 3]) - center[0],
+            static_cast<double>(verts[point * 3 + 1]) - center[1],
+            static_cast<double>(verts[point * 3 + 2]) - center[2]
+        };
+        for (int row = 0; row < 3; ++row) {
+            for (int col = row; col < 3; ++col) {
+                covariance[row][col] += value[row] * value[col];
+            }
+        }
+    }
+    const double inv_count = 1.0 / static_cast<double>(point_count);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = row; col < 3; ++col) {
+            covariance[row][col] *= inv_count;
+            covariance[col][row] = covariance[row][col];
+        }
+    }
+
+    double eigenvectors[3][3];
+    jacobi_eigen_3x3(covariance, eigenvectors);
+    int order[3] = {0, 1, 2};
+    std::sort(order, order + 3, [&](int left, int right) {
+        return covariance[left][left] > covariance[right][right];
+    });
+
+    double min_projection[3] = {
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max()
+    };
+    double max_projection[3] = {
+        -std::numeric_limits<double>::max(),
+        -std::numeric_limits<double>::max(),
+        -std::numeric_limits<double>::max()
+    };
+    for (size_t point = 0; point < point_count; ++point) {
+        const double value[3] = {
+            static_cast<double>(verts[point * 3]) - center[0],
+            static_cast<double>(verts[point * 3 + 1]) - center[1],
+            static_cast<double>(verts[point * 3 + 2]) - center[2]
+        };
+        for (int rank = 0; rank < 3; ++rank) {
+            const int axis = order[rank];
+            const double projection =
+                value[0] * eigenvectors[0][axis] +
+                value[1] * eigenvectors[1][axis] +
+                value[2] * eigenvectors[2][axis];
+            min_projection[rank] = std::min(min_projection[rank], projection);
+            max_projection[rank] = std::max(max_projection[rank], projection);
+        }
+    }
+
+    double extent_diag_sq = 0.0;
+    double midpoint_offset_sq = 0.0;
+    for (int rank = 0; rank < 3; ++rank) {
+        const double extent = std::max(max_projection[rank] - min_projection[rank], 0.0);
+        const double midpoint = (max_projection[rank] + min_projection[rank]) * 0.5;
+        metrics.dimensions[rank] = static_cast<float>(extent);
+        extent_diag_sq += extent * extent;
+        midpoint_offset_sq += midpoint * midpoint;
+    }
+
+    const double largest_variance = std::max(covariance[order[0]][order[0]], 0.0);
+    const double smallest_variance = std::max(covariance[order[2]][order[2]], 0.0);
+    const double variance_floor = std::max(largest_variance * 1e-8, 1e-16);
+    metrics.elongation = static_cast<float>(
+        std::sqrt(largest_variance / std::max(smallest_variance, variance_floor)));
+
+    // Keep the existing 0.8 UI threshold useful while removing scene scale.
+    const double extent_diag = std::sqrt(std::max(extent_diag_sq, 1e-16));
+    metrics.symmetry_score = static_cast<float>(
+        4.0 * std::sqrt(midpoint_offset_sq) / extent_diag);
+    metrics.center = {
+        static_cast<float>(center[0]),
+        static_cast<float>(center[1]),
+        static_cast<float>(center[2])
+    };
+    return metrics;
+}
+
 
 // ============================================================================
 // 4. РЕГИСТРАЦИЯ МОДУЛЯ ДЛЯ PYTHON
@@ -992,6 +1161,7 @@ PYBIND11_MODULE(BG_MATH_CORE_MODULE_NAME, m) {
     m.def("resolve_hp_collision", &py_resolve_hp_collision, "Resolve high-poly to low-poly candidate assignment collisions");
     m.def("calculate_vertex_owner_scores", &py_calculate_vertex_owner_scores, "Calculate LP/HP nearest-vertex ownership scores for candidate pairs");
     
-    m.def("analyze_mesh_shape", &analyze_mesh_shape, "Analyze mesh elongation and symmetry using PCA principles");
+    m.def("analyze_mesh_shape", &analyze_mesh_shape, "Analyze mesh elongation and symmetry using legacy world axes");
+    m.def("analyze_mesh_shape_v2", &analyze_mesh_shape_v2, "Rotation- and scale-invariant PCA shape metrics");
     m.def("generate_fingerprint_data", &generate_fingerprint_data, "Generate a geometric string fingerprint for a mesh");
 }

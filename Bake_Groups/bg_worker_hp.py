@@ -235,7 +235,10 @@ class HPGroupingWorker(QtCore.QThread):
         self.progress_value.emit(4)
         self.progress_text.emit("Step 1: Preparing LP boundaries...")
 
-        sorted_lp_names = sorted(self.lp_data.keys(), key=lambda k: self.lp_data[k].get("bbox_vol", 0))
+        sorted_lp_names = sorted(
+            self.lp_data.keys(),
+            key=lambda k: (self.lp_data[k].get("bbox_vol", 0), _short_name(k))
+        )
         unassigned_hps = set(self.hp_data.keys())
         lp_to_owned_hps = {lp: [] for lp in sorted_lp_names}
         hp_claims = {}
@@ -263,8 +266,11 @@ class HPGroupingWorker(QtCore.QThread):
             cb = _center_from_info(b)
             return math.sqrt(sum((ca[i] - cb[i]) ** 2 for i in range(3)))
 
-        hp_candidates = {hp: [] for hp in unassigned_hps}
-        unassigned_hp_names = list(unassigned_hps)
+        # Never seed ordered work queues from a set.  Python intentionally varies
+        # set iteration order between Maya sessions, and the first HP in a packed
+        # LP cluster participates in its shape/category decision.
+        unassigned_hp_names = sorted(unassigned_hps, key=_short_name)
+        hp_candidates = {hp: [] for hp in unassigned_hp_names}
 
         # Spatial grid over LP bounding boxes so each HP only runs is_overlapping()
         # against nearby LP instead of all of them (O(HP x LP) -> ~O(HP x local)).
@@ -381,6 +387,19 @@ class HPGroupingWorker(QtCore.QThread):
                 if _is_finite_value(x) and _is_finite_value(y) and _is_finite_value(z):
                     points.append((float(x), float(y), float(z)))
             return points
+
+        def _analyze_shape_metrics(flat_verts):
+            if not HAS_MATH_CORE or not flat_verts:
+                return None
+            analyzer = getattr(bg_math_core, 'analyze_mesh_shape_v2', None)
+            if analyzer is None:
+                analyzer = getattr(bg_math_core, 'analyze_mesh_shape', None)
+            if analyzer is None:
+                return None
+            try:
+                return analyzer(flat_verts)
+            except Exception:
+                return None
 
         def _spatial_hash(points, cell_size):
             cell_size = max(float(cell_size), 0.000001)
@@ -534,6 +553,82 @@ class HPGroupingWorker(QtCore.QThread):
         else:
             compound_scene_diag = 1.0
 
+        # Surface evidence is shared by the direct-match protection and the
+        # general LP resolver.  One HP/LP pair is therefore evaluated at most
+        # once even when it participates in a compound component.
+        surface_match_cache = {}
+        surface_match_stats = {'tests': 0}
+        hp_resolution_evidence = {}
+        ambiguous_hp_matches = set()
+
+        def _surface_match_evidence(hp_name, lp_name):
+            cache_key = (hp_name, lp_name)
+            if cache_key in surface_match_cache:
+                return surface_match_cache[cache_key]
+            if not (HAS_MATH_CORE and hasattr(bg_math_core, 'calculate_surface_match')):
+                surface_match_cache[cache_key] = None
+                return None
+
+            hp_proxy = self.hp_surface_cache.get(hp_name) or {}
+            lp_proxy = self.lp_surface_cache.get(lp_name) or {}
+            hp_samples = hp_proxy.get('samples') or []
+            hp_triangles = hp_proxy.get('triangles') or []
+            lp_samples = lp_proxy.get('samples') or []
+            lp_triangles = lp_proxy.get('triangles') or []
+            if not hp_samples or not hp_triangles or not lp_samples or not lp_triangles:
+                surface_match_cache[cache_key] = None
+                return None
+
+            hp_info = self.hp_data.get(hp_name, {})
+            lp_info = self.lp_data.get(lp_name, {})
+            hp_diag = max(float(hp_info.get('diag', hp_info.get('radius', 1.0) * 2.0) or 0.0), 0.000001)
+            lp_diag = max(float(lp_info.get('diag', lp_info.get('radius', 1.0) * 2.0) or 0.0), 0.000001)
+            pair_diag = max(min(hp_diag, lp_diag), 0.000001)
+            tolerance = max(pair_diag * 0.025 * self.match_tolerance_scale,
+                            compound_scene_diag * 0.00005, 0.000001)
+            try:
+                metrics = bg_math_core.calculate_surface_match(
+                    hp_samples, hp_triangles,
+                    lp_samples, lp_triangles,
+                    tolerance
+                )
+                surface_match_stats['tests'] += 1
+                hp_distance = float(metrics.get('hp_to_lp_distance', float('inf')))
+                lp_distance = float(metrics.get('lp_to_hp_distance', float('inf')))
+                hp_coverage = float(metrics.get('hp_coverage', 0.0))
+                lp_coverage = float(metrics.get('lp_coverage', 0.0))
+                average_distance = float(metrics.get('average_distance', float('inf')))
+                coverage = float(metrics.get('coverage', min(hp_coverage, lp_coverage)))
+            except Exception:
+                surface_match_cache[cache_key] = None
+                return None
+
+            size_ratio = min(hp_diag, lp_diag) / max(hp_diag, lp_diag)
+            distance_quality = max(0.0, 1.0 - min(hp_distance / max(tolerance * 1.5, 0.000001), 1.0))
+            confidence = max(0.0, min(100.0, 100.0 * (
+                hp_coverage * 0.68 + distance_quality * 0.22 + size_ratio * 0.10
+            )))
+            evidence = {
+                'lp_name': lp_name,
+                'hp_to_lp_distance': hp_distance,
+                'lp_to_hp_distance': lp_distance,
+                'average_distance': average_distance,
+                'hp_coverage': hp_coverage,
+                'lp_coverage': lp_coverage,
+                'coverage': coverage,
+                'tolerance': tolerance,
+                'size_ratio': size_ratio,
+                'confidence': confidence,
+                # HP coverage is directional on purpose: a valid LP may contain
+                # several HP pieces, so low LP->HP coverage is not a rejection.
+                'accepted': hp_coverage >= 0.70 and hp_distance <= tolerance * 1.35,
+                'excellent': hp_coverage >= 0.84 and hp_distance <= tolerance * 1.10,
+                'ambiguous': False,
+                'confidence_margin': None,
+            }
+            surface_match_cache[cache_key] = evidence
+            return evidence
+
         self.progress_value.emit(15)
         self.progress_text.emit("Step 2.2: Compound HP vertex linking..." if self.compound_link_enabled else "Step 2.2: Compound HP vertex linking skipped...")
 
@@ -563,19 +658,9 @@ class HPGroupingWorker(QtCore.QThread):
                     hp_names = sorted(set(hp_names))
                     if len(hp_names) < 2:
                         continue
-                    lp_proxy = self.lp_surface_cache.get(lp_name) or {}
-                    lp_samples = lp_proxy.get('samples') or []
-                    lp_triangles = lp_proxy.get('triangles') or []
-                    if not lp_samples or not lp_triangles:
-                        continue
                     lp_info = self.lp_data.get(lp_name, {})
                     lp_diag = max(float(lp_info.get('diag', lp_info.get('radius', 1.0) * 2.0) or 0.0), 0.0001)
                     for hp_name in hp_names:
-                        hp_proxy = self.hp_surface_cache.get(hp_name) or {}
-                        hp_samples = hp_proxy.get('samples') or []
-                        hp_triangles = hp_proxy.get('triangles') or []
-                        if not hp_samples or not hp_triangles:
-                            continue
                         hp_info = self.hp_data.get(hp_name, {})
                         hp_diag = max(float(hp_info.get('diag', hp_info.get('radius', 1.0) * 2.0) or 0.0), 0.0001)
                         size_ratio = min(hp_diag, lp_diag) / max(hp_diag, lp_diag)
@@ -583,17 +668,12 @@ class HPGroupingWorker(QtCore.QThread):
                             continue
                         if _center_dist(hp_info, lp_info) > max(min(hp_diag, lp_diag) * 0.20, 0.0001):
                             continue
-                        surface_tolerance = max(min(hp_diag, lp_diag) * 0.025, 0.0001)
-                        try:
-                            metrics = bg_math_core.calculate_surface_match(
-                                hp_samples, hp_triangles,
-                                lp_samples, lp_triangles,
-                                surface_tolerance
-                            )
-                            avg_distance = float(metrics.get('average_distance', float('inf')))
-                            coverage = float(metrics.get('coverage', 0.0))
-                        except Exception:
+                        evidence = _surface_match_evidence(hp_name, lp_name)
+                        if not evidence:
                             continue
+                        surface_tolerance = evidence['tolerance']
+                        avg_distance = evidence['average_distance']
+                        coverage = evidence['coverage']
                         if coverage < 0.82 or avg_distance > surface_tolerance * 1.15:
                             continue
                         direct_candidates_by_hp.setdefault(hp_name, []).append({
@@ -701,6 +781,7 @@ class HPGroupingWorker(QtCore.QThread):
             if len(component) < 2:
                 continue
             compound_components.append(component)
+        compound_components.sort(key=lambda component: tuple(_short_name(name) for name in component))
 
         if compound_components:
             logs.append(
@@ -728,6 +809,7 @@ class HPGroupingWorker(QtCore.QThread):
             if not candidates:
                 return None, False, "no LP candidate"
 
+            candidates = sorted(set(candidates), key=lambda name: (_short_name(name), str(name)))
             best_lp = None
             hp_verts = self.hp_verts_cache.get(hp_name, [])
             method = "single candidate"
@@ -737,10 +819,52 @@ class HPGroupingWorker(QtCore.QThread):
             # C++-вызовов на плотных мешах).
             mat_score_cache = {}
 
-            if len(candidates) == 1:
+            material_candidates = [c for c in candidates if _lp_material_slot(c)]
+            surface_candidates = material_candidates or candidates
+            surface_records = []
+            for lp_name in surface_candidates:
+                evidence = _surface_match_evidence(hp_name, lp_name)
+                if evidence:
+                    surface_records.append(evidence)
+            accepted_surface_records = [record for record in surface_records if record.get('accepted')]
+            accepted_surface_records.sort(key=lambda record: (
+                -float(record.get('confidence', 0.0)),
+                -float(record.get('hp_coverage', 0.0)),
+                float(record.get('hp_to_lp_distance', float('inf'))),
+                _short_name(record.get('lp_name')),
+                str(record.get('lp_name')),
+            ))
+
+            if accepted_surface_records:
+                best_record = dict(accepted_surface_records[0])
+                runner_up = accepted_surface_records[1] if len(accepted_surface_records) > 1 else None
+                if runner_up and _lp_base_name(best_record['lp_name']) != _lp_base_name(runner_up['lp_name']):
+                    confidence_margin = float(best_record['confidence']) - float(runner_up['confidence'])
+                    coverage_margin = float(best_record['hp_coverage']) - float(runner_up['hp_coverage'])
+                    distance_margin = float(runner_up['hp_to_lp_distance']) - float(best_record['hp_to_lp_distance'])
+                    ambiguous = (
+                        confidence_margin < 8.0
+                        and coverage_margin < 0.07
+                        and distance_margin < float(best_record['tolerance']) * 0.35
+                    )
+                    best_record['confidence_margin'] = confidence_margin
+                    best_record['ambiguous'] = ambiguous
+                    if ambiguous:
+                        ambiguous_hp_matches.add(hp_name)
+                hp_resolution_evidence[hp_name] = best_record
+                best_lp = best_record['lp_name']
+                method = "directional surface evidence"
+            elif surface_records:
+                surface_records.sort(key=lambda record: (
+                    -float(record.get('confidence', 0.0)),
+                    _short_name(record.get('lp_name')),
+                    str(record.get('lp_name')),
+                ))
+                hp_resolution_evidence[hp_name] = dict(surface_records[0])
+
+            if best_lp is None and len(candidates) == 1:
                 best_lp = candidates[0]
-            else:
-                material_candidates = [c for c in candidates if _lp_material_slot(c)]
+            elif best_lp is None:
                 if material_candidates and HAS_MATH_CORE and hp_verts:
                     def material_distance_score(lp_name):
                         if lp_name in mat_score_cache:
@@ -797,6 +921,19 @@ class HPGroupingWorker(QtCore.QThread):
                     method = "fallback first candidate"
 
             assigned_to_lp = False
+            selected_evidence = hp_resolution_evidence.get(hp_name) or {}
+            if selected_evidence.get('lp_name') == best_lp and selected_evidence.get('accepted'):
+                assigned_to_lp = True
+                validation = (
+                    "surface_hp_coverage={:.3f}, surface_distance={:.6f}, threshold={:.6f}, confidence={:.1f}{}"
+                    .format(
+                        float(selected_evidence.get('hp_coverage', 0.0)),
+                        float(selected_evidence.get('hp_to_lp_distance', float('inf'))),
+                        float(selected_evidence.get('tolerance', 0.0)) * 1.35,
+                        float(selected_evidence.get('confidence', 0.0)),
+                        " | ambiguous" if selected_evidence.get('ambiguous') else ""
+                    )
+                )
             if HAS_MATH_CORE and hp_verts:
                 best_lp_verts = self.lp_verts_cache.get(best_lp, [])
                 if best_lp_verts:
@@ -815,11 +952,14 @@ class HPGroupingWorker(QtCore.QThread):
 
                     if avg_dist <= threshold:
                         assigned_to_lp = True
-                    validation = "avg_distance={:.6f}, threshold={:.6f}".format(avg_dist, threshold)
+                    if not selected_evidence.get('accepted'):
+                        validation = "avg_distance={:.6f}, threshold={:.6f}".format(avg_dist, threshold)
                 else:
-                    validation = "best LP has no vertex cache"
+                    if not assigned_to_lp:
+                        validation = "best LP has no vertex cache"
             else:
-                validation = "C++ core or HP vertex cache unavailable"
+                if not assigned_to_lp:
+                    validation = "C++ core or HP vertex cache unavailable"
 
             # Fallback for ZBrush or missing/too sparse vertex cache: accept the chosen candidate.
             if not assigned_to_lp:
@@ -831,7 +971,16 @@ class HPGroupingWorker(QtCore.QThread):
 
             return best_lp, assigned_to_lp, "{} | {}".format(method, validation)
 
-        def _lp_claim_score(hp_name, lp_name, reason, candidate_count):
+        def _lp_claim_score(hp_name, lp_name, reason, candidate_count, evidence=None):
+            evidence = evidence or {}
+            if evidence.get('lp_name') == lp_name and evidence.get('accepted'):
+                score = float(evidence.get('confidence', 0.0) or 0.0)
+                if candidate_count == 1:
+                    score += 5.0
+                if evidence.get('ambiguous'):
+                    score = min(score, 55.0)
+                return max(0.0, min(100.0, score))
+
             score = 0.0
             reason = reason or ""
             match = re.search(r"avg_distance=([0-9eE+\-.]+), threshold=([0-9eE+\-.]+)", reason)
@@ -903,6 +1052,9 @@ class HPGroupingWorker(QtCore.QThread):
                     best_lp = direct_owner
                     driver_hp = hp_name
                     driver_reason = "surface direct match"
+                    direct_evidence = _surface_match_evidence(hp_name, direct_owner)
+                    if direct_evidence:
+                        hp_resolution_evidence[hp_name] = dict(direct_evidence)
                     break
                 candidate_lp, assigned, reason = _resolve_hp_to_lp(hp_name, hp_candidates.get(hp_name, []))
                 _debug("  RESOLVE: HP='{}' | unit_size={} | candidates={} | best_lp='{}' | assigned={} | reason={}".format(
@@ -923,29 +1075,99 @@ class HPGroupingWorker(QtCore.QThread):
                 _debug_list("  UNRESOLVED_UNIT: ", ordered_unit)
                 continue
 
-            claim_source = "compound" if len(ordered_unit) > 1 else "lp"
+            assigned_in_unit = 0
+            pulled_in_unit = 0
+            split_in_unit = 0
+            skipped_in_unit = 0
             for hp_name in ordered_unit:
                 if hp_name not in unassigned_hps:
                     continue
-                lp_to_owned_hps[best_lp].append(self.hp_data[hp_name])
+
+                member_lp = best_lp
+                member_driver = driver_hp
+                member_reason = driver_reason
+                member_source = "compound" if len(ordered_unit) > 1 else "lp"
+
+                if hp_name != driver_hp:
+                    member_direct_owner = compound_direct_owners.get(hp_name)
+                    if member_direct_owner:
+                        member_lp = member_direct_owner
+                        member_driver = hp_name
+                        member_reason = "surface direct match"
+                        member_source = "lp"
+                        member_evidence = _surface_match_evidence(hp_name, member_direct_owner)
+                        if member_evidence:
+                            hp_resolution_evidence[hp_name] = dict(member_evidence)
+                    else:
+                        resolved_lp, resolved_member, resolved_reason = _resolve_hp_to_lp(
+                            hp_name, hp_candidates.get(hp_name, [])
+                        )
+                        if resolved_member and resolved_lp:
+                            member_lp = resolved_lp
+                            member_driver = hp_name
+                            member_reason = resolved_reason
+                            member_source = "lp" if resolved_lp != best_lp else "compound"
+                        elif best_lp in hp_candidates.get(hp_name, []) and hp_name not in ambiguous_hp_matches:
+                            # A compound edge may support a weak fragment, but
+                            # only when that fragment independently overlaps the
+                            # same LP candidate.  Transitive components can no
+                            # longer pull every member to the driver's LP.
+                            member_reason = "compound geometric support via '{}' | {}".format(
+                                _short_name(driver_hp), resolved_reason
+                            )
+                            member_source = "compound"
+                        else:
+                            skipped_in_unit += 1
+                            _debug("  COMPOUND_MEMBER_DEFER: HP='{}' | driver='{}' LP='{}' | reason={}".format(
+                                _short_name(hp_name),
+                                _short_name(driver_hp),
+                                _short_name(best_lp),
+                                resolved_reason
+                            ))
+                            continue
+
+                if member_lp not in lp_to_owned_hps:
+                    skipped_in_unit += 1
+                    continue
+                lp_to_owned_hps[member_lp].append(self.hp_data[hp_name])
                 unassigned_hps.remove(hp_name)
+                evidence = hp_resolution_evidence.get(hp_name) or {}
+                if evidence.get('lp_name') != member_lp:
+                    evidence = {}
                 hp_claims[hp_name] = {
-                    "owner_lp": best_lp,
-                    "material_slot": _lp_material_slot(best_lp),
-                    "material_name": self.lp_data.get(best_lp, {}).get("material_name"),
+                    "owner_lp": member_lp,
+                    "material_slot": _lp_material_slot(member_lp),
+                    "material_name": self.lp_data.get(member_lp, {}).get("material_name"),
                     "candidate_lps": list(hp_candidates.get(hp_name, [])),
                     "candidate_count": len(hp_candidates.get(hp_name, [])),
-                    "driver_hp": driver_hp,
-                    "source": claim_source,
-                    "reason": driver_reason,
-                    "score": _lp_claim_score(hp_name, best_lp, driver_reason, len(hp_candidates.get(hp_name, [])))
+                    "driver_hp": member_driver,
+                    "source": member_source,
+                    "reason": member_reason,
+                    "score": _lp_claim_score(
+                        hp_name,
+                        member_lp,
+                        member_reason,
+                        len(hp_candidates.get(hp_name, [])),
+                        evidence
+                    ),
+                    "confidence": float(evidence.get('confidence', 0.0) or 0.0),
+                    "ambiguous": bool(evidence.get('ambiguous', False)),
+                    "evidence": dict(evidence),
                 }
+                assigned_in_unit += 1
+                if hp_name != driver_hp and member_lp == best_lp:
+                    pulled_in_unit += 1
+                elif member_lp != best_lp:
+                    split_in_unit += 1
 
             if len(ordered_unit) > 1:
-                _debug("  COMPOUND_ASSIGN: driver='{}' -> LP='{}' | pulled={} | reason={}".format(
+                _debug("  COMPOUND_ASSIGN: driver='{}' -> LP='{}' | assigned={} pulled={} split={} deferred={} | reason={}".format(
                     _short_name(driver_hp),
                     _short_name(best_lp),
-                    len(ordered_unit) - 1,
+                    assigned_in_unit,
+                    pulled_in_unit,
+                    split_in_unit,
+                    skipped_in_unit,
                     driver_reason
                 ))
             else:
@@ -954,6 +1176,20 @@ class HPGroupingWorker(QtCore.QThread):
                     _short_name(best_lp),
                     driver_reason
                 ))
+
+        accepted_surface_count = sum(
+            1 for evidence in hp_resolution_evidence.values()
+            if evidence.get('accepted')
+        )
+        logs.append(
+            "LP ownership evidence: {} surface pair test(s), {} accepted HP claim(s), {} ambiguous claim(s).".format(
+                surface_match_stats.get('tests', 0),
+                accepted_surface_count,
+                len(ambiguous_hp_matches)
+            )
+        )
+        if ambiguous_hp_matches:
+            _debug_list("  LP_AMBIGUOUS_PROTECTED: ", sorted(ambiguous_hp_matches, key=_short_name))
 
 
         def _step2_5_floater_decal_pass():
@@ -1085,9 +1321,11 @@ class HPGroupingWorker(QtCore.QThread):
                         return repeated_fastener_cache[hp_name]
                     repeated = hp_vtx_frequency.get(hp_info.get("vtx"), 0) >= 4
                     result = False
-                    if repeated and HAS_MATH_CORE and hasattr(bg_math_core, 'analyze_mesh_shape') and hp_verts:
+                    if repeated and hp_verts:
                         try:
-                            metrics = bg_math_core.analyze_mesh_shape(_sample_flat_verts(hp_verts, 600))
+                            metrics = _analyze_shape_metrics(_sample_flat_verts(hp_verts, 600))
+                            if metrics is None:
+                                raise RuntimeError("shape metrics unavailable")
                             result = (
                                 float(metrics.elongation) < self.bolt_elongation
                                 and (not self.use_symmetry or float(metrics.symmetry_score) < self.bolt_symmetry)
@@ -1115,14 +1353,39 @@ class HPGroupingWorker(QtCore.QThread):
                     except Exception:
                         score = 0.0
                     source = claim.get("source")
-                    try:
-                        candidate_count = int(claim.get("candidate_count", 0) or 0)
-                    except Exception:
-                        candidate_count = 0
-                    return (
-                        score >= 45.0
-                        and (candidate_count == 1 or source in ("compound", "manual", "custom", "gt"))
+                    if claim.get("ambiguous") and source in (
+                        "lp", "compound", "manual", "custom", "gt"
+                    ):
+                        # Ambiguous means "two plausible own LPs", not "this is
+                        # a floater".  Keep it in the deterministic LP result and
+                        # expose the uncertainty in diagnostics instead of
+                        # silently attaching it to an unrelated HP parent.
+                        return True
+                    # Candidate count only describes overlapping LP bounding
+                    # boxes. Once the geometry resolver produced a confident
+                    # direct claim, nearby LP boxes must not turn that HP into
+                    # somebody else's floater.
+                    return score >= 45.0 and source in (
+                        "lp", "compound", "manual", "custom", "gt"
                     )
+
+                def _has_scale_matched_lp_claim(hp_name, claim):
+                    """Return True when HP and its resolved LP have comparable bounds."""
+                    if not claim or not claim.get("owner_lp"):
+                        return False
+                    try:
+                        score = float(claim.get("score", 0.0) or 0.0)
+                    except Exception:
+                        score = 0.0
+                    if score < 45.0:
+                        return False
+                    hp_info = self.hp_data.get(hp_name, {})
+                    lp_info = self.lp_data.get(claim.get("owner_lp"), {})
+                    hp_diag = float(hp_info.get("diag", hp_info.get("radius", 0.0) * 2.0) or 0.0)
+                    lp_diag = float(lp_info.get("diag", lp_info.get("radius", 0.0) * 2.0) or 0.0)
+                    if hp_diag <= 0.0 or lp_diag <= 0.0:
+                        return False
+                    return min(hp_diag, lp_diag) / max(hp_diag, lp_diag) >= 0.60
 
                 def _mark_floater_candidate(hp_name, reason, unstable_parent=True):
                     weak_floater_candidates.add(hp_name)
@@ -1130,7 +1393,7 @@ class HPGroupingWorker(QtCore.QThread):
                     if unstable_parent:
                         unstable_floater_parents.add(hp_name)
 
-                for _hp_name in list(unassigned_hps):
+                for _hp_name in sorted(unassigned_hps, key=_short_name):
                     if _hp_name not in self.hp_data or not _has_hole(_hp_name):
                         continue
                     _hole_mode = _hole_orientation(_hp_name)
@@ -1263,13 +1526,21 @@ class HPGroupingWorker(QtCore.QThread):
                         continue
                     if _is_manual_hp(parent_hp):
                         continue
+                    parent_claim = hp_claims.get(parent_hp, {})
+                    if (
+                        _has_scale_matched_lp_claim(parent_hp, parent_claim)
+                        and hp_vtx_frequency.get(parent_info.get("vtx"), 0) >= 4
+                    ):
+                        # Repeated resolved hardware is a leaf detail, never the
+                        # surface that should absorb another HP as its floater.
+                        continue
                     parent_claim_score = _claim_score(parent_hp)
                     # Avoid cascading from weak floater links. A dependent mesh should
                     # attach to a stable bake owner, not to another uncertain detail.
                     if parent_hp in unstable_floater_parents or _claim_source(parent_hp) == "floater" or parent_claim_score < 35.0:
                         continue
                 
-                    for potential_floater in list(weak_floater_candidates):
+                    for potential_floater in sorted(weak_floater_candidates, key=_short_name):
                         if potential_floater == parent_hp or potential_floater in floaters_assigned:
                             continue
                         
@@ -1280,7 +1551,30 @@ class HPGroupingWorker(QtCore.QThread):
                             continue
                         if _is_manual_hp(potential_floater):
                             continue
-                        current_owner_lp = hp_claims.get(potential_floater, {}).get("owner_lp")
+                        current_claim = hp_claims.get(potential_floater, {})
+                        current_owner_lp = current_claim.get("owner_lp")
+                        try:
+                            current_claim_score = float(current_claim.get("score", 0.0) or 0.0)
+                        except Exception:
+                            current_claim_score = 0.0
+                        repeated_fastener_with_lp = (
+                            current_owner_lp
+                            and current_claim_score >= 45.0
+                            and _is_repeated_fastener_like(
+                                potential_floater, floater_info, floater_verts
+                            )
+                        )
+                        if current_owner_lp and (
+                            _has_own_lp_claim(potential_floater, current_claim)
+                            or _has_scale_matched_lp_claim(potential_floater, current_claim)
+                            or repeated_fastener_with_lp
+                        ):
+                            # A confident direct LP match has priority over indirect
+                            # floater evidence such as an outward-facing open border.
+                            # Repeated bolts/rivets commonly overlap several nearby
+                            # LP bboxes, so their strong match is accepted even when
+                            # the initial candidate list was not unique.
+                            continue
                         if current_owner_lp == parent_lp_name:
                             continue
                         candidate_reason = floater_candidate_reason.get(potential_floater, "unknown")
@@ -1752,7 +2046,9 @@ class HPGroupingWorker(QtCore.QThread):
             return prefix
 
         named_clusters = []
-        unlinked_meshes = [self.hp_data[hp] for hp in unassigned_hps]
+        unlinked_meshes = [
+            self.hp_data[hp] for hp in sorted(unassigned_hps, key=_short_name)
+        ]
 
         lp_base_to_lps = {}
         lp_base_order = {}
@@ -1830,41 +2126,71 @@ class HPGroupingWorker(QtCore.QThread):
 
         # --- STEP 4: Threshold Calculations & OUTLIER VALIDATION ---
         all_meshes_list = list(self.hp_data.values())
-        
+
+        def _percentile(values, fraction):
+            ordered = sorted(float(value) for value in values if _is_finite_value(value))
+            if not ordered:
+                return 0.0
+            if len(ordered) == 1:
+                return ordered[0]
+            position = max(0.0, min(1.0, float(fraction))) * (len(ordered) - 1)
+            lower = int(math.floor(position))
+            upper = int(math.ceil(position))
+            if lower == upper:
+                return ordered[lower]
+            weight = position - lower
+            return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
         raw_diags = [m.get("diag", 0) for m in all_meshes_list if m.get("diag", 0) > 0.001 and m.get("bbox_vol", 0) > 1e-6]
         median_scene_diag = bg_core.StatsUtils.median(raw_diags) if raw_diags else 1.0
-        
+
+        # Keep the proven historical scale on ordinary scenes, while allowing
+        # the upper population percentile to lift the cutoff when many repeated
+        # tiny details pull the median down.
+        raw_q95 = _percentile(raw_diags, 0.95) if raw_diags else median_scene_diag
+        outlier_diag_limit = max(median_scene_diag * 10.0, raw_q95 * 1.10, 0.001)
         valid_diags = []
         for m in all_meshes_list:
             d = m.get("diag", 0)
-            if 0.001 < d <= (median_scene_diag * 10) and m.get("bbox_vol", 0) > 1e-6:
+            if 0.001 < d <= outlier_diag_limit and m.get("bbox_vol", 0) > 1e-6:
                 valid_diags.append(d)
-            elif d > (median_scene_diag * 10):
+            elif d > outlier_diag_limit:
                 logs.append("[Warning] Mesh '{}' has anomalous bounding box (Diag: {:.2f}). Excluded from threshold calc.".format(m.get('name'), d))
-                
-        valid_diags.sort(reverse=True)
-        
-        top_count = min(10, len(valid_diags))
-        upper_shelf_diag = sum(valid_diags[:top_count]) / top_count if top_count > 0 else 1.0
+
+        valid_diags.sort()
+        # The 95th percentile remains stable as repeated chapters/details are
+        # added and closely matches the old upper-shelf calibration without
+        # depending on exactly ten mesh records.
+        upper_shelf_diag = min(raw_q95, valid_diags[-1]) if valid_diags else 1.0
 
         bolt_median_diag = 0.0
         vtx_dict = {}
         for m in all_meshes_list:
             d = m.get("diag", 0)
-            if not m.get("is_zbrush", False) and 1e-6 < m.get("bbox_vol", 0) and d <= (median_scene_diag * 10):
+            if not m.get("is_zbrush", False) and 1e-6 < m.get("bbox_vol", 0) and d <= outlier_diag_limit:
                 vtx_dict.setdefault(m.get("vtx", 0), []).append(d)
-        
-        largest_cluster_size = 0
-        for vtx, diags in vtx_dict.items():
-            if len(diags) > largest_cluster_size and len(diags) >= 2:
-                largest_cluster_size = len(diags)
-                bolt_median_diag = sum(diags) / len(diags)
+
+        repeated_scale_candidates = []
+        for vtx, diags in sorted(vtx_dict.items(), key=lambda item: item[0]):
+            if len(diags) < 2:
+                continue
+            cluster_mean = sum(diags) / float(len(diags))
+            if cluster_mean <= upper_shelf_diag * 0.40:
+                repeated_scale_candidates.append((
+                    -len(diags),
+                    vtx,
+                    cluster_mean,
+                ))
+
+        if repeated_scale_candidates:
+            repeated_scale_candidates.sort()
+            bolt_median_diag = repeated_scale_candidates[0][2]
 
         if bolt_median_diag == 0.0 or bolt_median_diag > upper_shelf_diag * 0.25:
-            bolt_median_diag = valid_diags[-1] * 1.5 if valid_diags else 0.1
+            bolt_median_diag = _percentile(valid_diags, 0.10) if valid_diags else 0.1
 
         small_threshold = bolt_median_diag * 1.5
-        large_threshold = upper_shelf_diag * 0.6
+        large_threshold = max(upper_shelf_diag * 0.6, small_threshold * 1.5)
         medium_threshold = (small_threshold + large_threshold) / 2.0
         bolt_vtx_values = set()
         for vtx, diags in vtx_dict.items():
@@ -1874,8 +2200,8 @@ class HPGroupingWorker(QtCore.QThread):
             if avg_diag <= (medium_threshold * 1.15):
                 bolt_vtx_values.add(vtx)
         _debug("Step 4: size thresholds.")
-        _debug("  median_scene_diag={:.6f} | valid_diag_count={} | upper_shelf_diag={:.6f}".format(
-            median_scene_diag, len(valid_diags), upper_shelf_diag
+        _debug("  median_scene_diag={:.6f} | q95={:.6f} | outlier_limit={:.6f} | valid_diag_count={} | upper_shelf_diag(q95)={:.6f}".format(
+            median_scene_diag, raw_q95, outlier_diag_limit, len(valid_diags), upper_shelf_diag
         ))
         _debug("  bolt_median_diag={:.6f} | small={:.6f} | medium={:.6f} | large={:.6f}".format(
             bolt_median_diag, small_threshold, medium_threshold, large_threshold
@@ -1898,7 +2224,9 @@ class HPGroupingWorker(QtCore.QThread):
                 verts = self.hp_verts_cache.get(name, [])
                 if verts:
                     try:
-                        metrics = bg_math_core.analyze_mesh_shape(verts)
+                        metrics = _analyze_shape_metrics(verts)
+                        if metrics is None:
+                            raise RuntimeError("shape metrics unavailable")
                         result = (float(metrics.elongation), float(metrics.symmetry_score))
                     except Exception:
                         result = None
@@ -2344,33 +2672,46 @@ class HPGroupingWorker(QtCore.QThread):
             
                 is_bolt_shape = False
                 is_wire_shape = False
-                math_core_success = False
-            
-                if HAS_MATH_CORE:
-                    # Reuse the shared get_shape_metrics cache instead of a second
-                    # direct analyze_mesh_shape() call for item[0] (it is analyzed
-                    # again just below via _mesh_is_bolt_like). get_shape_metrics
-                    # also swallows a failed shape analysis (returns None) so one
-                    # bad mesh can't crash the whole categorization pass.
-                    shape_metrics = get_shape_metrics(item[0])
-                    if shape_metrics is not None:
-                        elongation, symmetry_score = shape_metrics
+                valid_shape_count = 0
+                wire_like_count = 0
+                bolt_shape_count = 0
+                for mesh_info in item:
+                    mesh_metrics = get_shape_metrics(mesh_info)
+                    if not mesh_metrics:
+                        continue
+                    valid_shape_count += 1
+                    mesh_elongation = mesh_metrics[0]
+                    mesh_symmetry = mesh_metrics[1]
+                    mesh_wire_threshold = 8.0 if mesh_info.get("is_zbrush", False) else self.wire_elongation
+                    if mesh_elongation > mesh_wire_threshold and mesh_info.get("bbox_vol", 0.0) < 0.05:
+                        wire_like_count += 1
+                    symmetry_ok = (not self.use_symmetry) or mesh_symmetry < self.bolt_symmetry
+                    if (
+                        not mesh_info.get("is_zbrush", False)
+                        and mesh_elongation < self.bolt_elongation
+                        and symmetry_ok
+                    ):
+                        bolt_shape_count += 1
 
-                        symmetry_ok = (not self.use_symmetry) or symmetry_score < self.bolt_symmetry
-                        if not is_zb and not is_hard_custom and elongation < self.bolt_elongation and symmetry_ok:
-                            if cluster_diag <= medium_threshold:
-                                is_bolt_shape = True
+                # Classify the complete item so a different first member cannot
+                # change the result. Missing metrics cannot form a majority.
+                has_shape_quorum = valid_shape_count * 2 > len(item)
+                is_wire_shape = bool(
+                    has_shape_quorum
+                    and wire_like_count * 2 > valid_shape_count
+                    and true_vol < 0.05
+                )
+                is_bolt_shape = bool(
+                    not is_zb
+                    and not is_hard_custom
+                    and has_shape_quorum
+                    and bolt_shape_count * 2 > valid_shape_count
+                    and cluster_diag <= medium_threshold
+                )
 
-                        effective_wire_elongation = 8.0 if is_zb else self.wire_elongation
-                        if elongation > effective_wire_elongation and true_vol < 0.05:
-                            is_wire_shape = True
-
-                        math_core_success = True
-            
-                if not math_core_success:
-                    if not is_zb and not is_hard_custom:
-                        avg_variance = sum(float(m.get("variance", 999.0)) for m in item) / max(len(item), 1)
-                        is_bolt_shape = avg_variance < 0.5
+                if not valid_shape_count and not is_zb and not is_hard_custom:
+                    avg_variance = sum(float(m.get("variance", 999.0)) for m in item) / max(len(item), 1)
+                    is_bolt_shape = avg_variance < 0.5
 
                 bolt_like_count = 0 if (is_zb or is_hard_custom) else sum(1 for m in item if _mesh_is_bolt_like(m))
                 all_parts_bolt_like = bolt_like_count == len(item)
@@ -2386,6 +2727,20 @@ class HPGroupingWorker(QtCore.QThread):
                     )
                     and max_single_diag <= large_threshold
                 )
+
+                if len(item) > 1 or is_wire_shape or is_bolt_shape or is_mixed_bolt_item:
+                    _debug(
+                        "  ITEM_CLASSIFY: item_size={} | valid_shape={} | wire_votes={} | "
+                        "bolt_shape_votes={} | bolt_like_parts={} | wire={} | bolt_shape={} | "
+                        "mixed_bolt={} | item={}".format(
+                            len(item), valid_shape_count, wire_like_count,
+                            bolt_shape_count, bolt_like_count,
+                            "yes" if is_wire_shape else "no",
+                            "yes" if is_bolt_shape else "no",
+                            "yes" if is_mixed_bolt_item else "no",
+                            ", ".join(_short_name(m.get("name")) for m in item if m.get("name"))
+                        )
+                    )
             
                 if not is_wire_shape and not is_hard_custom and (is_bolt_shape or is_mixed_bolt_item or (max_single_diag <= small_threshold and not is_zb)):
                     if is_mixed_bolt_item:
@@ -3369,6 +3724,7 @@ class HPGroupingWorker(QtCore.QThread):
         source_counts = {}
         fallback_hits = []
         weak_hits = []
+        ambiguous_hits = []
         for _hp_name, _claim in hp_claims.items():
             _src = _claim.get("source", "unknown")
             source_counts[_src] = source_counts.get(_src, 0) + 1
@@ -3381,6 +3737,8 @@ class HPGroupingWorker(QtCore.QThread):
                 fallback_hits.append((_short_name(_hp_name), _short_name(_claim.get("owner_lp")), _score))
             elif _score < 45.0:
                 weak_hits.append((_short_name(_hp_name), _short_name(_claim.get("owner_lp")), _score))
+            if _claim.get("ambiguous"):
+                ambiguous_hits.append((_short_name(_hp_name), _short_name(_claim.get("owner_lp")), _score))
 
         _debug("")
         _debug("=== Diagnostics ===")
@@ -3399,13 +3757,17 @@ class HPGroupingWorker(QtCore.QThread):
             _debug("{} weak assignment(s) (confidence score < 45):".format(len(weak_hits)))
             for _n, _lp, _sc in sorted(weak_hits)[:80]:
                 _debug("  WEAK_ASSIGN: HP='{}' -> LP='{}' | score={:.1f}".format(_n, _lp, _sc))
+        if ambiguous_hits:
+            _debug("{} ambiguous LP ownership assignment(s) kept deterministic and protected from floater relinking:".format(len(ambiguous_hits)))
+            for _n, _lp, _sc in sorted(ambiguous_hits)[:80]:
+                _debug("  AMBIGUOUS_ASSIGN: HP='{}' -> LP='{}' | score={:.1f}".format(_n, _lp, _sc))
         _debug("")
 
         self.summary_lines = [
             "Analyze HP: {} HP mesh(es) processed into {} group(s).".format(len(self.hp_data), len(groups)),
             "LP-guided matching: {} HP mesh(es) resolved before final packing.".format(matched_count),
-            "Match confidence: {} fallback / {} weak assignment(s); {} HP mesh(es) matched no LP.".format(
-                len(fallback_hits), len(weak_hits), len(unassigned_list)),
+            "Match confidence: {} fallback / {} weak / {} ambiguous assignment(s); {} HP mesh(es) matched no LP.".format(
+                len(fallback_hits), len(weak_hits), len(ambiguous_hits), len(unassigned_list)),
             "Compound HP linking: {} component(s), {} linked pair(s), min vertices={}, distance={}%. ".format(
                 len(compound_components), compound_hit_pairs, compound_min_hits, self.compound_link_dist_pct
             ).strip(),

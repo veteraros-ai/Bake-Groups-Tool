@@ -367,8 +367,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.right_splitter.setChildrenCollapsible(True)
         right_layout.addWidget(self.right_splitter)
 
+        # Temporarily keep HP-LP Matcher out of the UI without removing its
+        # implementation or saved data.  Flip this flag back to True to restore
+        # the section in a later release.
+        self.hp_lp_matcher_visible = False
         self.gt_widget = bg_gt_matcher.GTWidget(self)
         self.right_splitter.addWidget(self.gt_widget)
+        self.gt_widget.setVisible(self.hp_lp_matcher_visible)
 
         top_right_widget = QtWidgets.QWidget()
         top_right_layout = QtWidgets.QVBoxLayout(top_right_widget)
@@ -428,7 +433,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.export_container.setVisible(False)
         self.right_splitter.addWidget(self.export_container)
 
-        self.right_splitter.setSizes([400, 260, 220, 220])
+        self.right_splitter.setSizes([0, 660, 220, 220])
 
         session_buttons_layout = QtWidgets.QHBoxLayout()
         session_buttons_layout.setSpacing(4)

@@ -67,6 +67,14 @@ import contextlib
 from bg_ui_widgets import SubgroupButton, get_icon, configure_square_icon_button
 
 
+def _create_identity_child_group(parent, name):
+    """Create an empty child with identity local TRS under ``parent``."""
+    if not parent or not cmds.objExists(parent):
+        raise RuntimeError("Cannot create subgroup: parent does not exist: {}".format(parent))
+    group = cmds.group(empty=True, name=name, parent=parent)
+    return (cmds.ls(group, long=True) or [group])[0]
+
+
 # ============================================================================
 # HP ANALYSIS MIXIN
 # ============================================================================
@@ -295,7 +303,81 @@ class HPAnalysisMixin:
         if not bbox:
             bbox = [0.0] * 6
         bbox_key = tuple(int(round(float(value) * 10000.0)) for value in bbox[:6])
-        return shape_uuid, (shape_uuid, vertex_count, face_count, bbox_key)
+        try:
+            world_matrix = cmds.xform(mesh_transform, query=True, matrix=True, worldSpace=True) or []
+            matrix_key = tuple(int(round(float(value) * 100000.0)) for value in world_matrix[:16])
+        except Exception:
+            matrix_key = ()
+
+        # A local surface-area checksum is evaluated inside Maya and catches
+        # ordinary component edits even when counts, transforms and the world
+        # bounding box stay unchanged.  It is much cheaper than copying every
+        # point into Python merely to validate a cached analysis result.
+        try:
+            # Avoid turning cache validation itself into a full million-face
+            # ZBrush evaluation; dense meshes still use bbox + matrix + the
+            # expanded deterministic point/topology sample below.
+            if vertex_count <= 250000:
+                local_area = float(cmds.polyEvaluate(mesh_transform, area=True) or 0.0)
+                geometry_key = int(round(local_area * 1000000.0))
+            else:
+                geometry_key = None
+        except Exception:
+            geometry_key = None
+
+        # Counts and bbox can stay unchanged after a real mesh edit. Sample a
+        # small stable subset of evaluated points and face connectivity so cache
+        # entries are invalidated after edits and Undo/Redo without paying for a
+        # full vertex extraction on every lookup.
+        point_key = ()
+        topology_key = ()
+        try:
+            selection = om.MSelectionList()
+            selection.add(shape)
+            shape_path = selection.getDagPath(0)
+            mesh_fn = om.MFnMesh(shape_path)
+
+            def _sample_indices(count, limit):
+                if count <= 0:
+                    return []
+                if count <= limit:
+                    return list(range(count))
+                return sorted(set(
+                    int(round(i * (count - 1) / float(limit - 1)))
+                    for i in range(limit)
+                ))
+
+            point_values = []
+            for index in _sample_indices(mesh_fn.numVertices, 128):
+                point = mesh_fn.getPoint(index, om.MSpace.kObject)
+                point_values.extend((
+                    int(round(float(point.x) * 100000.0)),
+                    int(round(float(point.y) * 100000.0)),
+                    int(round(float(point.z) * 100000.0)),
+                ))
+            point_key = tuple(point_values)
+
+            topology_values = []
+            for face_index in _sample_indices(mesh_fn.numPolygons, 32):
+                topology_values.append(tuple(
+                    int(vertex) for vertex in mesh_fn.getPolygonVertices(face_index)
+                ))
+            topology_key = tuple(topology_values)
+        except Exception:
+            pass
+
+        signature = (
+            "analyze-geo-v3",
+            shape_uuid,
+            vertex_count,
+            face_count,
+            bbox_key,
+            matrix_key,
+            geometry_key,
+            point_key,
+            topology_key,
+        )
+        return shape_uuid, signature
 
     def _combined_check_mesh_shells_cached(self, mesh_transform):
         long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
@@ -1031,7 +1113,8 @@ class HPAnalysisMixin:
         if not cache_id:
             return None, None, None, 100.0
         try:
-            vcount = int(sig[1])
+            # Signature v3 starts with (schema, shape_uuid, vertex_count, ...).
+            vcount = int(sig[2])
         except Exception:
             vcount = 0
         density = bg_core.density_pct_for(vcount, cache_mode)
@@ -2211,7 +2294,7 @@ class HPAnalysisMixin:
                 if existing_grp:
                     new_grp = existing_grp
                 else:
-                    new_grp = cmds.parent(cmds.group(em=True, name=safe_name), hp_main)[0]
+                    new_grp = _create_identity_child_group(hp_main, safe_name)
                     cmds.addAttr(new_grp, ln=bg_core.BakeConfig.ATTR_BAKE_GROUP, dt="string")
                     cmds.setAttr("{}.{}".format(new_grp, bg_core.BakeConfig.ATTR_BAKE_GROUP), "HP", type="string")
 
@@ -2705,7 +2788,7 @@ class LPMatchingMixin:
                         break
 
                 if not target_grp:
-                    target_grp = cmds.parent(cmds.group(em=True, name=s_name), lp_main)[0]
+                    target_grp = _create_identity_child_group(lp_main, s_name)
                     cmds.addAttr(target_grp, ln=bg_core.BakeConfig.ATTR_BAKE_GROUP, dt="string")
                     cmds.setAttr("{}.{}".format(target_grp, bg_core.BakeConfig.ATTR_BAKE_GROUP), "LP", type="string")
 
@@ -4485,8 +4568,9 @@ class FinalViewMixin:
         if exp_container is not None:
             exp_container.setVisible(False)
         if hasattr(self, 'gt_widget'):
-            self.gt_widget.setVisible(True)
-        # Restore the splitter proportions the Matcher had before cage config.
+            self.gt_widget.setVisible(bool(getattr(self, 'hp_lp_matcher_visible', False)))
+        # Restore the splitter proportions from before cage config.  The hidden
+        # Matcher keeps a zero-sized slot so it can be re-enabled later.
         saved = getattr(self, '_saved_right_sizes', None)
         if saved and hasattr(self, 'right_splitter'):
             try:
@@ -5480,12 +5564,12 @@ class GroupManagementMixin:
             lp_name = "{}{}".format(suffix, bg_core.BakeConfig.SUFFIX_LP)
 
             if not cmds.objExists(hp_name):
-                new_hp = cmds.parent(cmds.group(em=True, name=hp_name), hp_main)[0]
+                new_hp = _create_identity_child_group(hp_main, hp_name)
                 cmds.addAttr(new_hp, ln=bg_core.BakeConfig.ATTR_BAKE_GROUP, dt="string")
                 cmds.setAttr("{}.{}".format(new_hp, bg_core.BakeConfig.ATTR_BAKE_GROUP), "HP", type="string")
 
             if not cmds.objExists(lp_name):
-                new_lp = cmds.parent(cmds.group(em=True, name=lp_name), lp_main)[0]
+                new_lp = _create_identity_child_group(lp_main, lp_name)
                 cmds.addAttr(new_lp, ln=bg_core.BakeConfig.ATTR_BAKE_GROUP, dt="string")
                 cmds.setAttr("{}.{}".format(new_lp, bg_core.BakeConfig.ATTR_BAKE_GROUP), "LP", type="string")
 
@@ -5894,20 +5978,104 @@ class SceneInteractionMixin:
                 result.append(long_node)
         return result
 
-    def validate_frozen_transforms(self, root_nodes, mesh_roots=None, action_name=""):
-        roots = [(cmds.ls(node, long=True) or [node])[0] for node in (root_nodes or []) if node and cmds.objExists(node)]
-        mesh_nodes = []
-        for root_node in mesh_roots or []:
-            mesh_nodes.extend(self._mesh_transforms_under_root(root_node))
+    def _freeze_transform_hierarchy_nodes(self, root_nodes, mesh_roots=None):
+        """Return roots, mesh transforms and every transform between them.
 
-        invalid_roots = self._unfrozen_transforms(roots)
-        invalid_meshes = self._unfrozen_transforms(mesh_nodes)
-        invalid = []
-        seen = set()
-        for node in invalid_roots + invalid_meshes:
-            if node not in seen:
-                invalid.append(node)
-                seen.add(node)
+        Freezing only the leaf meshes is unsafe when a subgroup carries a
+        transform which its children compensate for.  Keep complete DAG paths
+        and sort parents before children so Maya can push a parent's transform
+        down before the child itself is frozen.
+        """
+        result = set()
+
+        for node in root_nodes or []:
+            if not node or not cmds.objExists(node):
+                continue
+            long_node = (cmds.ls(node, long=True) or [node])[0]
+            result.add(long_node)
+
+        for root_node in mesh_roots or []:
+            if not root_node or not cmds.objExists(root_node):
+                continue
+            long_root = (cmds.ls(root_node, long=True) or [root_node])[0]
+            result.add(long_root)
+
+            for mesh_node in self._mesh_transforms_under_root(long_root):
+                current = mesh_node
+                while current and (current == long_root or current.startswith(long_root + "|")):
+                    result.add(current)
+                    if current == long_root:
+                        break
+                    current = current.rsplit("|", 1)[0]
+
+        return sorted(result, key=lambda node: (node.count("|"), node))
+
+    def _freeze_transform_blockers(self, hierarchy_nodes, invalid_nodes):
+        """Find referenced, locked or driven transforms affected by a freeze."""
+        invalid = set(invalid_nodes or [])
+        affected = set()
+        blockers = []
+        transform_attrs = (
+            "translateX", "translateY", "translateZ",
+            "rotateX", "rotateY", "rotateZ",
+            "scaleX", "scaleY", "scaleZ",
+            "shearXY", "shearXZ", "shearYZ",
+        )
+
+        for node in hierarchy_nodes or []:
+            parent = node.rsplit("|", 1)[0] if "|" in node else ""
+            if node not in invalid and parent not in affected:
+                continue
+            affected.add(node)
+
+            try:
+                if cmds.referenceQuery(node, isNodeReferenced=True):
+                    blockers.append((node, "referenced"))
+                    continue
+            except Exception:
+                pass
+
+            reasons = []
+            for attr in transform_attrs:
+                plug = "{}.{}".format(node, attr)
+                if not cmds.objExists(plug):
+                    continue
+                try:
+                    if cmds.getAttr(plug, lock=True):
+                        reasons.append("{} locked".format(attr))
+                        continue
+                    incoming = cmds.listConnections(
+                        plug, source=True, destination=False, plugs=True
+                    ) or []
+                    if incoming:
+                        reasons.append("{} driven".format(attr))
+                except Exception:
+                    reasons.append("{} unavailable".format(attr))
+            if reasons:
+                blockers.append((node, ", ".join(reasons)))
+
+        return blockers
+
+    def _apply_freeze_transform_hierarchy(self, hierarchy_nodes):
+        """Freeze a complete hierarchy parent-first and return changed nodes."""
+        fixed = []
+        for node in hierarchy_nodes or []:
+            if not cmds.objExists(node) or self._is_transform_frozen(node):
+                continue
+            cmds.makeIdentity(
+                node,
+                apply=True,
+                translate=True,
+                rotate=True,
+                scale=True,
+                normal=False,
+            )
+            fixed.append(node)
+        return fixed
+
+    def validate_frozen_transforms(self, root_nodes, mesh_roots=None, action_name=""):
+        hierarchy_nodes = self._freeze_transform_hierarchy_nodes(root_nodes, mesh_roots)
+        invalid = self._unfrozen_transforms(hierarchy_nodes)
 
         if not invalid:
             return True
@@ -5939,17 +6107,32 @@ class SceneInteractionMixin:
                 )
             return False
 
+        blockers = self._freeze_transform_blockers(hierarchy_nodes, invalid)
+        if blockers:
+            blocked_nodes = [node for node, _reason in blockers]
+            cmds.select(blocked_nodes, replace=True)
+            preview = [
+                "{} ({})".format(node.split('|')[-1], reason)
+                for node, reason in blockers[:8]
+            ]
+            if len(blockers) > 8:
+                preview.append("... +{} more".format(len(blockers) - 8))
+            error = bg_l10n.text("Freeze Transformations failed: {error}").format(
+                error="locked, driven or referenced hierarchy nodes: {}".format(", ".join(preview))
+            )
+            cmds.warning(error)
+            self.log(error, "red")
+            return False
+
         try:
             with bg_core.undo_chunk("FreezeTransformations"):
-                cmds.makeIdentity(invalid, apply=True, translate=True, rotate=True, scale=True, normal=False)
+                fixed = self._apply_freeze_transform_hierarchy(hierarchy_nodes)
         except Exception as exc:
             cmds.warning(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc))
             self.log(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc), "red")
             return False
 
-        invalid_after = self._unfrozen_transforms(roots)
-        invalid_after.extend(self._unfrozen_transforms(mesh_nodes))
-        invalid_after = list(dict((node, None) for node in invalid_after).keys())
+        invalid_after = self._unfrozen_transforms(hierarchy_nodes)
         if invalid_after:
             cmds.select(invalid_after, replace=True)
             cmds.warning(bg_l10n.text("Freeze Transformations did not clear all invalid transforms."))
@@ -5961,7 +6144,7 @@ class SceneInteractionMixin:
         if hasattr(self, 'record_user_action'):
             self.record_user_action(
                 "Freeze Transformations completed",
-                "{} | fixed={}".format(action_name or "Action", len(invalid))
+                "{} | fixed={}".format(action_name or "Action", len(fixed))
             )
         return True
 

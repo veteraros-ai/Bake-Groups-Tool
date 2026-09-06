@@ -23,37 +23,55 @@ function Invoke-Native {
 }
 
 foreach ($version in $Versions) {
-    $buildDir = Join-Path $repoRoot "build\bg_math_core_$version"
-    $cmakeArgs = @(
-        "-S", $repoRoot,
-        "-B", $buildDir,
-        "-DMAYA_VERSION=$version",
-        "-DDEVKITS_ROOT=$DevkitsRoot"
-    )
+    foreach ($moduleName in @("bg_math_core", "bg_math_core_runtime")) {
+        $buildDir = Join-Path $repoRoot "build\${moduleName}_$version"
+        $cmakeArgs = @(
+            "-S", $repoRoot,
+            "-B", $buildDir,
+            "-DMAYA_VERSION=$version",
+            "-DDEVKITS_ROOT=$DevkitsRoot",
+            "-DBG_MATH_CORE_MODULE_NAME=$moduleName"
+        )
 
-    if ($Generator) {
-        $cmakeArgs += @("-G", $Generator)
-        if ($Architecture) {
-            $cmakeArgs += @("-A", $Architecture)
+        if ($Generator) {
+            $cmakeArgs += @("-G", $Generator)
+            if ($Architecture) {
+                $cmakeArgs += @("-A", $Architecture)
+            }
         }
+
+        if ($Pybind11SourceDir) {
+            $cmakeArgs += "-DPYBIND11_SOURCE_DIR=$Pybind11SourceDir"
+        }
+
+        Write-Host "Configuring $moduleName for Maya $version"
+        Invoke-Native -FilePath "cmake" -Arguments $cmakeArgs
+
+        Write-Host "Building $moduleName for Maya $version"
+        Invoke-Native -FilePath "cmake" -Arguments @("--build", $buildDir, "--config", $Config, "--target", "bg_math_core")
+
+        $outFile = Join-Path $repoRoot "Bake_Groups\bin\$version\$moduleName.pyd"
+        if (-not (Test-Path -LiteralPath $outFile)) {
+            throw "Build finished but output was not found: $outFile"
+        }
+
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $outFile).Hash
+        Write-Host "Built $outFile"
+        Write-Host "SHA256 $hash"
     }
 
-    if ($Pybind11SourceDir) {
-        $cmakeArgs += "-DPYBIND11_SOURCE_DIR=$Pybind11SourceDir"
+    $runtimeDir = Join-Path $repoRoot "Bake_Groups\bin\$version\runtime"
+    New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+    $sourceFile = Join-Path $repoRoot "Bake_Groups\bin\$version\bg_math_core_runtime.pyd"
+    $targetFile = Join-Path $runtimeDir "bg_math_core_runtime.pyd"
+    try {
+        Copy-Item -LiteralPath $sourceFile -Destination $targetFile -Force
+        Write-Host "Installed $targetFile"
     }
-
-    Write-Host "Configuring bg_math_core for Maya $version"
-    Invoke-Native -FilePath "cmake" -Arguments $cmakeArgs
-
-    Write-Host "Building bg_math_core for Maya $version"
-    Invoke-Native -FilePath "cmake" -Arguments @("--build", $buildDir, "--config", $Config, "--target", "bg_math_core")
-
-    $outFile = Join-Path $repoRoot "Bake_Groups\bin\$version\bg_math_core.pyd"
-    if (-not (Test-Path $outFile)) {
-        throw "Build finished but output was not found: $outFile"
+    catch {
+        $pendingFile = "$targetFile.pending"
+        Copy-Item -LiteralPath $sourceFile -Destination $pendingFile -Force
+        Write-Warning "Module is in use; staged update for next Maya start: $pendingFile"
     }
-
-    $hash = (Get-FileHash -Algorithm SHA256 $outFile).Hash
-    Write-Host "Built $outFile"
-    Write-Host "SHA256 $hash"
+    Remove-Item -LiteralPath $sourceFile -Force
 }
