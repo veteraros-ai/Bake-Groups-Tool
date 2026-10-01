@@ -63,6 +63,28 @@ def run():
         again, changed = bg_guide._upgrade_document(migrated, language)
         assert not changed and again == migrated
 
+        # A saved 1.4.5 board has the current manual schema, but its release
+        # heading must still follow the installed plugin version.
+        previous = json.loads(json.dumps(bundled))
+        release_title = next(entry for entry in previous["items"]
+                             if entry.get("anchor") == "release.whats_new"
+                             and entry.get("type") == "text"
+                             and ("New in version" in entry.get("text", "")
+                                  or "Что нового в версии" in entry.get("text", "")))
+        release_title["text"] = ("Что нового в версии 1.4.5" if language == "ru"
+                                 else "New in version 1.4.5")
+        previous["items"].append({"type": "text", "anchor": "my.note",
+                                  "text": "Keep this custom note", "x": 40, "y": 9000,
+                                  "w": 300, "size": 12})
+        refreshed, changed = bg_guide._upgrade_document(previous, language)
+        assert changed
+        assert release_title["text"].endswith("1.4.5")  # input is not mutated
+        assert any(entry.get("anchor") == "release.whats_new" and
+                   entry.get("text", "").endswith("1.4.6")
+                   for entry in refreshed["items"])
+        assert refreshed["items"][-1] == previous["items"][-1]
+        assert not bg_guide._upgrade_document(refreshed, language)[1]
+
         with tempfile.TemporaryDirectory(prefix="bake_guide_migrate_") as folder:
             path = os.path.join(folder, "guide.json")
             with open(path, "w", encoding="utf-8") as stream:

@@ -126,6 +126,8 @@ def run():
         bg_guide.mark_whats_new_seen("1.4.5", settings)
         assert not bg_guide.whats_new_due("1.4.5", settings)
         assert bg_guide.whats_new_due("1.4.6", settings)
+        settings.setValue("whats_new_seen_version", "1.4.6:card2")
+        assert bg_guide.whats_new_due("1.4.6", settings)
     print("Guide manual and close-button smoke passed")
 
 

@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import uuid
 
@@ -96,7 +97,7 @@ def _guide_settings():
     return QtCore.QSettings("BakeGroups", "BakeGuide")
 
 
-WHATS_NEW_CARD_REVISION = 2
+WHATS_NEW_CARD_REVISION = 3
 
 
 def _whats_new_marker(version):
@@ -143,12 +144,35 @@ def _default_document(language):
 
 
 def _upgrade_document(saved, language):
-    """Replace an obsolete board with the current shipped manual only."""
+    """Upgrade the manual while retaining edits on an already-current board."""
     bundled = _default_document(language)
     version = bundled.get("manual_version", 0)
-    if not version or saved.get("manual_version", 0) >= version:
+    if not version:
         return saved, False
-    return bundled, True
+    if saved.get("manual_version", 0) < version:
+        return bundled, True
+
+    # The release banner changes without a manual schema bump. Update only
+    # its shipped heading so a user's saved Guide layout and notes survive.
+    heading = next((entry.get("text") for entry in bundled.get("items", [])
+                    if entry.get("type") == "text" and
+                    entry.get("anchor") == "release.whats_new" and
+                    re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$",
+                             entry.get("text", ""))), None)
+    if heading is None:
+        return saved, False
+    for index, entry in enumerate(saved.get("items", [])):
+        if (entry.get("type") == "text" and
+                entry.get("anchor") == "release.whats_new" and
+                re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$",
+                         entry.get("text", ""))):
+            if entry["text"] == heading:
+                return saved, False
+            updated = dict(saved)
+            updated["items"] = list(saved["items"])
+            updated["items"][index] = dict(entry, text=heading)
+            return updated, True
+    return saved, False
 
 
 class GuideStroke(QtWidgets.QGraphicsPathItem):
