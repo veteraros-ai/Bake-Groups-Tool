@@ -4,7 +4,6 @@ from __future__ import print_function, division, absolute_import
 import sys
 import os
 import json
-import uuid
 import contextlib
 import re
 import zipfile
@@ -13,11 +12,11 @@ from datetime import datetime
 
 import maya.cmds as cmds
 import bg_core
-import bg_gt_matcher
 import bg_cage
 import bg_final_export
 import bg_localization as bg_l10n
 import bg_update
+import bg_guide
 
 from bg_worker_hp import HPGroupingWorker
 from bg_worker_lp import LPMatchingWorker
@@ -42,6 +41,41 @@ try:
     import maya.api.OpenMaya as om
 except Exception:
     om = None
+
+
+HELP_TARGETS = {
+    'le_picked_hp': 'pick.hp', 'btn_pick_hp': 'pick.hp',
+    'le_picked_lp': 'pick.lp', 'btn_pick_lp': 'pick.lp',
+    'btn_create_main': 'chapter.create', 'cb_keep_hp_structure': 'chapter.create',
+    'cb_color_subgroups': 'hp.color',
+    'btn_combine_mesh': 'hp.prepare.combine',
+    'btn_separate_mesh': 'hp.prepare.separate',
+    'btn_find_zbrush': 'hp.zbrush',
+    'btn_check_before_analyze': 'hp.check',
+    'btn_run_hp': 'hp.analyze', 'btn_run_lp': 'lp.assign',
+    'algo_group': 'hp.algorithm',
+    'input_suffix': 'groups.create', 'btn_create_group': 'groups.create',
+    'combo_hp_strategy': 'hp.algorithm.strategy',
+    'combo_hp_cache_mode': 'hp.algorithm.optimization',
+    'lbl_collision_pct': 'hp.algorithm.collision',
+    'spin_threshold': 'hp.algorithm.collision',
+    'chk_ignore_floaters': 'hp.algorithm.floaters',
+    'chk_compound_link': 'hp.algorithm.link',
+    'lbl_hp_link_vtx': 'hp.algorithm.link',
+    'spin_compound_link_verts': 'hp.algorithm.link',
+    'lbl_hp_link_dist': 'hp.algorithm.link',
+    'spin_compound_link_dist': 'hp.algorithm.link',
+    'btn_toggle_hp': 'hp.visibility', 'btn_toggle_lp': 'lp.visibility',
+    'btn_toggle_groups': 'groups.visibility',
+    'subgroups_widget': 'groups.search',
+    'btn_fs': 'hp.find_similar',
+    'btn_toggle_view': 'export.settings',
+    'btn_preview': 'export.smooth',
+    'btn_process_final': 'export.run',
+    'toc_tree': 'toc', 'lbl_toc': 'toc',
+    'btn_help': 'guide.help',
+    'btn_language': 'guide.language', 'btn_about': 'guide.language',
+}
 
 
 class TOCNameDelegate(QtWidgets.QStyledItemDelegate):
@@ -123,6 +157,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.update_dialog = None
         self.update_check_timer = None
         self.manual_prompt_timer = None
+        self._guide_window = None
+        self._help_mode = False
+        self._help_cursor_set = False
+        self._help_swallow_release = False
         self.manual_update_check_requested = False
         self._dock_relayout_pending = False
         self._resize_relayout_pending = False
@@ -134,6 +172,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self._combined_check_skipped_chapters = set()
 
         self.init_ui()
+        self.help_shortcut = QShortcut(QtGui.QKeySequence('F1'), self)
+        self.help_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.help_shortcut.activated.connect(self._show_focused_help)
         self.install_bg_undo_event_filter()
         self.apply_stylesheet()
         self.relax_dock_width_constraints()
@@ -143,11 +184,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.update_check_timer.setSingleShot(True)
         self.update_check_timer.timeout.connect(self.start_update_check)
         self.update_check_timer.start(1200)
-        # Offer the PureRef manual on launch (once, unless dismissed).
-        self.manual_prompt_timer = QtCore.QTimer(self)
-        self.manual_prompt_timer.setSingleShot(True)
-        self.manual_prompt_timer.timeout.connect(self.maybe_show_manual_prompt)
-        self.manual_prompt_timer.start(1800)
 
     # ------------------------------------------------------------------------
     # UI Initialization
@@ -183,10 +219,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.le_picked_hp.setReadOnly(True)
         self.le_picked_hp.setPlaceholderText("Pick HP...")
         self.le_picked_hp.setMinimumWidth(50)
-        btn_pick_hp = QtWidgets.QPushButton("Pick HP")
-        btn_pick_hp.clicked.connect(lambda: self.pick_node("HP"))
+        self.btn_pick_hp = QtWidgets.QPushButton("Pick HP")
+        self.btn_pick_hp.clicked.connect(lambda: self.pick_node("HP"))
         hp_layout.addWidget(self.le_picked_hp, stretch=3)
-        hp_layout.addWidget(btn_pick_hp, stretch=1)
+        hp_layout.addWidget(self.btn_pick_hp, stretch=1)
         picks_col.addLayout(hp_layout)
 
         lp_layout = QtWidgets.QHBoxLayout()
@@ -194,10 +230,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.le_picked_lp.setReadOnly(True)
         self.le_picked_lp.setPlaceholderText("Pick LP...")
         self.le_picked_lp.setMinimumWidth(50)
-        btn_pick_lp = QtWidgets.QPushButton("Pick LP")
-        btn_pick_lp.clicked.connect(lambda: self.pick_node("LP"))
+        self.btn_pick_lp = QtWidgets.QPushButton("Pick LP")
+        self.btn_pick_lp.clicked.connect(lambda: self.pick_node("LP"))
         lp_layout.addWidget(self.le_picked_lp, stretch=3)
-        lp_layout.addWidget(btn_pick_lp, stretch=1)
+        lp_layout.addWidget(self.btn_pick_lp, stretch=1)
         picks_col.addLayout(lp_layout)
 
         pick_row.addLayout(picks_col, stretch=3)
@@ -212,6 +248,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         btn_create_main.setProperty("bg_i18n_key", " Create Pair from Picked")
         btn_create_main.setStyleSheet("background-color: #333333; border: 1px solid #555555; border-radius: 4px; padding: 2px;")
         btn_create_main.clicked.connect(lambda checked=False: self.create_pair_smart())
+        self.btn_create_main = btn_create_main
         pick_row.addWidget(btn_create_main, alignment=QtCore.Qt.AlignVCenter)
 
         g_layout.addLayout(pick_row)
@@ -367,22 +404,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.right_splitter.setChildrenCollapsible(True)
         right_layout.addWidget(self.right_splitter)
 
-        # Temporarily keep HP-LP Matcher out of the UI without removing its
-        # implementation or saved data.  Flip this flag back to True to restore
-        # the section in a later release.
-        self.hp_lp_matcher_visible = False
-        self.gt_widget = bg_gt_matcher.GTWidget(self)
-        self.right_splitter.addWidget(self.gt_widget)
-        self.gt_widget.setVisible(self.hp_lp_matcher_visible)
-
         top_right_widget = QtWidgets.QWidget()
         top_right_layout = QtWidgets.QVBoxLayout(top_right_widget)
         top_right_layout.setContentsMargins(0, 0, 0, 0)
 
-        lbl_toc = QtWidgets.QLabel("TABLE OF CONTENTS")
-        lbl_toc.setAlignment(QtCore.Qt.AlignCenter)
-        lbl_toc.setStyleSheet("font-weight: bold; background-color: #252526; border: 1px solid #444; padding: 6px;")
-        top_right_layout.addWidget(lbl_toc)
+        self.lbl_toc = QtWidgets.QLabel("TABLE OF CONTENTS")
+        self.lbl_toc.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_toc.setStyleSheet("font-weight: bold; background-color: #252526; border: 1px solid #444; padding: 6px;")
+        top_right_layout.addWidget(self.lbl_toc)
 
         self.toc_tree = QtWidgets.QTreeWidget()
         self.toc_tree.setHeaderHidden(True)
@@ -415,11 +444,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.shortcut_select_by_mesh.activated.connect(self.select_subgroup_by_selected_mesh)
 
         top_right_layout.addWidget(self.toc_tree)
-        # Matcher on top, Table of Contents below (original order).
+        # Table of Contents is the primary right-side view. The legacy Matcher
+        # is not constructed, so hidden functionality adds no startup cost.
         self.right_splitter.addWidget(top_right_widget)
 
-        # Cage settings panel lives UNDER the Table of Contents; it is shown (and
-        # the Matcher hidden, for more room) only during cage setup.
+        # Cage settings panel lives under the Table of Contents.
         self.cage_container = QtWidgets.QWidget()
         cage_container_layout = QtWidgets.QVBoxLayout(self.cage_container)
         cage_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -433,20 +462,21 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.export_container.setVisible(False)
         self.right_splitter.addWidget(self.export_container)
 
-        self.right_splitter.setSizes([0, 660, 220, 220])
+        self.right_splitter.setSizes([660, 220, 220])
 
         session_buttons_layout = QtWidgets.QHBoxLayout()
         session_buttons_layout.setSpacing(4)
 
-        self.btn_save_session = QtWidgets.QPushButton("Save Session")
-        self.btn_save_session.setFixedHeight(30)
-        self.btn_save_session.setStyleSheet(
+        self.btn_help = QtWidgets.QPushButton("Help")
+        self.btn_help.setFixedHeight(30)
+        self.btn_help.setToolTip("Select a control to open its visual guide. Press Esc to cancel.")
+        self.btn_help.setStyleSheet(
             "QPushButton { background-color: #3b3b3b; font-weight: bold; border: 1px solid #555; }"
             "QPushButton:hover { background-color: #4a4a4a; border: 1px solid #777; }"
             "QPushButton:pressed { background-color: #2b2b2b; border: 1px solid #444; }"
         )
-        self.btn_save_session.clicked.connect(self.manual_save_session)
-        session_buttons_layout.addWidget(self.btn_save_session)
+        self.btn_help.clicked.connect(self.toggle_help_mode)
+        session_buttons_layout.addWidget(self.btn_help)
 
         self.btn_language = QtWidgets.QPushButton("Language")
         self.btn_language.setFixedHeight(30)
@@ -463,9 +493,112 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.right_panel)
         self.splitter.setSizes([300, 180])
+        self._bind_help_targets()
         bg_l10n.localize_widget_tree(self)
-        self.chk_ignore_floaters.setChecked(True)
         self.chk_material_slots.setChecked(False)
+
+    def _bind_help_targets(self):
+        for attribute, topic in HELP_TARGETS.items():
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setProperty('bg_help_id', topic)
+        self.algo_group.toggle_button.setProperty('bg_help_id', 'hp.algorithm')
+        self.left_panel.setProperty('bg_help_id', 'overview')
+
+    def toggle_help_mode(self, checked=False):
+        if self._help_mode:
+            self.cancel_help_mode()
+            return
+        self._help_mode = True
+        self.btn_help.setText('?  ' + bg_l10n.text('Help'))
+        self.btn_help.setStyleSheet('background-color: #298d57; font-weight: bold;')
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setOverrideCursor(QtCore.Qt.WhatsThisCursor)
+            self._help_cursor_set = True
+
+    def cancel_help_mode(self):
+        self._help_mode = False
+        if self._help_cursor_set:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.restoreOverrideCursor()
+            self._help_cursor_set = False
+        if hasattr(self, 'btn_help'):
+            self.btn_help.setText(bg_l10n.text('Help'))
+            self.btn_help.setStyleSheet(
+                'QPushButton { background-color: #3b3b3b; font-weight: bold; border: 1px solid #555; }'
+                'QPushButton:hover { background-color: #4a4a4a; border: 1px solid #777; }')
+
+    def _help_topic_for(self, widget):
+        while isinstance(widget, QtWidgets.QWidget):
+            topic = widget.property('bg_help_id')
+            if topic:
+                return str(topic)
+            if widget is self:
+                break
+            widget = widget.parentWidget()
+        return 'overview'
+
+    def show_guide(self, topic='overview', label='', description=''):
+        try:
+            guide = self._guide_window
+            if guide is not None:
+                guide.isVisible()
+        except RuntimeError:
+            guide = None
+        if guide is None:
+            guide = bg_guide.GuideWindow(initial_topic=topic)
+            self._guide_window = guide
+        else:
+            guide.go_to(topic)
+
+    def _show_focused_help(self):
+        focus = QtWidgets.QApplication.focusWidget()
+        topic, label, description = self._help_context_for(focus)
+        self.show_guide(topic, label, description)
+
+    def _help_context_for(self, widget):
+        topic = self._help_topic_for(widget)
+        if topic != 'overview':
+            return topic, '', ''
+        # Unknown controls use the overview; help must never append placeholder
+        # topics to the curated visual manual.
+        return 'overview', '', ''
+
+    def _handle_help_event(self, watched, event):
+        event_type = event.type()
+        if self._help_swallow_release and event_type == QtCore.QEvent.MouseButtonRelease:
+            self._help_swallow_release = False
+            if isinstance(watched, QtWidgets.QWidget) and (
+                    watched is self or self.isAncestorOf(watched)):
+                return True
+        if not self._help_mode:
+            return False
+        if event_type == QtCore.QEvent.KeyPress and event.key() == QtCore.Qt.Key_Escape:
+            self.cancel_help_mode()
+            return True
+        if event_type != QtCore.QEvent.MouseButtonPress:
+            return False
+        if event.button() != QtCore.Qt.LeftButton:
+            if event.button() == QtCore.Qt.RightButton:
+                self.cancel_help_mode()
+                return True
+            return False
+        if not isinstance(watched, QtWidgets.QWidget):
+            return False
+        if watched is not self and not self.isAncestorOf(watched):
+            return False
+        if watched is self.btn_help or self.btn_help.isAncestorOf(watched):
+            self.cancel_help_mode()
+        else:
+            topic, label, description = self._help_context_for(watched)
+            self.cancel_help_mode()
+            QtCore.QTimer.singleShot(
+                0, lambda key=topic, title=label, body=description:
+                self.show_guide(key, title, body))
+        self._help_swallow_release = True
+        return True
 
     def relax_dock_width_constraints(self):
         policy_ignored = QtWidgets.QSizePolicy.Ignored
@@ -479,7 +612,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             (getattr(self, 'subgroups_scroll', None), 0, policy_ignored),
             (getattr(self, 'subgroups_widget', None), 0, policy_ignored),
             (getattr(self, 'toc_tree', None), 0, policy_ignored),
-            (getattr(self, 'gt_widget', None), 0, policy_ignored),
             (getattr(self, 'log_output', None), 0, policy_ignored),
         ]
         for widget, min_width, horizontal_policy in targets:
@@ -610,6 +742,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.input_suffix.setPlaceholderText("Group name")
         self.input_suffix.setMinimumWidth(70)
         btn_c_pair = QtWidgets.QPushButton("Create Group")
+        self.btn_create_group = btn_c_pair
         btn_c_pair.setIcon(get_icon("add_group.png"))
         btn_c_pair.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Create Group", self.create_subgroup_pair))
         self.algo_group.addHeaderWidget(self.input_suffix, stretch=1)
@@ -766,10 +899,68 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.spin_wire_elong.setRange(1.0, 20.0)
         self.spin_wire_elong.setValue(4.0)
         self.spin_wire_elong.setSingleStep(0.1)
+
+        self._restore_hp_algorithm_settings()
+        update_compound_link_controls(self.chk_compound_link.isChecked())
+        for signal in (
+                self.combo_hp_strategy.currentIndexChanged,
+                self.combo_hp_cache_mode.currentIndexChanged,
+                self.spin_threshold.valueChanged,
+                self.chk_ignore_floaters.toggled,
+                self.chk_compound_link.toggled,
+                self.spin_compound_link_verts.valueChanged,
+                self.spin_compound_link_dist.valueChanged):
+            signal.connect(lambda *args: self._save_hp_algorithm_settings())
         # Collapsed by default now that N_Mat no longer lives here.
         self.algo_group.toggle_button.setChecked(False)
         self.algo_group.on_pressed()
         layout.addWidget(self.algo_group)
+
+    @staticmethod
+    def _settings_bool(value, default=False):
+        if value is None:
+            return bool(default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _restore_hp_algorithm_settings(self):
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        controls = (
+            self.combo_hp_strategy, self.combo_hp_cache_mode, self.spin_threshold,
+            self.chk_ignore_floaters, self.chk_compound_link,
+            self.spin_compound_link_verts, self.spin_compound_link_dist,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            strategy = int(settings.value("hp/strategy", 1))
+            cache_mode = int(settings.value("hp/cache_mode", 0))
+            self.combo_hp_strategy.setCurrentIndex(max(0, min(self.combo_hp_strategy.count() - 1, strategy)))
+            self.combo_hp_cache_mode.setCurrentIndex(max(0, min(self.combo_hp_cache_mode.count() - 1, cache_mode)))
+            self.spin_threshold.setValue(int(settings.value("hp/collision_pct", 15)))
+            self.chk_ignore_floaters.setChecked(self._settings_bool(
+                settings.value("hp/ignore_floaters", True), True))
+            self.chk_compound_link.setChecked(self._settings_bool(
+                settings.value("hp/compound_link", False), False))
+            self.spin_compound_link_verts.setValue(int(settings.value("hp/compound_vertices", 8)))
+            self.spin_compound_link_dist.setValue(float(settings.value("hp/compound_distance", 0.1)))
+        except (TypeError, ValueError):
+            # Corrupt preferences must never prevent the tool from opening.
+            pass
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+
+    def _save_hp_algorithm_settings(self):
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        settings.setValue("hp/strategy", self.combo_hp_strategy.currentIndex())
+        settings.setValue("hp/cache_mode", self.combo_hp_cache_mode.currentIndex())
+        settings.setValue("hp/collision_pct", self.spin_threshold.value())
+        settings.setValue("hp/ignore_floaters", self.chk_ignore_floaters.isChecked())
+        settings.setValue("hp/compound_link", self.chk_compound_link.isChecked())
+        settings.setValue("hp/compound_vertices", self.spin_compound_link_verts.value())
+        settings.setValue("hp/compound_distance", self.spin_compound_link_dist.value())
 
     def apply_stylesheet(self):
         style = """
@@ -923,6 +1114,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             event_type = event.type()
         except Exception:
             return super(BakeManagerUI, self).eventFilter(watched, event)
+        if self._handle_help_event(watched, event):
+            return True
         # Rubber-band (marquee) selection over the Final Group subgroup panel.
         if watched is getattr(self, 'subgroups_widget', None):
             if self._handle_final_rubber_band(event):
@@ -2153,6 +2346,18 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not self._stop_update_worker_for_close():
             self._is_closing = False
             return False
+        self.cancel_help_mode()
+        guide = getattr(self, '_guide_window', None)
+        if guide is not None:
+            try:
+                guide.close()
+            except RuntimeError:
+                pass
+            self._guide_window = None
+        try:
+            bg_core.BakeSessionModel.save(getattr(self, 'root_pairs', []) or [])
+        except Exception as exc:
+            cmds.warning('Failed to save Bake Groups session on close: {}'.format(exc))
         self._clear_analysis_runtime_caches(clear_geometry=True)
         if dialog:
             try:
@@ -2229,6 +2434,13 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
     def set_language_ui(self, code):
         if not code:
             return
+        guide = getattr(self, '_guide_window', None)
+        if guide is not None:
+            try:
+                guide.close()
+            except RuntimeError:
+                pass
+            self._guide_window = None
         bg_l10n.set_language(code)
         self.refresh_localized_ui()
         if self.active_root_id:
@@ -2347,6 +2559,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             hp_node, lp_node = groups[ui_name]['hp'], groups[ui_name]['lp']
             is_active_subgroup = self.active_subgroup_name == ui_name
             frame = QtWidgets.QFrame()
+            frame.setProperty("bg_help_id", "groups.row")
             frame.setStyleSheet(self.subgroup_row_style(ui_name, is_active_subgroup))
             layout = QtWidgets.QHBoxLayout(frame)
             layout.setContentsMargins(4, 4, 4, 4)
@@ -2357,6 +2570,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_vis.setIcon(get_icon("open_eye.png" if is_vis else "close_eye.png"))
             btn_vis.setIconSize(QtCore.QSize(16, 16))
             btn_vis.setProperty("bg_i18n_key", "Toggle visibility")
+            btn_vis.setProperty("bg_help_id", "groups.row")
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.clicked.connect(lambda checked=False, h=hp_node, l=lp_node, b=btn_vis: self.run_undoable_bg_action("Subgroup Visibility", self.toggle_subgroup_vis, h, l, b))
             btn_vis.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -2364,6 +2578,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(ui_name)
+            btn_name.setProperty("bg_help_id", "groups.row")
             btn_name.setStyleSheet(self.subgroup_name_style(ui_name, is_active_subgroup))
             btn_name.clicked.connect(lambda checked=False, n=ui_name: self.set_active_subgroup(n))
             btn_name.doubleClicked.connect(lambda checked=False, h=hp_node, l=lp_node: self.select_meshes_in_group(h, l))
@@ -2373,6 +2588,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             btn_plus = QtWidgets.QPushButton()
             btn_plus.setFixedSize(36, 24)
             btn_plus.setProperty("bg_i18n_key", "Add selected mesh")
+            btn_plus.setProperty("bg_help_id", "groups.row")
             btn_plus.setIcon(get_icon("Add.png"))
             btn_plus.setIconSize(QtCore.QSize(16, 16))
             btn_plus.setStyleSheet(self.subgroup_add_button_style(is_active_subgroup))
@@ -2380,6 +2596,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             layout.addWidget(btn_plus)
 
             btn_lock = QtWidgets.QPushButton()
+            btn_lock.setProperty("bg_help_id", "groups.row")
             btn_lock.setFixedSize(24, 24)
             is_locked = ui_name in locked_list
             icon_name = "Look_Icon_Button.png" if is_locked else "Unlook_Icon_Button.png"
@@ -2399,6 +2616,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             layout.addWidget(btn_lock)
 
             btn_del = QtWidgets.QPushButton()
+            btn_del.setProperty("bg_help_id", "groups.row")
             btn_del.setFixedSize(24, 24)
             btn_del.setIcon(get_icon("Delete.png"))
             btn_del.setIconSize(QtCore.QSize(16, 16))
@@ -3172,6 +3390,20 @@ def cleanup_stale_bake_manager_ui():
         pass
 
 
+def show_release_card_if_new(ui, settings=None):
+    """Show the installed version's Guide card once per user profile."""
+    version = bg_update.bg_version.__version__
+    if ui is None or not bg_guide.whats_new_due(version, settings):
+        return False
+    try:
+        ui.show_guide('release.whats_new')
+    except Exception as exc:
+        cmds.warning('Could not show Bake Guide release card: {}'.format(exc))
+        return False
+    bg_guide.mark_whats_new_seen(version, settings)
+    return True
+
+
 def main():
     cleanup_stale_bake_manager_ui()
     if cmds.workspaceControl(bg_core.BakeConfig.WORKSPACE_NAME, exists=True):
@@ -3196,6 +3428,9 @@ def main():
         cmds.workspaceControl(bg_core.BakeConfig.WORKSPACE_NAME, e=True, restore=True)
     except:
         pass
+
+    # Wait until Maya finishes restoring the dock before raising its owned Guide.
+    QtCore.QTimer.singleShot(250, lambda: show_release_card_if_new(bake_manager_ui))
 
     # Anonymous, fire-and-forget update ping (only when the version changed).
     # Fully guarded so it can never affect tool startup.

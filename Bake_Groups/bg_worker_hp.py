@@ -2,8 +2,9 @@
 from __future__ import print_function, division, absolute_import
 
 import time
-import math 
-import re 
+import math
+import re
+import traceback
 
 import bg_core
 try:
@@ -26,7 +27,9 @@ except ImportError:
 class HPGroupingWorker(QtCore.QThread):
     progress_value = QtCore.Signal(int)
     progress_text = QtCore.Signal(str)
-    finished = QtCore.Signal(dict, list)
+    result_ready = QtCore.Signal(dict, list)
+    failed = QtCore.Signal(str, str)
+    cancelled = QtCore.Signal()
     
     def __init__(self, hp_data, lp_data, hp_verts_cache, lp_verts_cache, hp_holes_cache,
                  threshold_pct, group_limit, custom_clusters_dict=None, 
@@ -86,6 +89,18 @@ class HPGroupingWorker(QtCore.QThread):
         self.summary_lines = []
 
     def run(self):
+        """Run analysis and always report one terminal outcome to the UI."""
+        try:
+            self._run_analysis()
+            if self.is_cancelled or self.isInterruptionRequested():
+                self.cancelled.emit()
+        except Exception as exc:
+            if self.is_cancelled or self.isInterruptionRequested():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc), traceback.format_exc())
+
+    def _run_analysis(self):
         logs = []
         self.debug_lines = []
         self.summary_lines = []
@@ -3775,9 +3790,8 @@ class HPGroupingWorker(QtCore.QThread):
         ]
 
         self.progress_value.emit(100)
-        self.finished.emit(groups, logs)
+        self.result_ready.emit(groups, logs)
 
     def stop(self):
         self.is_cancelled = True
-        self.quit()
-        self.wait()
+        self.requestInterruption()

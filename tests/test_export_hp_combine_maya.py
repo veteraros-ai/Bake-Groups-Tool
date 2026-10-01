@@ -128,6 +128,7 @@ def run():
         "Chapter", hp_root, lp_root, {"Group": 1})
 
     captures = []
+    capture_dir = tempfile.mkdtemp(prefix="bake_groups_hp_capture_test_")
     unite_input_counts = []
     smooth_targets = []
     original_export = Processor.export_selected_fbx
@@ -135,6 +136,8 @@ def run():
     original_smooth = cmds.polySmooth
 
     def capture_export(_path):
+        with open(_path, "wb"):
+            pass
         _capture_selection(captures)
 
     def track_unite(*args, **kwargs):
@@ -152,8 +155,9 @@ def run():
     try:
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
-            prepared_chapters=[snapshot], status_callback=lambda _label: None)
+            export_dir=capture_dir, smooth_states={"Group": 1},
+            prepared_chapters=[snapshot], status_callback=lambda _label: None,
+            external_hp_obj=False)
     finally:
         Processor.export_selected_fbx = original_export
         cmds.polyUnite = original_unite
@@ -203,8 +207,9 @@ def run():
     try:
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
-            prepared_chapters=[snapshot], status_callback=lambda _label: None)
+            export_dir=capture_dir, smooth_states={"Group": 1},
+            prepared_chapters=[snapshot], status_callback=lambda _label: None,
+            external_hp_obj=False)
     finally:
         Processor.export_selected_fbx = original_export
         Processor._combine_regular_hp_export_group = original_combine
@@ -221,6 +226,7 @@ def run():
     assert fallback["Chapter_Group_high_002"]["faces"] == 24
     assert fallback["Chapter_Group_high_003"]["faces"] == 6
     assert not _temp_roots(), _temp_roots()
+    shutil.rmtree(capture_dir, ignore_errors=True)
 
     # Exercise the real FBX plug-in and verify the optimized object structure
     # survives a round trip, without leaking any internal BG temp hierarchy.
@@ -229,7 +235,8 @@ def run():
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
             export_dir=export_dir, smooth_states={"Group": 1},
-            prepared_chapters=[snapshot], status_callback=lambda _label: None)
+            prepared_chapters=[snapshot], status_callback=lambda _label: None,
+            external_hp_obj=False)
         export_path = os.path.join(export_dir, result + ".fbx")
         assert os.path.isfile(export_path)
         assert os.path.getsize(export_path) > 0

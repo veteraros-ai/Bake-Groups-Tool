@@ -1,8 +1,8 @@
 {
-  "latest_version": "1.4.5",
-  "package_sha256": "620a3fe9c4bbda05dbcb417de4d739bcbcff638e8a6e566bb27574a6baffa3c2",
+  "latest_version": "1.4.6",
+  "package_sha256": "",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.5/Bake_Groups_1.4.5.zip",
-  "release_notes": "HP ANALYSIS & TRANSFORMS: Freeze Transformations now handles complete parent hierarchies and newly created HP/LP subgroups keep identity local transforms. HP classification evaluates complete assemblies instead of depending on the first mesh, keeps identical fasteners together, preserves confident LP ownership, and produces deterministic groups. Faster native shape analysis and safer runtime loading are included for Maya 2022-2027. HP-LP Matcher is temporarily hidden."
+  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.6/Bake_Groups_1.4.6.zip",
+  "release_notes": "FASTER EXPORT & GUIDE: Standard FBX now smooths HP outside Maya and writes a compact FBX package. Marmoset Toolbag export supports bridge installation, automatic package import, and per-mesh smoothing. The Bake Guide has illustrated context help and a What's New card. Cage export starts disabled and enables after Cage creation. About and subgroup Help links are fixed."
 }

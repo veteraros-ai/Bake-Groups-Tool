@@ -9,6 +9,7 @@ import os
 import uuid
 import math
 import io
+import shutil
 from contextlib import contextmanager
 
 # ==========================================
@@ -103,6 +104,37 @@ def undo_chunk(chunk_name="BakeManagerAction"):
 # ==========================================
 class BakeSessionModel(object):
     @staticmethod
+    def _read_json_list(path):
+        with io.open(path, 'r', encoding='utf-8') as handle:
+            value = json.load(handle)
+        if not isinstance(value, list):
+            raise ValueError("Bake Groups session root must be a list")
+        return value
+
+    @staticmethod
+    def _atomic_write_json(path, data):
+        """Write a backward-compatible session list without risking truncation."""
+        temp_path = "{}.tmp.{}.{}".format(path, os.getpid(), uuid.uuid4().hex[:8])
+        backup_path = path + ".bak"
+        try:
+            with io.open(temp_path, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, indent=4, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if os.path.exists(path):
+                try:
+                    shutil.copy2(path, backup_path)
+                except Exception:
+                    pass
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    @staticmethod
     def get_json_path():
         scene_name = cmds.file(q=True, sceneName=True)
         if not scene_name: 
@@ -117,8 +149,7 @@ class BakeSessionModel(object):
         json_path = cls.get_json_path()
         if json_path:
             try:
-                with io.open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
+                cls._atomic_write_json(json_path, data)
             except Exception as e: 
                 cmds.warning("Failed to save JSON to disk: {}".format(e))
 
@@ -128,12 +159,17 @@ class BakeSessionModel(object):
         json_path = cls.get_json_path()
         if json_path and os.path.exists(json_path):
             try:
-                with io.open(json_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except IOError as e:
-                cmds.warning("Could not read JSON file: {}".format(e))
-            except ValueError as e:
-                cmds.warning("JSON file is corrupted: {}".format(e))
+                data = cls._read_json_list(json_path)
+            except (IOError, OSError, ValueError) as e:
+                backup_path = json_path + ".bak"
+                if os.path.exists(backup_path):
+                    try:
+                        data = cls._read_json_list(backup_path)
+                        cmds.warning("Bake Groups session recovered from backup: {}".format(e))
+                    except (IOError, OSError, ValueError):
+                        cmds.warning("Bake Groups JSON and its backup are unavailable: {}".format(e))
+                else:
+                    cmds.warning("Could not read Bake Groups JSON: {}".format(e))
 
         if not data:
             info = cmds.fileInfo(BakeConfig.KEY, query=True) or []
@@ -164,7 +200,7 @@ class BakeSessionModel(object):
             cs.setdefault('unit', 'percent')
             cs.setdefault('fitted', False)  # False = inflate mode, True = fitted
             cs.setdefault('display_mode', 'solid')  # 'wire' | 'solid' cage look
-            cs.setdefault('export_enabled', True)   # cage rides along with chapter export
+            cs.setdefault('export_enabled', False)  # enabled when Cage is created
             seen_ids.add(p['id'])
             
         return data

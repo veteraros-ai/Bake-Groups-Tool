@@ -10,6 +10,7 @@ Thumbs.db
 out/
 build/
 dist/
+graphify-out/
 Bake_Tools_Blender/addon/bake_tools_blender/vendor/
 Bake_Tools_Blender_Releases/
 # Internal post-port milestones were renumbered into the first public 1.0.0.

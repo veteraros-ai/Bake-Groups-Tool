@@ -158,15 +158,25 @@ def run():
     original_dialog = cmds.fileDialog2
     original_message = cmds.inViewMessage
     original_export = bg_final_export.FinalExportProcessor.export_selected_fbx
+    original_external = bg_final_export.FinalExportProcessor._export_external_hp_direct
 
     def capture(path):
         exports.append((
             os.path.basename(path),
             [node.split('|')[-1] for node in (cmds.ls(selection=True, long=True) or [])]))
+        with open(path, 'wb') as stream:
+            stream.write(b'FBX test placeholder')
+
+    def capture_external(meshes, _levels, path, **_kwargs):
+        exports.append((os.path.basename(path), [node.split('|')[-1] for node in meshes]))
+        with open(path, 'wb') as stream:
+            stream.write(b'FBX test placeholder')
+        return True
 
     cmds.fileDialog2 = lambda **_kwargs: [export_dir]
     cmds.inViewMessage = lambda **_kwargs: None
     bg_final_export.FinalExportProcessor.export_selected_fbx = staticmethod(capture)
+    bg_final_export.FinalExportProcessor._export_external_hp_direct = staticmethod(capture_external)
     try:
         harness._export_run()
         expected = sorted(
@@ -177,8 +187,9 @@ def run():
         separate = dict(exports)
         for pair in pairs:
             high_selection = separate[pair['base'] + "_HP.fbx"]
-            # Two regular HP meshes combine; the ZBrush mesh stays separate.
-            assert len(high_selection) == 2, (pair['base'], high_selection)
+            # Direct HP export receives all source meshes; it does not combine
+            # or smooth them inside Maya before passing them to the helper.
+            assert len(high_selection) == 3, (pair['base'], high_selection)
         assert "3" in harness.exp_status.text(), (harness.exp_status.text(), exports)
 
         exports[:] = []
@@ -190,11 +201,12 @@ def run():
         assert sorted(name for name, _selection in exports) == expected_by_material
         assert all(selection for _name, selection in exports)
         by_material = dict(exports)
-        assert len(by_material["Book_A_HP.fbx"]) == 4, by_material["Book_A_HP.fbx"]
-        assert len(by_material["Book_B_HP.fbx"]) == 2, by_material["Book_B_HP.fbx"]
+        assert len(by_material["Book_A_HP.fbx"]) == 6, by_material["Book_A_HP.fbx"]
+        assert len(by_material["Book_B_HP.fbx"]) == 3, by_material["Book_B_HP.fbx"]
         assert "2" in harness.exp_status.text(), (harness.exp_status.text(), exports)
     finally:
         bg_final_export.FinalExportProcessor.export_selected_fbx = original_export
+        bg_final_export.FinalExportProcessor._export_external_hp_direct = original_external
         cmds.fileDialog2 = original_dialog
         cmds.inViewMessage = original_message
         harness.close()

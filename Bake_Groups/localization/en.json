@@ -1,6 +1,10 @@
 {
     "language":  "en",
     "texts":  {
+                  "Target":  "Target",
+                  "Select Marmoset Package Folder":  "Select Marmoset Package Folder",
+                  "Preparing Marmoset package...":  "Preparing Marmoset package...",
+                  "Marmoset package exported: {name}":  "Marmoset package exported: {name}",
                   "Bake Group Manager Pro":  "Bake Group Manager Pro",
                   "Pick HP...":  "Pick HP...",
                   "placeholder:Pick HP...":  "Pick HP...",
@@ -49,6 +53,7 @@
                   "Export":  "Export",
                   "TABLE OF CONTENTS":  "TABLE OF CONTENTS",
                   "Save Session":  "Save",
+                  "Help":  "Help",
                   "Language":  "Language",
                   "Save Debug Log":  "Save Debug Log",
                   "No debug log to save yet. Run Analyze HP first.":  "No debug log yet. Run Analyze HP first.",
@@ -419,6 +424,25 @@
                      "Algorithm":  "Automatic HP grouping settings for Analyze HP.",
                      "Groups Hid":  "Some subgroups are hidden. Click to show all subgroups in the active chapter.",
                      "Groups Vis/M":  "Material visibility filter is active. Click to show all material sections again.",
-                     "Undo BG":  "Undo the last lightweight Bake Groups action. Analyze HP, Assign LP, export, Combine Fin, and Color HP are excluded."
+                     "Undo BG":  "Undo the last lightweight Bake Groups action. Analyze HP, Assign LP, export, Combine Fin, and Color HP are excluded.",
+                     "External HP OBJ export":  "External HP smoothing (OBJ)",
+                     "External HP OBJ export tooltip":  "Exports HP as a separate OBJ. Smooth level is preserved per subgroup; ZBrush HP remains unsmoothed. LP and Cage continue to export as FBX.",
+                     "External HP FBX export":  "External HP smoothing (FBX)",
+                     "External HP FBX export tooltip":  "Smooths HP outside Maya and exports a separate binary FBX. Smooth level is preserved per subgroup; ZBrush HP remains unsmoothed. LP and Cage still export as FBX.",
+                     "Converting HP to FBX...":  "Converting HP to FBX...",
+                     "External HP FBX export failed: {error}":  "External HP FBX export failed: {error}",
+                     "Combined HP LP Maya export tooltip": "A combined HP+LP file is exported through Maya. Separate files use fast external HP smoothing by default.",
+                     "Marmoset bridge setup": "Marmoset bridge setup",
+                     "Marmoset bridge install prompt": "The Bake Groups Bridge plugin is not installed in Marmoset Toolbag 5. Install it for this user now?",
+                     "Marmoset bridge update prompt": "The installed Bake Groups Bridge differs from the bundled copy. Replace it with this version? The existing file will be backed up.",
+                     "Install bridge": "Install bridge",
+                     "Export package only": "Export package only",
+                     "Marmoset bridge installed instructions": "The bridge was installed. In Toolbag, choose Edit > Plugins > Refresh (or restart Toolbag), then launch Bake Groups Bridge from that menu. Use Open / Sync Package to select BakeGroups_Marmoset.json.",
+                     "Marmoset bridge not installed warning": "Install Bake Groups Bridge in Toolbag before opening this package.",
+                     "Opening Marmoset package: {name}": "Opening Marmoset Toolbag with {name}...",
+                     "Marmoset launch failed: {error}": "Package exported, but Toolbag could not be opened: {error}",
+                     "External HP OBJ helper missing":  "External OBJ export helper is missing. Reinstall or restore Bake Groups.",
+                     "Converting HP to OBJ...":  "Converting HP to OBJ...",
+                     "External HP OBJ export failed: {error}":  "External HP OBJ export failed: {error}"
                  }
 }

@@ -1,39 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function, division, absolute_import
 
-import sys
-
-if sys.version_info[0] >= 3:
-    from importlib import reload
-
-modules_to_reload = [
-    'bg_core',
-    'bg_worker_hp',
-    'bg_worker_lp',
-    'bg_gt_matcher',
-    'bg_cage',
-    'bg_final_export',
-    'bg_localization'
-]
-
-for mod_name in modules_to_reload:
-    if mod_name in sys.modules:
-        try:
-            reload(sys.modules[mod_name])
-            print("bg_mixins: reloaded {}".format(mod_name))
-        except Exception as e:
-            print("bg_mixins: failed to reload {}: {}".format(mod_name, e))
-    else:
-        print("bg_mixins: {} not loaded yet".format(mod_name))
-
 import bg_core
 import bg_worker_hp
 from bg_worker_hp import HPGroupingWorker
 import bg_worker_lp
 import maya.api.OpenMaya as om
 from bg_worker_lp import LPMatchingWorker
-import bg_gt_matcher
 import bg_final_export
+import bg_marmoset_bridge
 import bg_cage
 import bg_localization as bg_l10n
 
@@ -80,6 +55,12 @@ def _create_identity_child_group(parent, name):
 # ============================================================================
 class HPAnalysisMixin:
     """Methods for High-poly analysis and auto-grouping."""
+
+    def _claim_hp_analysis_terminal(self):
+        if getattr(self, '_hp_analysis_terminal_handled', False):
+            return False
+        self._hp_analysis_terminal_handled = True
+        return True
 
     def gather_hp_worker_params(self):
         cache_mode = bg_core.DENSITY_MODE_OPTIMAL
@@ -909,12 +890,25 @@ class HPAnalysisMixin:
 
     def _cancel_hp_analysis(self):
         worker = getattr(self, 'hp_worker', None)
-        if worker:
+        if worker and worker.isRunning():
             try:
                 worker.stop()
             except Exception:
                 pass
-            self._release_analysis_worker('hp_worker')
+            progress = getattr(self, 'progress_dlg', None)
+            if progress:
+                try:
+                    progress.setCancelButton(None)
+                    progress.setLabelText(bg_l10n.text("Canceling HP analysis..."))
+                except Exception:
+                    pass
+            return
+        self._finalize_hp_analysis_cancel()
+
+    def _finalize_hp_analysis_cancel(self):
+        if not self._claim_hp_analysis_terminal():
+            return
+        self._release_analysis_worker('hp_worker')
         progress = getattr(self, 'progress_dlg', None)
         if progress:
             try:
@@ -924,6 +918,29 @@ class HPAnalysisMixin:
         self._revert_prep_undo('hp_analysis', "HP subgroup/mesh structure reverted to its state before Analyze HP.")
         self._clear_analysis_runtime_caches(clear_geometry=True)
         self.log("HP Analysis canceled.", "orange")
+
+    def _on_hp_analysis_failed(self, message, details):
+        if not self._claim_hp_analysis_terminal():
+            return
+        worker = getattr(self, 'hp_worker', None)
+        worker_debug = list(getattr(worker, 'debug_lines', []) or [])
+        self.last_debug_lines = ["=== HP Analysis Error ===", str(message), str(details)] + worker_debug
+        self._release_analysis_worker('hp_worker')
+        progress = getattr(self, 'progress_dlg', None)
+        if progress:
+            try:
+                progress.close()
+            except Exception:
+                pass
+        self._revert_prep_undo('hp_analysis', "HP subgroup/mesh structure reverted after an analysis error.")
+        self._clear_analysis_runtime_caches(clear_geometry=True)
+        self.log("HP Analysis failed: {}".format(message), "red")
+        try:
+            QtWidgets.QMessageBox.critical(
+                self, bg_l10n.text("HP Analysis"),
+                bg_l10n.text("HP Analysis failed. The scene was restored.\n\n{}".format(message)))
+        except Exception:
+            pass
 
     def _cancel_lp_matching(self):
         worker = getattr(self, 'lp_worker', None)
@@ -1130,6 +1147,7 @@ class HPAnalysisMixin:
         self._analyze_geo_cache_dict()[cache_id] = {'key': full_key, 'payload': payload}
 
     def run_hp_analysis(self, _):
+        self._hp_analysis_terminal_handled = False
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
@@ -2226,15 +2244,20 @@ class HPAnalysisMixin:
             hp_surface_cache=hp_surface_cache,
             lp_surface_cache=lp_surface_cache
         )
+        self._hp_analysis_terminal_handled = False
 
         # Fingerprinting already filled 0-40%; the worker owns the 40-100% band.
         self.hp_worker.progress_value.connect(self._on_hp_worker_progress)
         self.hp_worker.progress_text.connect(self.progress_dlg.setLabelText)
-        self.hp_worker.finished.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair))
+        self.hp_worker.result_ready.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair))
+        self.hp_worker.cancelled.connect(self._finalize_hp_analysis_cancel)
+        self.hp_worker.failed.connect(self._on_hp_analysis_failed)
         self.progress_dlg.canceled.connect(self._cancel_hp_analysis)
         self.hp_worker.start()
 
     def on_hp_finished(self, groups, logs, hp_main, pair):
+        if not self._claim_hp_analysis_terminal():
+            return
         # Analysis completed and we're about to commit the new structure -
         # the pre-analysis prep is no longer something Cancel should revert.
         self._reset_prep_undo_tracking('hp_analysis')
@@ -2974,7 +2997,7 @@ class FinalViewMixin:
             self.btn_toggle_view.setText(bg_l10n.text("Export Settings"))
             self.btn_preview.setVisible(False)
             self.btn_process_final.setVisible(False)
-            # Leaving Export Settings also leaves cage config (restore Matcher).
+            # Leaving Export Settings also leaves cage configuration.
             if getattr(self, 'is_cage_config', False):
                 self.exit_cage_config()
             if getattr(self, 'is_preview_active', False):
@@ -3125,6 +3148,7 @@ class FinalViewMixin:
             full_prefix = base_name + "_" + display_name
 
             frame = QtWidgets.QFrame()
+            frame.setProperty("bg_help_id", "export.smoothing")
             if hasattr(self, 'subgroup_row_style'):
                 frame.setStyleSheet(self.subgroup_row_style(display_name, False))
             row_layout = QtWidgets.QHBoxLayout(frame)
@@ -3137,6 +3161,7 @@ class FinalViewMixin:
             btn_vis.setIcon(get_icon("open_eye.png" if is_vis else "close_eye.png"))
             btn_vis.setIconSize(QtCore.QSize(16, 16))
             btn_vis.setProperty("bg_i18n_key", "Toggle visibility")
+            btn_vis.setProperty("bg_help_id", "groups.visibility")
             btn_vis.setStyleSheet("background-color: #4a5d4a;" if is_vis else "background-color: #8c4242;")
             btn_vis.setFocusPolicy(QtCore.Qt.NoFocus)
             btn_vis.clicked.connect(lambda checked=False, h=hp_nodes, b=btn_vis, n=display_name: self.run_undoable_bg_action("Final HP Visibility", self.toggle_final_hp_vis, h, b, n))
@@ -3147,6 +3172,7 @@ class FinalViewMixin:
             row_layout.addWidget(btn_vis)
 
             btn_name = SubgroupButton(display_name)
+            btn_name.setProperty("bg_help_id", "export.smoothing")
             btn_name.setCheckable(True)
             if hasattr(self, 'subgroup_name_style'):
                 btn_name.setStyleSheet(self.subgroup_name_style(display_name, False))
@@ -3158,6 +3184,7 @@ class FinalViewMixin:
             row_layout.addWidget(btn_name, stretch=1)
 
             combo = QtWidgets.QComboBox()
+            combo.setProperty("bg_help_id", "export.smoothing")
             combo.setObjectName("FinalSmoothCombo")
             combo.addItems(["Smooth 0", "Smooth 1", "Smooth 2", "Smooth 3"])
             combo.setFixedWidth(85)
@@ -3175,6 +3202,7 @@ class FinalViewMixin:
             row_layout.addWidget(combo)
 
             btn_smooth_up = QtWidgets.QPushButton()
+            btn_smooth_up.setProperty("bg_help_id", "export.smoothing")
             btn_smooth_up.setFixedSize(24, 24)
             btn_smooth_up.setIcon(get_icon("Plus.png"))
             btn_smooth_up.setIconSize(QtCore.QSize(14, 14))
@@ -3184,6 +3212,7 @@ class FinalViewMixin:
             row_layout.addWidget(btn_smooth_up)
 
             btn_smooth_down = QtWidgets.QPushButton()
+            btn_smooth_down.setProperty("bg_help_id", "export.smoothing")
             btn_smooth_down.setFixedSize(24, 24)
             btn_smooth_down.setIcon(get_icon("Minus.png"))
             btn_smooth_down.setIconSize(QtCore.QSize(14, 14))
@@ -3194,6 +3223,7 @@ class FinalViewMixin:
 
             # Per-subgroup cage max-offset override (blank = global default).
             cage_edit = QtWidgets.QLineEdit()
+            cage_edit.setProperty("bg_help_id", "cage.controls")
             cage_edit.setObjectName("CageOverride")
             cage_edit.setFixedWidth(46)
             cage_edit.setAlignment(QtCore.Qt.AlignCenter)
@@ -3683,6 +3713,11 @@ class FinalViewMixin:
         base_name = pair.get('base', 'Chapter')
         with bg_core.undo_chunk("ClearCage"):
             bg_cage.CageProcessor.clear_chapter_cage(base_name)
+        pair.setdefault('cage_settings', {})['export_enabled'] = False
+        self._standard_cage_include = False
+        if hasattr(self, 'exp_inc_cage'):
+            self.exp_inc_cage.setChecked(False)
+        bg_core.BakeSessionModel.save(self.root_pairs)
         self.log("Cage cleared for chapter '{}'.".format(base_name), "lightblue")
 
     def sculpt_active_cage(self):
@@ -3735,11 +3770,11 @@ class FinalViewMixin:
         """Export the chapter's cage as its own {base}_cage.fbx into
         ``export_dir`` - always a separate file, alongside the regular HP/LP
         export, whenever a cage exists AND the chapter's 'export cage' flag
-        (default on) is enabled. No-op (returns False) if there is no cage or
+        (enabled by Create Cage) is on. No-op (returns False) if there is no cage or
         the flag is off - there is no separate Export Cage button anymore."""
         base_name = pair.get('base', 'Chapter')
         settings = pair.get('cage_settings') or {}
-        if not settings.get('export_enabled', True):
+        if not settings.get('export_enabled', False):
             return False
         cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
                        else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
@@ -3860,9 +3895,24 @@ class FinalViewMixin:
         h.addWidget(spin)
         return row, spin, slider, state
 
+    def _enable_cage_export_on_creation(self, pair, result):
+        """Arm Cage export only after Create Cage actually produced/found meshes."""
+        if not result:
+            return False
+        if not (result.get('made') or bg_cage.CageProcessor.get_chapter_cage_meshes(
+                pair.get('base', 'Chapter'))):
+            return False
+        pair.setdefault('cage_settings', {})['export_enabled'] = True
+        checkbox = getattr(self, 'exp_inc_cage', None)
+        target = getattr(self, 'exp_target', None)
+        if checkbox is not None and (target is None or target.currentIndex() == 0):
+            checkbox.setChecked(True)
+        elif checkbox is not None:
+            self._standard_cage_include = True
+        return True
+
     def build_cage_settings_panel(self, pair):
-        """Build the embedded Cage settings panel (lives in the Matcher slot
-        during setup). Returns the panel widget."""
+        """Build the embedded Cage settings panel on the right side."""
         settings = dict(pair.get('cage_settings') or {})
         fitted = {'v': bool(settings.get('fitted', False))}
 
@@ -3910,6 +3960,7 @@ class FinalViewMixin:
         infl_step = round(infl_hi / 200.0, decimals) or (10 ** -decimals)
 
         panel = QtWidgets.QWidget()
+        panel.setProperty("bg_help_id", "cage.controls")
         # STYLE_MAIN leaves QSlider unstyled, so on Maya's dark theme the groove
         # is nearly invisible. Draw an explicit groove + handle so the jog track
         # (the long bar) and its centred handle read clearly.
@@ -3926,6 +3977,7 @@ class FinalViewMixin:
         outer.setContentsMargins(4, 4, 4, 4)
 
         header = QtWidgets.QLabel(bg_l10n.text("CAGE SETTINGS"))
+        header.setProperty("bg_help_id", "cage.controls")
         header.setAlignment(QtCore.Qt.AlignCenter)
         header.setStyleSheet("font-weight: bold; background-color: #3a2a44; border: 1px solid #5a3d6b; padding: 6px;")
         outer.addWidget(header)
@@ -3934,6 +3986,8 @@ class FinalViewMixin:
         # when the docked panel is narrow or the window is resized.
         def add_labeled(text_key, widget):
             lbl = QtWidgets.QLabel(bg_l10n.text(text_key))
+            lbl.setProperty("bg_help_id", "cage.inflation" if text_key in
+                            ("Expansion (inflate)", "Normal move") else "cage.controls")
             lbl.setStyleSheet("color: #bbbbbb; margin-top: 4px;")
             outer.addWidget(lbl)
             outer.addWidget(widget)
@@ -3944,6 +3998,8 @@ class FinalViewMixin:
         # block, so the panel reads in the final visual order.
         inflate_row, inflate_spin, inflate_slider, _ = self._make_cage_slider_row(
             -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
+        inflate_spin.setProperty("bg_help_id", "cage.inflation")
+        inflate_slider.setProperty("bg_help_id", "cage.inflation")
 
         status = QtWidgets.QLabel("")
         status.setWordWrap(True)
@@ -3956,6 +4012,7 @@ class FinalViewMixin:
 
         def _square_btn(icon_name, tip_key):
             b = QtWidgets.QPushButton()
+            b.setProperty("bg_help_id", "cage.controls")
             b.setIcon(get_icon(icon_name))
             b.setIconSize(QtCore.QSize(CAGE_ICON, CAGE_ICON))
             b.setFixedSize(CAGE_BTN, CAGE_BTN)
@@ -3998,7 +4055,7 @@ class FinalViewMixin:
                 # Nothing selected: global change, reset per-subgroup overrides.
                 # Preserve the display mode (it is a separate, chapter-wide look).
                 changed['display_mode'] = (pair.get('cage_settings') or {}).get('display_mode', 'solid')
-                changed['export_enabled'] = (pair.get('cage_settings') or {}).get('export_enabled', True)
+                changed['export_enabled'] = (pair.get('cage_settings') or {}).get('export_enabled', False)
                 pair['cage_settings'] = changed
                 overrides.clear()
             else:
@@ -4027,7 +4084,9 @@ class FinalViewMixin:
             _recenter(inflate_spin, inflate_slider)
             self._cage_islands = {}  # stale intersection islands no longer valid
             save_settings(set(groups.keys()), True)  # inflate=0 global, overrides cleared
-            self.rebuild_active_cage(only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
+            result = self.rebuild_active_cage(only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
+            if self._enable_cage_export_on_creation(pair, result):
+                bg_core.BakeSessionModel.save(self.root_pairs)
             try:
                 cmds.select(clear=True)
             except Exception:
@@ -4113,7 +4172,7 @@ class FinalViewMixin:
             cs['inflate'] = 0.0
             cs['fitted'] = False
             cs.setdefault('display_mode', 'solid')
-            cs.setdefault('export_enabled', True)
+            cs.setdefault('export_enabled', False)
             (pair.setdefault('cage_overrides', {})).clear()
             bg_core.BakeSessionModel.save(self.root_pairs)
             if expo['targets']:
@@ -4222,6 +4281,8 @@ class FinalViewMixin:
         # coarse near the ends, applied smoothly while the handle moves.
         ix_row, ix_spin, ix_slider, _ = self._make_cage_slider_row(
             -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
+        ix_spin.setProperty("bg_help_id", "cage.inflation")
+        ix_slider.setProperty("bg_help_id", "cage.inflation")
 
         def do_find_intersections():
             pairs = _scoped_cage_hp_pairs()
@@ -4525,15 +4586,12 @@ class FinalViewMixin:
             self.export_panel = self.build_export_panel(pair)
             elayout.addWidget(self.export_panel)
             exp_container.setVisible(True)
-        # Show the cage panel (under the TOC) and hide the Matcher for more room.
+        # Show the cage panel under the Table of Contents.
         if not was_active and hasattr(self, 'right_splitter'):
             self._saved_right_sizes = self.right_splitter.sizes()
         container.setVisible(True)
-        if hasattr(self, 'gt_widget'):
-            self.gt_widget.setVisible(False)
         self.is_cage_config = True
-        # Hand the space freed by the hidden Matcher to the Table of Contents:
-        # the cage panel stays only as tall as its content. Deferred so the
+        # Keep the cage panel only as tall as its content. Deferred so the
         # panel's sizeHint is valid after this layout pass.
         QtCore.QTimer.singleShot(0, self._fit_cage_split)
 
@@ -4556,8 +4614,8 @@ class FinalViewMixin:
             cage_h = int(cage_h * scale)
             exp_h = int(exp_h * scale)
         toc_h = max(120, total - cage_h - exp_h)
-        # [Matcher (hidden), Table of Contents, Cage panel, Export panel]
-        splitter.setSizes([0, toc_h, cage_h, exp_h])
+        # [Table of Contents, Cage panel, Export panel]
+        splitter.setSizes([toc_h, cage_h, exp_h])
 
     def exit_cage_config(self):
         self.is_cage_config = False
@@ -4567,10 +4625,7 @@ class FinalViewMixin:
         exp_container = getattr(self, 'export_container', None)
         if exp_container is not None:
             exp_container.setVisible(False)
-        if hasattr(self, 'gt_widget'):
-            self.gt_widget.setVisible(bool(getattr(self, 'hp_lp_matcher_visible', False)))
-        # Restore the splitter proportions from before cage config.  The hidden
-        # Matcher keeps a zero-sized slot so it can be re-enabled later.
+        # Restore the splitter proportions from before cage config.
         saved = getattr(self, '_saved_right_sizes', None)
         if saved and hasattr(self, 'right_splitter'):
             try:
@@ -4809,7 +4864,7 @@ class ExportMixin:
                             cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
 
                     # No separate Export Cage button anymore: whenever a cage exists
-                    # for this chapter and its "export cage" flag is on (default),
+                    # for this chapter and its "export cage" flag is on,
                     # it goes out too - always as its own {base}_cage.fbx file.
                     self.export_chapter_cage_if_enabled(pair, export_dir, snapshot=snapshot)
 
@@ -4912,7 +4967,7 @@ class ExportMixin:
     def _export_book_by_material(self, book, export_dir, inc_hp=True, inc_lp=True,
                                  inc_cage=True, snapshots=None,
                                  status_callback=None, file_callback=None,
-                                 cancel_check=None):
+                                 cancel_check=None, external_hp_obj=True):
         """Export one book by material. If the book name IS a material, merge all
         chapters into one {book}_HP/LP/cage; otherwise the book is a container so
         each chapter goes out on its own (named by chapter). ``inc_*`` pick which
@@ -4942,7 +4997,8 @@ class ExportMixin:
                     export_dir=export_dir, smooth_states=primary['smooth'],
                     export_name_override=file_base, prepared_chapters=chapters,
                     status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check):
+                    cancel_check=cancel_check,
+                    external_hp_obj=external_hp_obj):
                 wrote = True
             if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
@@ -4970,7 +5026,8 @@ class ExportMixin:
             if self._export_chapter_files(
                     ch['pair'], export_dir, inc_hp, inc_lp, inc_cage,
                     single=False, snapshot=ch, status_callback=status_callback,
-                    file_callback=file_callback, cancel_check=cancel_check):
+                    file_callback=file_callback, cancel_check=cancel_check,
+                    external_hp_obj=external_hp_obj):
                 done += 1
         self.log("Export by material: book '{}' (container) -> {} chapter(s).".format(book, done), "lightgreen")
         return done
@@ -5021,7 +5078,8 @@ class ExportMixin:
 
     def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage,
                               single, snapshot=None, status_callback=None,
-                              file_callback=None, cancel_check=None):
+                              file_callback=None, cancel_check=None,
+                              external_hp_obj=True):
         """Export one chapter's requested parts. ``single`` merges HP+LP into one
         file only when both are included; otherwise HP and LP go to separate
         files. Returns True if anything was written."""
@@ -5033,19 +5091,21 @@ class ExportMixin:
         base_name = pair.get('base', 'Chapter')
         smooth = pair.get('final_smooth_states', {})
         wrote = False
-        if single and inc_hp and inc_lp:
+        if single and inc_hp and inc_lp and not external_hp_obj:
             if bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='both',
                     export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
                     status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check):
+                    cancel_check=cancel_check,
+                    external_hp_obj=external_hp_obj):
                 wrote = True
         else:
             if inc_hp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='hp',
                     export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
                     status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check):
+                    cancel_check=cancel_check,
+                    external_hp_obj=external_hp_obj):
                 wrote = True
             if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
                     base_name, hp_main, lp_main, [], parent_window=self, mode='lp',
@@ -5093,6 +5153,7 @@ class ExportMixin:
         """Docked Export panel (under Cage Settings, Export Settings mode only).
         Replaces the old right-click export menu."""
         panel = QtWidgets.QWidget()
+        panel.setProperty("bg_help_id", "export.settings")
         panel.setStyleSheet(bg_core.BakeConfig.STYLE_MAIN + " QCheckBox:disabled { color: #666666; }")
         outer = QtWidgets.QVBoxLayout(panel)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -5108,6 +5169,7 @@ class ExportMixin:
             outer.addWidget(lb)
 
         self.exp_scope = QtWidgets.QComboBox()
+        self.exp_scope.setProperty("bg_help_id", "export.scope")
         self.exp_scope.addItems([bg_l10n.text("Active Chapter"), bg_l10n.text("Active Book"), bg_l10n.text("All Books")])
         self.exp_scope.setStyleSheet(
             "QComboBox { background-color: #2f5d3a; color: #ffffff; font-weight: bold; font-size: 13px;"
@@ -5116,12 +5178,27 @@ class ExportMixin:
             "QComboBox QAbstractItemView { background-color: #223528; color: #eaeaea; selection-background-color: #367046; }")
         outer.addWidget(self.exp_scope)
 
+        _lbl("Target")
+        self.exp_target = QtWidgets.QComboBox()
+        self.exp_target.setProperty("bg_help_id", "export.target")
+        self.exp_target.addItems(["Standard FBX", "Marmoset Toolbag"])
+        outer.addWidget(self.exp_target)
+
         _lbl("Include")
         inc_row = QtWidgets.QHBoxLayout()
         self.exp_inc_hp = QtWidgets.QCheckBox("HP"); self.exp_inc_hp.setChecked(True)
         self.exp_inc_lp = QtWidgets.QCheckBox("LP"); self.exp_inc_lp.setChecked(True)
-        self.exp_inc_cage = QtWidgets.QCheckBox(bg_l10n.text("Cage")); self.exp_inc_cage.setChecked(True)
+        self.exp_inc_cage = QtWidgets.QCheckBox(bg_l10n.text("Cage"))
+        pair = self._active_pair() if callable(getattr(self, '_active_pair', None)) else None
+        cage_enabled = bool((pair or {}).get('cage_settings', {}).get('export_enabled', False))
+        if cage_enabled and pair:
+            cage_enabled = bool(bg_cage.CageProcessor.get_chapter_cage_meshes(
+                pair.get('base', 'Chapter')))
+        self.exp_inc_cage.setChecked(cage_enabled)
+        self._standard_cage_include = cage_enabled
+        self._marmoset_target_active = False
         for w in (self.exp_inc_hp, self.exp_inc_lp, self.exp_inc_cage):
+            w.setProperty("bg_help_id", "export.files")
             inc_row.addWidget(w)
         inc_row.addStretch(1)
         outer.addLayout(inc_row)
@@ -5130,6 +5207,9 @@ class ExportMixin:
         files_row = QtWidgets.QHBoxLayout()
         self.exp_files_sep = QtWidgets.QRadioButton(bg_l10n.text("Separate")); self.exp_files_sep.setChecked(True)
         self.exp_files_one = QtWidgets.QRadioButton(bg_l10n.text("HP+LP one file"))
+        self.exp_files_sep.setProperty("bg_help_id", "export.files")
+        self.exp_files_one.setProperty("bg_help_id", "export.files")
+        self.exp_files_one.setToolTip(bg_l10n.text("Combined HP LP Maya export tooltip"))
         self._exp_files_group = QtWidgets.QButtonGroup(panel)
         self._exp_files_group.addButton(self.exp_files_sep)
         self._exp_files_group.addButton(self.exp_files_one)
@@ -5141,6 +5221,8 @@ class ExportMixin:
         flags_row = QtWidgets.QHBoxLayout()
         self.exp_bymat = QtWidgets.QCheckBox(bg_l10n.text("By material"))
         self.exp_lp_one = QtWidgets.QCheckBox(bg_l10n.text("LP in one file"))
+        self.exp_bymat.setProperty("bg_help_id", "export.files")
+        self.exp_lp_one.setProperty("bg_help_id", "export.files")
         flags_row.addWidget(self.exp_bymat)
         flags_row.addWidget(self.exp_lp_one)
         flags_row.addStretch(1)
@@ -5154,7 +5236,10 @@ class ExportMixin:
                 cb.setEnabled(not is_chapter)
                 if is_chapter:
                     cb.setChecked(False)
+            self._update_export_target_controls()
         self.exp_scope.currentIndexChanged.connect(lambda _idx: _update_scope_flags())
+        self.exp_target.currentIndexChanged.connect(
+            lambda _idx: self._update_export_target_controls())
         _update_scope_flags()
 
         self.exp_status = QtWidgets.QLabel("")
@@ -5167,6 +5252,149 @@ class ExportMixin:
         # 'combo:' keys and would revert them to English. All texts are already
         # set with bg_l10n.text() and the panel rebuilds on language change.
         return panel
+
+    def _update_export_target_controls(self):
+        """Keep the Toolbag workflow one-click and prevent incompatible flags."""
+        if not hasattr(self, 'exp_target'):
+            return
+        is_marmoset = self.exp_target.currentIndex() == 1
+        if is_marmoset:
+            if not getattr(self, '_marmoset_target_active', False):
+                self._standard_cage_include = self.exp_inc_cage.isChecked()
+            self.exp_inc_hp.setChecked(True)
+            self.exp_inc_lp.setChecked(True)
+            self.exp_inc_cage.setChecked(False)
+            self.exp_files_sep.setChecked(True)
+            self.exp_bymat.setChecked(False)
+            self.exp_lp_one.setChecked(False)
+        elif getattr(self, '_marmoset_target_active', False):
+            self.exp_inc_cage.setChecked(bool(getattr(self, '_standard_cage_include', False)))
+        self._marmoset_target_active = is_marmoset
+        general_controls = (
+            getattr(self, 'exp_inc_hp', None),
+            getattr(self, 'exp_inc_lp', None),
+            getattr(self, 'exp_inc_cage', None),
+            getattr(self, 'exp_files_sep', None),
+            getattr(self, 'exp_files_one', None),
+        )
+        for control in general_controls:
+            if control is not None:
+                control.setEnabled(not is_marmoset)
+        self.exp_files_one.setEnabled(not is_marmoset)
+        is_chapter = (
+            hasattr(self, 'exp_scope') and self.exp_scope.currentIndex() == 0)
+        for control in (
+                getattr(self, 'exp_bymat', None),
+                getattr(self, 'exp_lp_one', None)):
+            if control is not None:
+                control.setEnabled(not is_marmoset and not is_chapter)
+
+    def _ask_marmoset_plugin_setup(self, status):
+        """Return install, export_only, or cancel from the Toolbag setup dialog."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Marmoset bridge setup"))
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText(bg_l10n.text("Marmoset bridge install prompt" if
+                                  status["state"] == "missing" else
+                                  "Marmoset bridge update prompt"))
+        box.setInformativeText(status["destination"])
+        install_button = box.addButton(bg_l10n.text("Install bridge"),
+                                       QtWidgets.QMessageBox.AcceptRole)
+        export_button = box.addButton(bg_l10n.text("Export package only"),
+                                      QtWidgets.QMessageBox.ActionRole)
+        box.addButton(bg_l10n.text("Cancel"), QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(install_button)
+        box.exec_() if hasattr(box, 'exec_') else box.exec()
+        if box.clickedButton() == export_button:
+            return "export_only"
+        return "install" if box.clickedButton() == install_button else "cancel"
+
+    def _ensure_marmoset_plugin(self):
+        self._marmoset_bridge_ready = False
+        try:
+            status = bg_marmoset_bridge.toolbag_plugin_status()
+        except Exception as exc:
+            cmds.warning("Marmoset bridge is unavailable: {}".format(exc))
+            return False
+        if status["state"] == "current":
+            self._marmoset_bridge_ready = True
+            return True
+        choice = self._ask_marmoset_plugin_setup(status)
+        if choice == "export_only":
+            self.log("Marmoset package only; bridge not installed or updated.", "lightblue")
+            return True
+        if choice != "install":
+            return False
+        try:
+            plugin_path = bg_marmoset_bridge.install_toolbag_plugin()
+        except Exception as exc:
+            cmds.warning("Could not install Marmoset bridge: {}".format(exc))
+            return False
+        self.log("Marmoset bridge installed: {}".format(plugin_path), "lightblue")
+        self._marmoset_bridge_ready = True
+        return True
+
+    def _export_marmoset_package(self, targets, snapshots):
+        if not self._ensure_marmoset_plugin():
+            return
+        export_dirs = cmds.fileDialog2(
+            fileMode=3, caption=bg_l10n.text("Select Marmoset Package Folder"))
+        if not export_dirs:
+            return
+        export_dir = export_dirs[0]
+        progress = QtWidgets.QProgressDialog(
+            bg_l10n.text("Preparing Marmoset package..."),
+            bg_l10n.text("Cancel"), 0, max(1, len(targets)), self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        completed = [0]
+
+        def status(label):
+            progress.setLabelText(label)
+            progress.setValue(min(completed[0], len(targets)))
+            completed[0] += 1
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            with self.suspend_subgroup_color_preview():
+                with self.suspend_isolation():
+                    with bg_final_export.FinalExportProcessor.export_session():
+                        manifest = bg_marmoset_bridge.MarmosetPackageExporter.export_package(
+                            targets, snapshots, export_dir,
+                            status_callback=status,
+                            cancel_check=progress.wasCanceled)
+            if progress.wasCanceled() or not manifest:
+                if hasattr(self, 'exp_status'):
+                    self.exp_status.setText(bg_l10n.text("Export cancelled"))
+                return
+            progress.setValue(max(1, len(targets)))
+            if hasattr(self, 'exp_status'):
+                message = bg_l10n.text("Marmoset package exported: {name}").format(
+                    name=os.path.basename(manifest))
+                if not self._marmoset_bridge_ready:
+                    message += " " + bg_l10n.text("Marmoset bridge not installed warning")
+                self.exp_status.setText(message)
+            cmds.inViewMessage(
+                amg="Marmoset package exported: {}".format(manifest),
+                pos='midCenter', fade=True)
+        finally:
+            progress.close()
+        if self._marmoset_bridge_ready:
+            try:
+                bg_marmoset_bridge.launch_toolbag_bridge(manifest)
+                if hasattr(self, 'exp_status'):
+                    self.exp_status.setText(
+                        bg_l10n.text("Opening Marmoset package: {name}").format(
+                            name=os.path.basename(manifest)))
+            except Exception as exc:
+                message = bg_l10n.text("Marmoset launch failed: {error}").format(
+                    error=exc)
+                cmds.warning(message)
+                if hasattr(self, 'exp_status'):
+                    self.exp_status.setText(message)
 
     def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage, snapshots=None):
         """One validation pass over the chapters about to be exported. Returns
@@ -5239,6 +5467,10 @@ class ExportMixin:
         scope = self.exp_scope.currentIndex()
         by_mat = self.exp_bymat.isChecked() and scope != 0
         lp_one = self.exp_lp_one.isChecked() and scope != 0
+        # Standard FBX smooths HP externally by default. The combined HP+LP
+        # file still uses Maya's exporter because LP must share that FBX scene.
+        external_hp_obj = self._use_external_hp_fbx(
+            inc_hp, inc_lp, single, lp_one, by_mat)
 
         books = []
         targets = []
@@ -5264,6 +5496,17 @@ class ExportMixin:
 
         self.save_final_smooth_states()
         snapshots = self._prepare_export_snapshots(targets)
+
+        is_marmoset = (
+            hasattr(self, 'exp_target') and self.exp_target.currentIndex() == 1)
+        if is_marmoset:
+            errors, warnings = self._export_preflight(
+                targets, True, True, False, snapshots=snapshots)
+            if ((errors or warnings) and
+                    not self._confirm_export_preflight(errors, warnings)):
+                return
+            self.disable_preview_smoothing_for_export()
+            return self._export_marmoset_package(targets, snapshots)
 
         # Single preflight before the artist even picks a folder: block on broken
         # scenes, and let them confirm past soft issues (undistributed LP, empty
@@ -5308,7 +5551,11 @@ class ExportMixin:
 
         def file_callback(export_name):
             files_written[0] += 1
-            progress.setLabelText("{}.fbx".format(export_name))
+            if str(export_name).lower().endswith((".fbx", ".obj")):
+                file_label = export_name
+            else:
+                file_label = "{}.fbx".format(export_name)
+            progress.setLabelText(file_label)
             progress.setValue(min(files_written[0], total_files))
             QtWidgets.QApplication.processEvents()
 
@@ -5344,7 +5591,8 @@ class ExportMixin:
                                         snapshots=snapshots,
                                         status_callback=status_callback,
                                         file_callback=file_callback,
-                                        cancel_check=cancel_check)
+                                        cancel_check=cancel_check,
+                                        external_hp_obj=external_hp_obj)
                             else:
                                 for pair in targets:
                                     if cancel_check():
@@ -5355,7 +5603,8 @@ class ExportMixin:
                                             snapshot=self._snapshot_for_pair(snapshots, pair),
                                             status_callback=status_callback,
                                             file_callback=file_callback,
-                                            cancel_check=cancel_check):
+                                            cancel_check=cancel_check,
+                                            external_hp_obj=external_hp_obj):
                                         n += 1
                         was_cancelled[0] = cancel_check()
                         if not was_cancelled[0]:
@@ -5378,6 +5627,11 @@ class ExportMixin:
             cmds.inViewMessage(amg="Export cancelled", pos='midCenter', fade=True)
         else:
             cmds.inViewMessage(amg="Export: {} item(s).".format(n), pos='midCenter', fade=True)
+
+    @staticmethod
+    def _use_external_hp_fbx(inc_hp, inc_lp, single, lp_one, by_mat):
+        """External HP is standard except when HP and LP share one FBX file."""
+        return bool(inc_hp and not (single and inc_lp and not lp_one and not by_mat))
 
     def export_active_lp_only(self):
         if not self.active_root_id:
@@ -8244,8 +8498,6 @@ class TOCMixin:
         QtCore.QTimer.singleShot(0, restore_toc_scroll)
         if any_healed:
             bg_core.BakeSessionModel.save(self.root_pairs)
-        if hasattr(self, 'gt_widget'):
-            self.gt_widget.refresh_labels()
         if hasattr(self, 'schedule_dock_relayout'):
             self.schedule_dock_relayout()
 

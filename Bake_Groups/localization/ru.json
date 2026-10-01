@@ -1,6 +1,10 @@
 ﻿{
     "language":  "ru",
     "texts":  {
+                  "Target":  "Назначение",
+                  "Select Marmoset Package Folder":  "Выберите папку пакета Marmoset",
+                  "Preparing Marmoset package...":  "Подготовка пакета Marmoset...",
+                  "Marmoset package exported: {name}":  "Пакет Marmoset экспортирован: {name}",
                   "Manual HPs:":  "Ручные HP:",
                   "Empty manual cluster. Use Link later to replace it with selected HP meshes.":  "Пустой ручной кластер. Позже нажмите Link, чтобы заменить его выбранными HP-мешами.",
                   "Export preflight":  "Проверка перед экспортом",
@@ -126,6 +130,7 @@
                   "Export":  "Экспорт",
                   "TABLE OF CONTENTS":  "ОГЛАВЛЕНИЕ",
                   "Save Session":  "Сохр.",
+                  "Help":  "Справка",
                   "Language":  "Язык",
                   "Save Debug Log":  "Сохранить debug",
                   "No debug log to save yet. Run Analyze HP first.":  "Debug ещё не готов. Сначала запусти Analyze HP.",
@@ -520,6 +525,25 @@
                      "Groups Hid":  "Часть сабгрупп скрыта. Нажмите, чтобы показать все сабгруппы активной главы.",
                      "Groups Vis/M":  "Активен фильтр видимости по материалу. Нажмите, чтобы снова показать все материалы.",
                      "Undo BG":  "Отменить последнее лёгкое действие Bake Groups. Analyze HP, Assign LP, экспорт, Combine Fin и Color HP не входят.",
-                     "Create by Mat":  "Создать несколько глав из выбранных HP и LP root-групп по материалам LP. (beta)"
+                     "Create by Mat":  "Создать несколько глав из выбранных HP и LP root-групп по материалам LP. (beta)",
+                     "External HP OBJ export":  "Внешнее сглаживание HP (OBJ)",
+                     "External HP OBJ export tooltip":  "Экспортирует HP в OBJ отдельным файлом. Уровень Smooth сохраняется для каждой сабгруппы; ZBrush HP остаётся без сглаживания. LP и Cage по-прежнему экспортируются в FBX.",
+                     "External HP FBX export":  "Внешнее сглаживание HP (FBX)",
+                     "External HP FBX export tooltip":  "Сглаживает HP вне Maya и экспортирует отдельный бинарный FBX. Уровень Smooth сохраняется для каждой сабгруппы; ZBrush HP остаётся без сглаживания. LP и Cage по-прежнему экспортируются в FBX.",
+                     "Converting HP to FBX...":  "Преобразование HP в FBX...",
+                     "External HP FBX export failed: {error}":  "Не удалось экспортировать внешний HP FBX: {error}",
+                     "Combined HP LP Maya export tooltip": "Общий файл HP+LP экспортируется через Maya. При экспорте отдельными файлами HP по умолчанию сглаживается вне Maya.",
+                     "Marmoset bridge setup": "Установка моста Marmoset",
+                     "Marmoset bridge install prompt": "Плагин Bake Groups Bridge не установлен в Marmoset Toolbag 5. Установить его для текущего пользователя?",
+                     "Marmoset bridge update prompt": "Установленный Bake Groups Bridge отличается от встроенного файла. Заменить его? Текущий файл будет сохранён в резервной копии.",
+                     "Install bridge": "Установить плагин",
+                     "Export package only": "Только экспортировать пакет",
+                     "Marmoset bridge installed instructions": "Плагин установлен. В Toolbag выберите Edit > Plugins > Refresh (или перезапустите Toolbag), затем запустите Bake Groups Bridge в этом меню. Через Open / Sync Package выберите BakeGroups_Marmoset.json.",
+                     "Marmoset bridge not installed warning": "Перед открытием пакета установите Bake Groups Bridge в Toolbag.",
+                     "Opening Marmoset package: {name}": "Открываю Marmoset Toolbag с пакетом {name}...",
+                     "Marmoset launch failed: {error}": "Пакет экспортирован, но открыть Toolbag не удалось: {error}",
+                     "External HP OBJ helper missing":  "Не найдена утилита внешнего экспорта OBJ. Переустановите или восстановите Bake Groups.",
+                     "Converting HP to OBJ...":  "Преобразование HP в OBJ...",
+                     "External HP OBJ export failed: {error}":  "Не удалось экспортировать внешний HP OBJ: {error}"
                  }
 }

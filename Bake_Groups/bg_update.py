@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,9 +26,24 @@ import bg_localization as bg_l10n
 import bg_version
 
 PACKAGE_DOWNLOAD_TIMEOUT = 300
-DEFAULT_PACKAGE_URL = "https://codeload.github.com/{}/zip/refs/heads/main".format(bg_version.GITHUB_REPOSITORY)
 DEVELOPER_MARKER_NAME = ".bake_groups_developer.json"
 KEEP_PREVIOUS_VERSIONS = 1
+MAX_ARCHIVE_FILES = 10000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+_RELEASE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _validated_release_version(value):
+    version = str(value or "").strip()
+    if not _RELEASE_VERSION_RE.match(version):
+        raise ValueError("Invalid update version: {!r}".format(version))
+    return version
+
+
+def _tag_package_url(version):
+    version = _validated_release_version(version)
+    return "https://codeload.github.com/{}/zip/refs/tags/{}".format(
+        bg_version.GITHUB_REPOSITORY, version)
 
 
 def _version_tuple(value):
@@ -82,9 +98,8 @@ def _local_manifest_path():
 
 def _manifest_info_from_text(data):
     manifest = json.loads(data)
-    remote_version = str(manifest.get("latest_version") or manifest.get("version") or "").strip()
-    if not remote_version:
-        raise ValueError("Remote manifest version not found")
+    remote_version = _validated_release_version(
+        manifest.get("latest_version") or manifest.get("version"))
     release_notes = manifest.get("release_notes") or manifest.get("notes") or ""
     if isinstance(release_notes, (list, tuple)):
         release_notes = "\n".join([str(item) for item in release_notes])
@@ -93,39 +108,37 @@ def _manifest_info_from_text(data):
         "remote_version": remote_version,
         "github_url": manifest.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": manifest.get("releases_url") or bg_version.RELEASES_URL,
-        "package_url": manifest.get("package_url") or DEFAULT_PACKAGE_URL,
+        "package_url": manifest.get("package_url") or _tag_package_url(remote_version),
         "package_sha256": package_sha256 or None,
         "release_notes": release_notes,
     }
 
 
-def _merge_source_version(update_info, timeout=4):
-    try:
-        source_version = fetch_remote_version(timeout)
-        if is_newer_version(source_version, update_info.get("remote_version")):
-            update_info["remote_version"] = source_version
-    except Exception:
-        pass
-    return update_info
-
-
 def fetch_update_info(timeout=4):
     try:
-        return _merge_source_version(_manifest_info_from_text(_read_url(bg_version.UPDATE_MANIFEST_URL, timeout)), timeout)
+        # The manifest is an atomic version/package/checksum record. Never merge
+        # its version with a separately fetched source file: GitHub caches can
+        # expose those files at different revisions for a short time.
+        return _manifest_info_from_text(_read_url(bg_version.UPDATE_MANIFEST_URL, timeout))
     except Exception:
         pass
 
-    path = _local_manifest_path()
-    if os.path.exists(path):
-        with open(path, "r") as handle:
-            return _merge_source_version(_manifest_info_from_text(handle.read()), timeout)
-
-    return _merge_source_version({
-        "remote_version": fetch_remote_version(timeout),
-        "github_url": bg_version.GITHUB_URL,
-        "releases_url": bg_version.RELEASES_URL,
-        "package_url": DEFAULT_PACKAGE_URL,
-    }, timeout)
+    try:
+        source_version = _validated_release_version(fetch_remote_version(timeout))
+        return {
+            "remote_version": source_version,
+            "github_url": bg_version.GITHUB_URL,
+            "releases_url": bg_version.RELEASES_URL,
+            "package_url": _tag_package_url(source_version),
+            "package_sha256": None,
+            "release_notes": "",
+        }
+    except Exception:
+        path = _local_manifest_path()
+        if os.path.exists(path):
+            with open(path, "r") as handle:
+                return _manifest_info_from_text(handle.read())
+        raise
 
 
 def check_for_update():
@@ -139,7 +152,7 @@ def check_for_update():
         "is_update_available": is_newer_version(update_info.get("remote_version"), current_version),
         "github_url": update_info.get("github_url") or bg_version.GITHUB_URL,
         "releases_url": update_info.get("releases_url") or bg_version.RELEASES_URL,
-        "package_url": update_info.get("package_url") or DEFAULT_PACKAGE_URL,
+        "package_url": update_info.get("package_url") or _tag_package_url(update_info.get("remote_version")),
         "package_sha256": update_info.get("package_sha256"),
         "release_notes": update_info.get("release_notes") or "",
     }
@@ -336,6 +349,73 @@ def _find_runtime_source(extract_dir):
     raise RuntimeError("Bake_Groups runtime folder not found in update package")
 
 
+def _runtime_version(runtime_dir):
+    version_path = os.path.join(runtime_dir, "bg_version.py")
+    if not os.path.isfile(version_path):
+        raise RuntimeError("Update package has no bg_version.py")
+    with open(version_path, "r") as handle:
+        source = handle.read()
+    match = re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", source)
+    if not match:
+        raise RuntimeError("Update package version marker not found")
+    return _validated_release_version(match.group(1))
+
+
+def _validate_runtime_version(runtime_dir, expected_version):
+    actual_version = _runtime_version(runtime_dir)
+    if actual_version != _validated_release_version(expected_version):
+        raise RuntimeError(
+            "Update package version mismatch (expected {}, got {})".format(
+                expected_version, actual_version))
+    return actual_version
+
+
+def _safe_extract_archive(archive, extract_dir):
+    """Extract a bounded ZIP while rejecting traversal paths and symlinks."""
+    members = archive.infolist()
+    if len(members) > MAX_ARCHIVE_FILES:
+        raise RuntimeError("Update archive contains too many files")
+    total_size = sum(max(0, int(info.file_size)) for info in members)
+    if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        raise RuntimeError("Update archive is too large after extraction")
+
+    root = os.path.normcase(os.path.realpath(extract_dir))
+    for info in members:
+        name = str(info.filename or "").replace("\\", "/")
+        if not name or "\x00" in name:
+            raise RuntimeError("Update archive contains an invalid path")
+        unix_mode = (int(info.external_attr) >> 16) & 0xFFFF
+        if stat.S_ISLNK(unix_mode):
+            raise RuntimeError("Update archive contains a symbolic link: {}".format(name))
+        target = os.path.normcase(os.path.realpath(os.path.join(extract_dir, name)))
+        try:
+            inside = os.path.commonpath([root, target]) == root
+        except ValueError:
+            inside = False
+        if not inside:
+            raise RuntimeError("Update archive path escapes the install directory: {}".format(name))
+    archive.extractall(extract_dir)
+
+
+def _atomic_write_json(path, data):
+    fd, temp_path = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".tmp.",
+        dir=os.path.dirname(os.path.abspath(path)))
+    os.close(fd)
+    try:
+        with open(temp_path, "w") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
 def _write_active_version(bootstrap_dir, version, target_dir, previous_version=None):
     data = {
         "active_version": version,
@@ -345,8 +425,7 @@ def _write_active_version(bootstrap_dir, version, target_dir, previous_version=N
     if previous_version:
         data["previous_version"] = str(previous_version)
     path = os.path.join(bootstrap_dir, "active_version.json")
-    with open(path, "w") as handle:
-        json.dump(data, handle, indent=2)
+    _atomic_write_json(path, data)
 
 
 def _copy_bootstrap_launcher(source_dir, bootstrap_dir):
@@ -382,31 +461,34 @@ if __name__ == "__main__":
 
 def install_update(update_info, progress_callback=None):
     _progress(progress_callback, 5, "Preparing update...")
-    version = str(update_info.get("remote_version") or "").strip()
-    if not version:
-        raise RuntimeError("Update version is not available")
+    version = _validated_release_version(update_info.get("remote_version"))
 
     bootstrap_dir = _bootstrap_dir()
     current_state = _active_state(bootstrap_dir)
     current_version = str(current_state.get("active_version") or bg_version.__version__).strip()
     versions_dir = os.path.join(bootstrap_dir, "versions")
     target_dir = os.path.join(versions_dir, version)
-    package_url = update_info.get("package_url") or DEFAULT_PACKAGE_URL
+    package_url = update_info.get("package_url") or _tag_package_url(version)
 
     if os.path.exists(os.path.join(target_dir, "bg_main_window.py")):
-        _progress(progress_callback, 90, "Activating update...")
-        previous_version = current_version if current_version != version else current_state.get("previous_version")
-        _write_active_version(bootstrap_dir, version, target_dir, previous_version)
-        _copy_bootstrap_launcher(target_dir, bootstrap_dir)
-        cleanup = _cleanup_old_versions(bootstrap_dir, version, previous_version)
-        _progress(progress_callback, 100, "Update installed.")
-        return {
-            "success": True,
-            "version": version,
-            "target_dir": target_dir,
-            "already_installed": True,
-            "cleanup": cleanup,
-        }
+        try:
+            _validate_runtime_version(target_dir, version)
+        except Exception as exc:
+            print("Bake Groups update: existing version is invalid; reinstalling: {}".format(exc))
+        else:
+            _progress(progress_callback, 90, "Activating update...")
+            previous_version = current_version if current_version != version else current_state.get("previous_version")
+            _write_active_version(bootstrap_dir, version, target_dir, previous_version)
+            _copy_bootstrap_launcher(target_dir, bootstrap_dir)
+            cleanup = _cleanup_old_versions(bootstrap_dir, version, previous_version)
+            _progress(progress_callback, 100, "Update installed.")
+            return {
+                "success": True,
+                "version": version,
+                "target_dir": target_dir,
+                "already_installed": True,
+                "cleanup": cleanup,
+            }
 
     if not os.path.exists(versions_dir):
         os.makedirs(versions_dir)
@@ -438,10 +520,11 @@ def install_update(update_info, progress_callback=None):
         _progress(progress_callback, 60, "Extracting update package...")
         extract_dir = os.path.join(work_dir, "extract")
         with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(extract_dir)
+            _safe_extract_archive(archive, extract_dir)
 
         _progress(progress_callback, 75, "Installing update files...")
         source_dir = _find_runtime_source(extract_dir)
+        _validate_runtime_version(source_dir, version)
         _copy_runtime_tree(source_dir, staging_dir)
 
         if os.path.exists(target_dir):
@@ -669,10 +752,11 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.check_btn.clicked.connect(self.check_requested.emit)
         buttons.addWidget(self.check_btn)
 
-        # Quick access to the PureRef manual - hidden if it isn't bundled.
-        self.manual_btn = QtWidgets.QPushButton(bg_l10n.text("Show manual"))
-        self.manual_btn.clicked.connect(lambda: open_manual_folder())
-        if resolve_manual_file() is None:
+        self.manual_btn = QtWidgets.QPushButton(bg_l10n.text("Help"))
+        guide_host = self.parentWidget()
+        if guide_host is not None and hasattr(guide_host, "show_guide"):
+            self.manual_btn.clicked.connect(lambda: guide_host.show_guide("overview"))
+        else:
             self.manual_btn.hide()
         buttons.addWidget(self.manual_btn)
         buttons.addStretch(1)

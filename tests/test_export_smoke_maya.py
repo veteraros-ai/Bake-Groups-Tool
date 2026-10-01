@@ -93,8 +93,11 @@ def run():
         assert sorted(face for faces in material_faces.values() for face in faces) == [0, 1, 2, 3]
 
     captures = []
+    capture_dir = tempfile.mkdtemp(prefix="bake_groups_capture_test_")
 
     def capture_export(_path):
+        with open(_path, "wb"):
+            pass
         selected = cmds.ls(selection=True, long=True, type="transform") or []
         captures.append({
             "names": [node.split("|")[-1] for node in selected],
@@ -107,8 +110,9 @@ def run():
     try:
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
-            prepared_chapters=[snapshot], status_callback=lambda _label: None)
+            export_dir=capture_dir, smooth_states={"Group": 1},
+            prepared_chapters=[snapshot], status_callback=lambda _label: None,
+            external_hp_obj=False)
         assert result == "Chapter_HP"
         hp_capture = captures.pop(0)
         assert len([name for name in hp_capture["names"] if "_high" in name.lower()]) == 1
@@ -121,9 +125,9 @@ def run():
             "Chapter", hp_root, lp_root, {"Group": 0})
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
-            export_dir=os.getcwd(), smooth_states={"Group": 0},
+            export_dir=capture_dir, smooth_states={"Group": 0},
             prepared_chapters=[zero_smooth_snapshot],
-            status_callback=lambda _label: None)
+            status_callback=lambda _label: None, external_hp_obj=False)
         assert result == "Chapter_HP"
         zero_smooth_capture = captures.pop(0)
         assert zero_smooth_capture["faces"] == [original_hp_faces]
@@ -132,7 +136,7 @@ def run():
 
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="lp",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
+            export_dir=capture_dir, smooth_states={"Group": 1},
             prepared_chapters=[snapshot], status_callback=lambda _label: None)
         assert result == "Chapter_LP"
         lp_capture = captures.pop(0)
@@ -144,7 +148,7 @@ def run():
 
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="both",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
+            export_dir=capture_dir, smooth_states={"Group": 1},
             prepared_chapters=[snapshot], status_callback=lambda _label: None)
         assert result == "Chapter"
         both_capture = captures.pop(0)
@@ -160,7 +164,7 @@ def run():
 
         result = Processor.export_chapter(
             "Chapter", hp_root, lp_root, [], mode="hp",
-            export_dir=os.getcwd(), smooth_states={"Group": 1},
+            export_dir=capture_dir, smooth_states={"Group": 1},
             prepared_chapters=[snapshot], status_callback=lambda _label: None,
             cancel_check=lambda: True)
         assert result is False
@@ -169,6 +173,7 @@ def run():
     finally:
         Processor.export_selected_fbx = original_export
         Processor._cleanup_stale_export_temps()
+        shutil.rmtree(capture_dir, ignore_errors=True)
 
     export_dir = tempfile.mkdtemp(prefix="bake_groups_export_test_")
     try:

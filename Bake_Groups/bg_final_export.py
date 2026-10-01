@@ -8,6 +8,11 @@ import bg_localization as bg_l10n
 import re
 import math
 import contextlib
+import os
+import subprocess
+import tempfile
+import time
+import bg_hp_binary
 
 try:
     import maya.api.OpenMaya as om
@@ -147,7 +152,8 @@ class FinalExportProcessor(object):
     @staticmethod
     def _export_with_lp_triangulation_rollback(export_nodes, export_path,
                                                reusable_temp_nodes=None,
-                                               triangulate_all=False):
+                                               triangulate_all=False,
+                                               external_level_map=None):
         """Export triangulated temporary copies without touching scene originals.
 
         ``reusable_temp_nodes`` are already-disposable meshes produced by the
@@ -191,16 +197,26 @@ class FinalExportProcessor(object):
             flattened = []
             flattened_disposable = []
             disposable_set = set(disposable)
+            mapped_levels = dict(external_level_map or {})
+            flattened_levels = {}
             for node in prepared:
+                original_short = node.split('|')[-1]
                 if node in disposable_set or FinalExportProcessor._is_export_temp_node(node):
                     short_name = node.split('|')[-1]
                     node = cmds.parent(node, world=True, absolute=True)[0]
                     node = cmds.rename(node, short_name)
                     node = (cmds.ls(node, long=True) or [node])[0]
                     flattened_disposable.append(node)
+                if original_short in mapped_levels:
+                    flattened_levels[node.split('|')[-1]] = mapped_levels[original_short]
                 flattened.append(node)
             prepared = flattened
             disposable = flattened_disposable
+            if external_level_map is not None:
+                if len(flattened_levels) != len(mapped_levels):
+                    raise RuntimeError("An HP mesh level was lost while preparing FBX names")
+                external_level_map.clear()
+                external_level_map.update(flattened_levels)
 
             cmds.select(prepared, replace=True)
             FinalExportProcessor.export_selected_fbx(export_path)
@@ -240,6 +256,7 @@ class FinalExportProcessor(object):
             "BG_HP_Export_Zero_Temp",
             "BG_Export_Tri_Temp",
             "BG_Material_Export_Temp",
+            "BG_Marmoset_Export_Temp",
         )
         return any(
             part.startswith(prefixes)
@@ -332,7 +349,8 @@ class FinalExportProcessor(object):
         return FinalExportProcessor._resolve_child_under_parent(renamed, parent_long)
 
     @staticmethod
-    def _prepare_individual_hp_export_copy(entry, temp_root, reusable):
+    def _prepare_individual_hp_export_copy(entry, temp_root, reusable,
+                                           apply_smoothing=True):
         """Prepare one HP mesh while preserving its object identity and name."""
         mesh = entry['mesh']
         long_mesh = entry['long']
@@ -351,7 +369,7 @@ class FinalExportProcessor(object):
 
             # ZBrush meshes deliberately never enter this branch: they stay as
             # separate objects and receive neither polyUnite nor polySmooth.
-            if level > 0 and not is_zbrush_mesh:
+            if apply_smoothing and level > 0 and not is_zbrush_mesh:
                 try:
                     cmds.polySmooth(
                         dup, divisions=int(level), keepBorder=False,
@@ -395,7 +413,8 @@ class FinalExportProcessor(object):
             raise
 
     @staticmethod
-    def _combine_regular_hp_export_group(entries, temp_root, level):
+    def _combine_regular_hp_export_group(entries, temp_root, level,
+                                         apply_smoothing=True):
         """Combine one subgroup's non-ZBrush HP copies for fast FBX writing."""
         duplicates = []
         combined = None
@@ -425,7 +444,7 @@ class FinalExportProcessor(object):
                 FinalExportProcessor._delete_temp_nodes(duplicates)
                 duplicates = []
 
-            if level > 0:
+            if apply_smoothing and level > 0:
                 cmds.polySmooth(
                     combined, divisions=int(level), keepBorder=False,
                     constructionHistory=False)
@@ -446,7 +465,8 @@ class FinalExportProcessor(object):
     @staticmethod
     def _make_zero_transform_hp_export_copies(
             meshes, smooth_levels=None, reusable_temp_nodes=None,
-            combine_non_zbrush=False):
+            combine_non_zbrush=False, apply_smoothing=True,
+            external_level_map=None):
         """Prepare HP copies with world-space geometry and zeroed transforms.
 
         Material-split HP meshes are already temporary. Reusing them here avoids
@@ -468,6 +488,22 @@ class FinalExportProcessor(object):
         passthrough = []
         groups = {}
         group_order = []
+        external_names = set()
+
+        def register_external_level(node, level):
+            if external_level_map is None or not node or not cmds.objExists(node):
+                return node
+            short = node.split('|')[-1]
+            key = short.lower()
+            if key in external_names:
+                unique_short = "{}__BG{:03d}".format(short, len(external_names) + 1)
+                node = FinalExportProcessor._rename_child_under_parent(
+                    node, temp_root, unique_short)
+                short = node.split('|')[-1]
+                key = short.lower()
+            external_names.add(key)
+            external_level_map[short] = max(0, min(5, int(level or 0)))
+            return node
 
         # Classify once before creating temporary geometry. This is both faster
         # and guarantees that ZBrush membership is read from the source object,
@@ -514,6 +550,11 @@ class FinalExportProcessor(object):
                 if not is_zbrush_mesh:
                     groups[prefix]['level'] = max(groups[prefix]['level'], level)
             except Exception as e:
+                if external_level_map is not None:
+                    FinalExportProcessor._delete_temp_nodes([temp_root])
+                    raise RuntimeError(
+                        "Could not classify HP mesh for external export '{}': {}".format(
+                            short_name, e))
                 cmds.warning("Could not classify HP export mesh '{}': {}".format(short_name, e))
                 passthrough.append(mesh)
 
@@ -528,9 +569,11 @@ class FinalExportProcessor(object):
 
             if can_combine:
                 try:
-                    prepared.append(
-                        FinalExportProcessor._combine_regular_hp_export_group(
-                            regular, temp_root, group['level']))
+                    combined = FinalExportProcessor._combine_regular_hp_export_group(
+                        regular, temp_root, group['level'],
+                        apply_smoothing=apply_smoothing)
+                    combined = register_external_level(combined, group['level'])
+                    prepared.append(combined)
                     regular = []
                 except Exception as e:
                     cmds.warning(
@@ -540,10 +583,18 @@ class FinalExportProcessor(object):
             # Fallback and single-mesh subgroups preserve the existing path.
             for entry in regular:
                 try:
-                    prepared.append(
-                        FinalExportProcessor._prepare_individual_hp_export_copy(
-                            entry, temp_root, reusable))
+                    copied = FinalExportProcessor._prepare_individual_hp_export_copy(
+                        entry, temp_root, reusable,
+                        apply_smoothing=apply_smoothing)
+                    if not apply_smoothing and not entry['zbrush']:
+                        copied = register_external_level(copied, entry['level'])
+                    prepared.append(copied)
                 except Exception as e:
+                    if external_level_map is not None:
+                        FinalExportProcessor._delete_temp_nodes([temp_root])
+                        raise RuntimeError(
+                            "Could not prepare HP mesh for external export '{}': {}".format(
+                                entry['short'], e))
                     cmds.warning(
                         "Could not create zero-transform HP export copy '{}': {}".format(
                             entry['short'], e))
@@ -553,10 +604,17 @@ class FinalExportProcessor(object):
             # never receives polyUnite or polySmooth.
             for entry in zbrush:
                 try:
-                    prepared.append(
-                        FinalExportProcessor._prepare_individual_hp_export_copy(
-                            entry, temp_root, reusable))
+                    copied = FinalExportProcessor._prepare_individual_hp_export_copy(
+                        entry, temp_root, reusable,
+                        apply_smoothing=apply_smoothing)
+                    copied = register_external_level(copied, 0)
+                    prepared.append(copied)
                 except Exception as e:
+                    if external_level_map is not None:
+                        FinalExportProcessor._delete_temp_nodes([temp_root])
+                        raise RuntimeError(
+                            "Could not prepare ZBrush mesh for external export '{}': {}".format(
+                                entry['short'], e))
                     cmds.warning(
                         "Could not create zero-transform ZBrush export copy '{}': {}".format(
                             entry['short'], e))
@@ -565,6 +623,104 @@ class FinalExportProcessor(object):
         prepared.extend(passthrough)
 
         return prepared, temp_root
+
+    @staticmethod
+    def external_obj_helper_path():
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "bin", "bg_obj_subdivider.exe")
+
+    @staticmethod
+    def _export_external_hp_direct(meshes, smooth_levels, output_fbx,
+                                   status_callback=None, cancel_check=None):
+        """Read source HP through Maya API and hand only useful data to the EXE."""
+        helper = FinalExportProcessor.external_obj_helper_path()
+        output_dir = os.path.dirname(os.path.abspath(output_fbx))
+        with tempfile.TemporaryDirectory(prefix="BakeGroups_HP_") as temp_dir, \
+                tempfile.TemporaryDirectory(prefix=".BG_HP_Output_", dir=output_dir) as output_stage:
+            geometry_path = os.path.join(temp_dir, "source.bghp")
+            staged_fbx = os.path.join(output_stage, os.path.basename(output_fbx))
+            if status_callback:
+                status_callback(bg_l10n.text("Preparing: {name}").format(
+                    name=os.path.basename(output_fbx)))
+            bg_hp_binary.write(
+                geometry_path, meshes, smooth_levels,
+                FinalExportProcessor._is_zbrush_mesh, cancel_check=cancel_check)
+            if cancel_check and cancel_check():
+                return False
+            if not FinalExportProcessor._run_external_obj_export(
+                    helper, geometry_path, staged_fbx, None,
+                    status_callback=status_callback, cancel_check=cancel_check,
+                    binary_input=True, output_format="fbx"):
+                return False
+            os.replace(staged_fbx, output_fbx)
+        return True
+
+    @staticmethod
+    def _run_external_obj_export(helper_path, input_fbx, output_obj,
+                                 level_map, status_callback=None,
+                                 cancel_check=None, binary_input=False,
+                                 output_format="obj"):
+        """Convert an HP geometry stream or compatibility FBX to one output."""
+        if not os.path.isfile(helper_path):
+            raise RuntimeError("External OBJ helper is missing: {}".format(helper_path))
+        if not binary_input and not level_map:
+            raise RuntimeError("No HP meshes were prepared for external export.")
+
+        with tempfile.TemporaryDirectory(prefix="BakeGroups_OBJ_") as temp_dir:
+            levels_path = os.path.join(temp_dir, "mesh_levels.tsv")
+            log_path = os.path.join(temp_dir, "converter.log")
+            if not binary_input:
+                with open(levels_path, "w", encoding="utf-8", newline="\n") as stream:
+                    for mesh_name, level in sorted(level_map.items(), key=lambda item: item[0].lower()):
+                        if any(char in mesh_name for char in "\t\r\n"):
+                            raise RuntimeError("An exported mesh name cannot be represented in the level map.")
+                        stream.write("{}\t{}\n".format(int(level), mesh_name))
+
+            command = [helper_path, "--input", input_fbx,
+                       "--output", output_obj, "--level", "0",
+                       "--format", output_format]
+            if binary_input:
+                command.append("--input-binary")
+            else:
+                command.extend(("--levels-file", levels_path))
+            if status_callback:
+                status_callback(bg_l10n.text("Converting HP to FBX..." if output_format == "fbx"
+                                             else "Converting HP to OBJ..."))
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            with open(log_path, "wb") as log_stream:
+                process = subprocess.Popen(
+                    command, stdout=log_stream, stderr=subprocess.STDOUT,
+                    creationflags=flags)
+                while process.poll() is None:
+                    if cancel_check and cancel_check():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2.0)
+                        except Exception:
+                            try:
+                                process.kill()
+                            except Exception:
+                                pass
+                            process.wait()
+                        return False
+                    app = QtWidgets.QApplication.instance()
+                    if app is not None:
+                        app.processEvents()
+                    time.sleep(0.05)
+                exit_code = process.returncode
+
+            if exit_code != 0:
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                        details = stream.read()[-4000:].strip()
+                except Exception:
+                    details = ""
+                raise RuntimeError(
+                    "External HP conversion failed (code {}). {}".format(
+                        exit_code, details))
+            if not os.path.isfile(output_obj) or os.path.getsize(output_obj) == 0:
+                raise RuntimeError("External HP conversion produced no output file.")
+        return True
 
     @staticmethod
     def _cleanup_zero_transform_hp_export_temps(extra_nodes=None):
@@ -873,7 +1029,7 @@ class FinalExportProcessor(object):
                        smooth_states=None, extra_chapters=None,
                        export_name_override=None, prepared_chapters=None,
                        status_callback=None, file_callback=None,
-                       cancel_check=None):
+                       cancel_check=None, external_hp_obj=True):
         """Prepare and export one file using reusable chapter snapshots."""
         if not export_dir:
             export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Export Directory"))
@@ -1075,12 +1231,18 @@ class FinalExportProcessor(object):
                 if not all_to_export:
                     return False
 
+                is_external_hp = bool(external_hp_obj and mode == 'hp')
                 export_nodes = all_to_export
-                if mode in ('both', 'hp'):
+                external_level_map = {}
+                if mode in ('both', 'hp') and not is_external_hp:
                     export_nodes, temp_root = \
                         FinalExportProcessor._make_zero_transform_hp_export_copies(
                             all_to_export, smooth_levels, reusable_hp_nodes,
-                            combine_non_zbrush=(mode == 'hp'))
+                            combine_non_zbrush=(mode == 'hp'),
+                            apply_smoothing=not (external_hp_obj and mode == 'hp'),
+                            external_level_map=(external_level_map
+                                                if external_hp_obj and mode == 'hp'
+                                                else None))
                     if temp_root:
                         temp_roots.append(temp_root)
 
@@ -1090,12 +1252,49 @@ class FinalExportProcessor(object):
                 elif mode == 'lp':
                     suffix = "_LP"
                 export_name = "{}{}".format(name_base, suffix).replace(".", "_")
-                export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
+                export_path = "{}/{}.{}".format(
+                    export_dir.rstrip('/\\'), export_name,
+                    "fbx").replace('\\', '/')
                 notify_status(bg_l10n.text("Preparing: {name}").format(name=export_name))
 
-                if FinalExportProcessor._export_with_lp_triangulation_rollback(
+                if is_external_hp:
+                    try:
+                        converted = FinalExportProcessor._export_external_hp_direct(
+                            export_nodes, smooth_levels, export_path,
+                            status_callback=status_callback, cancel_check=is_cancelled)
+                        if not converted:
+                            return False
+                    except Exception as exc:
+                        if is_cancelled():
+                            return False
+                        cmds.warning("Direct HP export failed; trying Maya FBX fallback: {}".format(exc))
+                        try:
+                            legacy_nodes, legacy_root = \
+                                FinalExportProcessor._make_zero_transform_hp_export_copies(
+                                    all_to_export, smooth_levels, reusable_hp_nodes,
+                                    combine_non_zbrush=True, apply_smoothing=True)
+                            if legacy_root:
+                                temp_roots.append(legacy_root)
+                            with tempfile.TemporaryDirectory(
+                                    prefix=".BG_HP_Output_",
+                                    dir=os.path.dirname(os.path.abspath(export_path))) as output_stage:
+                                staged_fbx = os.path.join(output_stage, os.path.basename(export_path))
+                                if not FinalExportProcessor._export_with_lp_triangulation_rollback(
+                                        legacy_nodes, staged_fbx,
+                                        reusable_temp_nodes=reusable_lp_nodes):
+                                    return False
+                                os.replace(staged_fbx, export_path)
+                        except Exception as legacy_exc:
+                            cmds.warning(bg_l10n.text(
+                                "External HP FBX export failed: {error}").format(
+                                    error=legacy_exc))
+                            return False
+                elif not FinalExportProcessor._export_with_lp_triangulation_rollback(
                         export_nodes, export_path,
                         reusable_temp_nodes=reusable_lp_nodes):
+                    return False
+
+                if os.path.isfile(export_path):
                     if progress_dlg:
                         progress_dlg.setValue(len(prefixes_to_process))
                         QtWidgets.QApplication.processEvents()
