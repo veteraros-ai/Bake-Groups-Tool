@@ -13,7 +13,7 @@ import bg_guide_manual
 
 def run():
     app = bg_guide.QtWidgets.QApplication.instance() or bg_guide.QtWidgets.QApplication([])
-    for language in ("ru", "en"):
+    for language in ("ru", "en", "ja", "zh-CN"):
         document = bg_guide_manual.build_document(language)
         assert document["manual_version"] == 5
         assert any(entry.get("anchor") == "release.whats_new"
@@ -40,7 +40,7 @@ def run():
                     "release_bridge_controls.png"}
     with tempfile.TemporaryDirectory(prefix="bake_guide_manual_") as folder:
         test_language = os.environ.get("BG_GUIDE_TEST_LANGUAGE")
-        if test_language in ("ru", "en"):
+        if test_language in ("ru", "en", "ja", "zh-CN"):
             bg_guide._language = lambda chosen=test_language: chosen
         bg_guide._document_path = lambda language: os.path.join(folder, "guide.json")
         host = bg_guide.QtWidgets.QMainWindow()

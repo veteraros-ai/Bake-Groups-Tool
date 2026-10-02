@@ -4,6 +4,8 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import struct
+from functools import lru_cache
+from bg_guide_translations import CAPTIONS, CARDS, RELEASE, SECTIONS as TRANSLATED_SECTIONS
 
 try:
     import bg_version
@@ -15,6 +17,29 @@ try:
     from PySide6 import QtGui
 except ImportError:
     from PySide2 import QtGui
+
+
+@lru_cache(maxsize=4)
+def guide_font_family(language):
+    """Load a Windows CJK font when Maya's offscreen Qt has no font database."""
+    if language == "ja":
+        family, filename = "Yu Gothic", "YuGothR.ttc"
+    elif language == "zh-CN":
+        family, filename = "Microsoft YaHei", "msyh.ttc"
+    else:
+        return "Arial"
+    if family in QtGui.QFontDatabase().families():
+        return family
+    path = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", filename)
+    if os.path.isfile(path):
+        font_id = QtGui.QFontDatabase.addApplicationFont(path)
+        if font_id >= 0:
+            families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
+            if family in families:
+                return family
+            if families:
+                return families[0]
+    return family
 
 
 def _figure(image, en_caption="", ru_caption=""):
@@ -279,15 +304,15 @@ def _png_size(name):
     return struct.unpack(">II", header[16:24])
 
 
-def _text_height(value, width, point_size):
+def _text_height(value, width, point_size, language="en"):
     document = QtGui.QTextDocument()
-    document.setDefaultFont(QtGui.QFont("Arial", point_size))
+    document.setDefaultFont(QtGui.QFont(guide_font_family(language), point_size))
     document.setPlainText(value)
     document.setTextWidth(width)
     return document.size().height()
 
 
-def _media_layout(rows, russian):
+def _media_layout(rows, language):
     """Return relative figure positions and total height for a card's image rows."""
     result = []
     cursor = 0
@@ -301,8 +326,10 @@ def _media_layout(rows, russian):
             max_height = 520 if len(row) == 1 else 300
             scale = min(2.0, slot_width / original_w, max_height / original_h)
             width, height = original_w * scale, original_h * scale
-            caption = ru_caption if russian else en_caption
-            caption_height = _text_height(caption, slot_width, 11) + 12 if caption else 0
+            caption = (CAPTIONS.get(language, {}).get(en_caption, en_caption)
+                       if language in CAPTIONS else
+                       ru_caption if language == "ru" else en_caption)
+            caption_height = _text_height(caption, slot_width, 11, language) + 12 if caption else 0
             left = index * (slot_width + 18)
             row_figures.append((filename, caption, left, cursor, width, height,
                                 caption_height, slot_width))
@@ -319,6 +346,7 @@ def _media_layout(rows, russian):
 def _release_card(language):
     """A single-screen release card with the five supplied UI screenshots."""
     ru = language == "ru"
+    translation = RELEASE.get(language, {})
     key = "release.whats_new"
     x, y, width, height = 64, 48, 1200, 740
     items = [{"type": "rect", "x": x, "y": y, "w": width, "h": height,
@@ -327,14 +355,21 @@ def _release_card(language):
              {"type": "rect", "x": x + 24, "y": y + 22, "w": 1152, "h": 86,
               "color": "#09a773", "fill": "#09a773", "thickness": 1},
              {"type": "text", "x": x + 42, "y": y + 32, "w": 1100,
-              "text": ("Что нового в версии " if ru else "New in version ") + CURRENT_VERSION,
+              "text": (translation["title"].format(CURRENT_VERSION) if translation else
+                       ("Что нового в версии " if ru else "New in version ") + CURRENT_VERSION),
               "size": 32, "color": "#f5fff9", "anchor": key}]
+
+    feature_index = [0]
 
     def feature(column, top, en_heading, ru_heading, en_body, ru_body,
                 image=None, image_width=220, image_height=180):
         left = x + 30 + column * 580
-        heading = ru_heading if ru else en_heading
-        body = ru_body if ru else en_body
+        if translation:
+            heading, body = translation["features"][feature_index[0]]
+            feature_index[0] += 1
+        else:
+            heading = ru_heading if ru else en_heading
+            body = ru_body if ru else en_body
         text_width = 310 if image else 530
         items.append({"type": "text", "x": left, "y": y + top,
                       "w": text_width, "text": heading, "size": 17,
@@ -376,12 +411,15 @@ def _release_card(language):
 
 
 def build_document(language):
+    guide_font_family(language)
     russian = language == "ru"
+    translated_sections = TRANSLATED_SECTIONS.get(language, {})
+    translated_cards = CARDS.get(language, {})
     items, y = _release_card(language)
     navy = "#242d39"
     for number, en_heading, ru_heading, en_intro, ru_intro, cards in SECTIONS:
-        heading = ru_heading if russian else en_heading
-        intro = ru_intro if russian else en_intro
+        heading, intro = translated_sections.get(
+            number, (ru_heading, ru_intro) if russian else (en_heading, en_intro))
         items.append({"type": "rect", "x": 64, "y": y, "w": 1040, "h": 100,
                       "color": "#315775", "fill": "#1c3448", "thickness": 2})
         items.append({"type": "text", "x": 88, "y": y + 8, "w": 980,
@@ -394,12 +432,12 @@ def build_document(language):
             key, en_title, ru_title, en_body, ru_body, rows = card
             column = index % 2
             x, card_y = 64 + column * 530, column_y[column]
-            title = ru_title if russian else en_title
-            body = ru_body if russian else en_body
-            title_height = _text_height(title, 470, 18)
+            title, body = translated_cards.get(
+                key, (ru_title, ru_body) if russian else (en_title, en_body))
+            title_height = _text_height(title, 470, 18, language)
             body_y = 15 + title_height + 12
-            media_y = body_y + _text_height(body, 470, 12) + 18
-            figures, media_height = _media_layout(rows, russian)
+            media_y = body_y + _text_height(body, 470, 12, language) + 18
+            figures, media_height = _media_layout(rows, language)
             height = max(275, media_y + media_height + 32)
             items.append({"type": "rect", "x": x, "y": card_y, "w": 510, "h": height,
                           "color": "#526b83", "fill": navy, "thickness": 2,

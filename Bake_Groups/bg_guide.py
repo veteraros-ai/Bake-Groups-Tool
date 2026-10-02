@@ -13,8 +13,13 @@ import uuid
 
 try:
     from bg_guide_manual import build_document as _build_manual_document
+    from bg_guide_manual import guide_font_family as _guide_font_family
 except ImportError:
     _build_manual_document = None
+    _guide_font_family = lambda language: "Arial"
+
+from bg_guide_translations import CARDS as _TRANSLATED_CARDS, RELEASE as _TRANSLATED_RELEASE
+from bg_version import __version__ as _CURRENT_VERSION
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -81,7 +86,14 @@ TOPICS = (
 def _language():
     try:
         import bg_localization
-        return "ru" if bg_localization.current_language().lower().startswith("ru") else "en"
+        language = bg_localization.current_language().lower()
+        if language.startswith("ru"):
+            return "ru"
+        if language.startswith("ja"):
+            return "ja"
+        if language.startswith("zh"):
+            return "zh-CN"
+        return "en"
     except Exception:
         return "en"
 
@@ -157,14 +169,14 @@ def _upgrade_document(saved, language):
     heading = next((entry.get("text") for entry in bundled.get("items", [])
                     if entry.get("type") == "text" and
                     entry.get("anchor") == "release.whats_new" and
-                    re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$",
+                    re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$|^バージョン \d+\.\d+\.\d+ の新機能$|^版本 \d+\.\d+\.\d+ 的新功能$",
                              entry.get("text", ""))), None)
     if heading is None:
         return saved, False
     for index, entry in enumerate(saved.get("items", [])):
         if (entry.get("type") == "text" and
                 entry.get("anchor") == "release.whats_new" and
-                re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$",
+                re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$|^バージョン \d+\.\d+\.\d+ の新機能$|^版本 \d+\.\d+\.\d+ 的新功能$",
                          entry.get("text", ""))):
             if entry["text"] == heading:
                 return saved, False
@@ -342,8 +354,6 @@ class GuideWindow(QtWidgets.QMainWindow):
         bar = self.addToolBar("Guide")
         bar.setMovable(False)
         self.topic_box = QtWidgets.QComboBox()
-        for key, en, ru, _, _ in TOPICS:
-            self.topic_box.addItem(ru if self.language == "ru" else en, key)
         self.topic_box.activated.connect(self._choose_topic)
         bar.addWidget(self.topic_box)
         self.search_box = QtWidgets.QLineEdit()
@@ -416,6 +426,23 @@ class GuideWindow(QtWidgets.QMainWindow):
             shortcut = QShortcut(QtGui.QKeySequence(key), self)
             shortcut.activated.connect(callback)
         self._load_items(self.document_data.get("items", []))
+        self._populate_topics()
+        self._update_chrome_language()
+        self.history = [self._serialize()]
+        self.history_index = 0
+        self.go_to(initial_topic)
+
+    def _populate_topics(self):
+        self.topic_box.blockSignals(True)
+        self.topic_box.clear()
+        for key, en, ru, _, _ in TOPICS:
+            if key == "release.whats_new" and self.language in _TRANSLATED_RELEASE:
+                title = _TRANSLATED_RELEASE[self.language]["title"].format(_CURRENT_VERSION)
+            elif self.language in _TRANSLATED_CARDS:
+                title = _TRANSLATED_CARDS[self.language].get(key, (en,))[0]
+            else:
+                title = ru if self.language == "ru" else en
+            self.topic_box.addItem(title, key)
         known = {key for key, _, _, _, _ in TOPICS}
         custom_titles = {}
         for entry in self.document_data.get("items", []):
@@ -426,9 +453,36 @@ class GuideWindow(QtWidgets.QMainWindow):
             if key and key not in known:
                 self.topic_box.addItem(custom_titles.get(key) or key, key)
                 known.add(key)
+        self.topic_box.blockSignals(False)
+
+    def _update_chrome_language(self):
+        self.search_box.setPlaceholderText({
+            "ru": "Поиск", "ja": "検索", "zh-CN": "搜索"}.get(self.language, "Search"))
+        self.setWindowTitle({
+            "ru": "Bake Guide — Руководство",
+            "ja": "Bake Guide — ガイド",
+            "zh-CN": "Bake Guide — 指南"}.get(self.language, "Bake Guide"))
+
+    def switch_language(self, language):
+        """Keep the Guide open while loading the board for another language."""
+        language = ("zh-CN" if str(language).lower().startswith("zh") else
+                    "ja" if str(language).lower().startswith("ja") else
+                    "ru" if str(language).lower().startswith("ru") else "en")
+        if language == self.language:
+            return
+        topic = self.topic_box.currentData() or "overview"
+        self._commit()
+        self.language = language
+        self.path = _document_path(language)
+        self._migration_pending = False
+        self.document_data = self._read_document()
+        self._load_items(self.document_data.get("items", []))
+        self._populate_topics()
+        self.search_box.clear()
+        self._update_chrome_language()
         self.history = [self._serialize()]
         self.history_index = 0
-        self.go_to(initial_topic)
+        self.go_to(topic)
 
     def _spin(self, title, minimum, maximum):
         self.edit_bar.addWidget(QtWidgets.QLabel(title))
@@ -479,7 +533,7 @@ class GuideWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QGraphicsTextItem()
             item.setPlainText(str(entry.get("text", "")))
             item.setTextWidth(w)
-            font = QtGui.QFont("Arial", int(entry.get("size", 14)))
+            font = QtGui.QFont(_guide_font_family(self.language), int(entry.get("size", 14)))
             item.setFont(font)
             item.setDefaultTextColor(color)
             item.document().contentsChanged.connect(self._schedule_save)

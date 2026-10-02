@@ -1,8 +1,8 @@
 {
   "latest_version": "1.4.6",
-  "package_sha256": "46909f3ab860959a72de69fcce01a4a42a04574484480845b3c69bfdd2403196",
+  "package_sha256": "",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
   "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.6/Bake_Groups_1.4.6.zip",
-  "release_notes": "FASTER EXPORT & GUIDE: Standard FBX now smooths HP outside Maya and writes a compact FBX package. Marmoset Toolbag export supports bridge installation, automatic package import, and per-mesh smoothing. The Bake Guide has illustrated context help and a What's New card. Cage export starts disabled and enables after Cage creation. About and subgroup Help links are fixed."
+  "release_notes": "FASTER EXPORT & GUIDE: Standard FBX smooths HP outside Maya and writes a compact FBX package. Marmoset Toolbag export supports the bridge and per-mesh smoothing. The illustrated Bake Guide now has complete Japanese and Simplified Chinese translations and stays open while switching languages. Cage export starts disabled and enables after Cage creation. About and subgroup Help links are fixed."
 }

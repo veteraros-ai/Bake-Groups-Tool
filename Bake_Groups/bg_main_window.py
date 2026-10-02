@@ -2435,13 +2435,12 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not code:
             return
         guide = getattr(self, '_guide_window', None)
+        bg_l10n.set_language(code)
         if guide is not None:
             try:
-                guide.close()
+                guide.switch_language(code)
             except RuntimeError:
-                pass
-            self._guide_window = None
-        bg_l10n.set_language(code)
+                self._guide_window = None
         self.refresh_localized_ui()
         if self.active_root_id:
             pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
