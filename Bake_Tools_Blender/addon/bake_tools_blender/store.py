@@ -131,6 +131,7 @@ class BlenderStateStore:
             cage_wire=state.cage_wire,
             cage_status=state.cage_status,
             export_scope=state.export_scope,
+            export_target=state.export_target,
             export_include_hp=state.export_include_hp,
             export_include_lp=state.export_include_lp,
             export_include_cage=state.export_include_cage,

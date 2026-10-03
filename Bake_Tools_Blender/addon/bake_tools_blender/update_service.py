@@ -15,7 +15,7 @@ import zipfile
 PLUGIN_NAME = "Bake Groups Tool"
 AUTHOR_NAME = "Veteraros AI"
 CONTACT_EMAIL = "veteraros@gmail.com"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 GITHUB_URL = "https://github.com/veteraros-ai/Bake-Groups-Tool"
 RELEASES_URL = GITHUB_URL + "/releases"
 MANIFEST_URL = (

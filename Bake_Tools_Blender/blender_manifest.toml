@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "bake_groups_tool"
-version = "1.0.0"
+version = "1.0.1"
 name = "Bake Groups Tool"
 tagline = "Prepare HP and LP bake groups, cages and FBX exports"
 maintainer = "Veteraros AI <veteraros@gmail.com>"

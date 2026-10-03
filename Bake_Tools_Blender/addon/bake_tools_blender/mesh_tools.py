@@ -426,6 +426,23 @@ def _hierarchy_depth(obj):
     return depth
 
 
+def _unsafe_freeze_reason(obj):
+    """Reject cases where baking world coordinates cannot preserve evaluation."""
+    if obj.library is not None or (obj.data is not None and obj.data.library is not None):
+        return "linked data"
+    if obj.constraints:
+        return "constraints"
+    if obj.instance_type != "NONE":
+        return "instancing"
+    if any(modifier.type not in {"SUBSURF", "TRIANGULATE"} for modifier in obj.modifiers):
+        return "coordinate-dependent modifiers"
+    if abs(obj.matrix_world.determinant()) < 1.0e-12:
+        return "singular transform"
+    if obj.parent is not None and abs(obj.parent.matrix_world.determinant()) < 1.0e-12:
+        return "singular parent transform"
+    return ""
+
+
 def apply_check_transforms(context, state, pair):
     """Freeze checked object transforms without moving visible geometry.
 
@@ -454,12 +471,12 @@ def apply_check_transforms(context, state, pair):
     }
     freezable = {
         obj for obj in targets
-        if obj.library is None and (obj.data is None or obj.data.library is None)
+        if not _unsafe_freeze_reason(obj)
     }
     fixed = []
     skipped = []
     for obj in sorted(targets, key=_hierarchy_depth):
-        if obj.library is not None or (obj.data is not None and obj.data.library is not None):
+        if _unsafe_freeze_reason(obj):
             skipped.append(obj)
             continue
         old_world = original_world[obj]

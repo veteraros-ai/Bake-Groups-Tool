@@ -194,10 +194,44 @@ def main():
         bbox_volume=0.004, vertex_count=8, edge_count=12, face_count=6,
         vertices=((10.001, 4.9, 4.9), (10.101, 5.1, 5.1)),
     )
-    with_floaters = AnalysisService().analyze(
+    without_owner = AnalysisService().analyze(
         (parent, floater), (), AnalysisSettings(ignore_floaters=False)
     )
+    assert without_owner.floater_links == 0, "An unmatched HP must not host a floater"
+    parent_lp = MeshSnapshot(
+        key="parent_lp", name="parent_lp", bbox_min=(0.0, 0.0, 0.0),
+        bbox_max=(5.0, 5.0, 5.0), center=(2.5, 2.5, 2.5),
+        dimensions=(5.0, 5.0, 5.0), diagonal=75.0 ** 0.5,
+        bbox_volume=125.0, vertex_count=8, edge_count=12, face_count=6,
+        vertices=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)),
+    )
+    with_floaters = AnalysisService().analyze(
+        (parent, floater), (parent_lp,), AnalysisSettings(ignore_floaters=False)
+    )
     assert with_floaters.floater_links == 1
+
+    # Classification must not collapse tiny imported scenes into the old
+    # absolute 0.001-unit / 1e-6-volume defaults.
+    def scaled(mesh, factor):
+        return replace(
+            mesh,
+            bbox_min=tuple(value * factor for value in mesh.bbox_min),
+            bbox_max=tuple(value * factor for value in mesh.bbox_max),
+            center=tuple(value * factor for value in mesh.center),
+            dimensions=tuple(value * factor for value in mesh.dimensions),
+            diagonal=mesh.diagonal * factor,
+            bbox_volume=mesh.bbox_volume * factor ** 3,
+            vertices=tuple(tuple(value * factor for value in point) for point in mesh.vertices),
+        )
+    service = AnalysisService()
+    base = [([parent], []), ([floater], [])]
+    tiny = [([scaled(parent, 0.001)], []), ([scaled(floater, 0.001)], [])]
+    base_thresholds = service._size_thresholds(base)
+    tiny_thresholds = service._size_thresholds(tiny)
+    assert abs(tiny_thresholds[0] / base_thresholds[0] - 0.001) < 1e-8
+    assert [service._category(item, AnalysisSettings(), base_thresholds) for item in base] == [
+        service._category(item, AnalysisSettings(), tiny_thresholds) for item in tiny
+    ]
 
     addon.unregister()
     print("BAKE_TOOLS_ANALYSIS_SMOKE_OK")

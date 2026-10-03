@@ -98,6 +98,7 @@ class ManagerView:
     cage_wire: bool
     cage_status: str
     export_scope: str
+    export_target: str
     export_include_hp: bool
     export_include_lp: bool
     export_include_cage: bool

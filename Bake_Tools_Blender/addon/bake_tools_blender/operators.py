@@ -470,7 +470,7 @@ class BAKE_TOOLS_OT_about(bpy.types.Operator):
 
         layout = self.layout
         layout.label(text="Bake Group Manager Pro", icon="MODIFIER")
-        layout.label(text="Blender 1.0.0")
+        layout.label(text="Blender 1.0.1")
         layout.label(text="Math: {}".format(native_core.backend_name()))
         layout.separator()
         layout.label(text="Original PySide6 UI edition")
@@ -767,11 +767,7 @@ class BAKE_TOOLS_OT_subgroup_action(bpy.types.Operator):
             subgroup.use_custom_color = True
             message = "{} color updated".format(subgroup.name)
         elif self.action == "ADD_SELECTED":
-            external_side = str(self.value or "").upper()
-            moved, unchanged, skipped = ObjectRepository.assign_selected(
-                context, pair, subgroup, state,
-                external_side=external_side if external_side in {"HP", "LP"} else "",
-            )
+            moved, unchanged, skipped = ObjectRepository.assign_selected(context, pair, subgroup, state)
             ObjectRepository.sync_pair_visibility(state, pair)
             hp_count = sum(1 for _obj, side in moved if side == "HP")
             lp_count = sum(1 for _obj, side in moved if side == "LP")
@@ -804,6 +800,7 @@ _SETTING_TYPES = {
     "adjacent_link": bool, "link_vertex": int, "link_distance": float,
     "matcher_tolerance": float, "matcher_min_hp_lp": int, "matcher_mode": str,
     "strict_geo_check": bool, "cage_wire": bool, "export_scope": str,
+    "export_target": str,
     "export_include_hp": bool, "export_include_lp": bool,
     "export_include_cage": bool, "export_lp_triangulate": bool, "export_files": str,
     "export_by_material": bool, "export_lp_one_file": bool,
@@ -1209,7 +1206,12 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                         fixed, skipped = apply_check_transforms(context, state, pair)
                         message = "Apply Transforms: fixed {} object(s)".format(len(fixed))
                         if skipped:
-                            message += "; skipped {} linked object(s)".format(len(skipped))
+                            from .mesh_tools import _unsafe_freeze_reason
+                            details = ", ".join(
+                                "{} ({})".format(obj.name, _unsafe_freeze_reason(obj) or "unsupported")
+                                for obj in skipped[:8]
+                            )
+                            message += "; skipped {} unsafe object(s): {}".format(len(skipped), details)
                     elif self.action == "CHECK_REMOVE_DUPLICATES":
                         removed, kept, skipped = remove_duplicate_copies(context, state, pair)
                         message = "Duplicate mesh cleanup: removed {} extra copy/copies, kept {}".format(
@@ -1256,7 +1258,7 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
             return bpy.ops.bake_tools.assign_lp("EXEC_DEFAULT")
         if self.action.startswith("CAGE_"):
             from .cage_service import (
-                apply_display, create_cages, delete_cages, expand_cages,
+                apply_display, cage_objects, create_cages, delete_cages, expand_cages,
                 find_intersections, move_intersections, sculpt_cage, sync_visibility,
             )
             pair = active_pair(state)
@@ -1276,6 +1278,8 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                 if self.action == "CAGE_CREATE":
                     with progress_scope("Create Cage", "Duplicating LP meshes", cancellable=False) as progress:
                         created = create_cages(context, state, pair, subgroup_ids, progress)
+                    if created:
+                        state.export_include_cage = True
                     message = "Cage: created {} deflated mesh(es)".format(len(created))
                 elif self.action == "CAGE_SCULPT":
                     cage = sculpt_cage(context, state, pair, subgroup_ids)
@@ -1291,6 +1295,8 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                     message = "Cage exported: {}".format(path)
                 elif self.action == "CAGE_DELETE":
                     count = delete_cages(state, pair, subgroup_ids)
+                    if not any(cage_objects(item) for item in state.pairs):
+                        state.export_include_cage = False
                     message = "Cage: deleted {} mesh(es)".format(count)
                 elif self.action == "CAGE_EXPANSION":
                     count = expand_cages(state, pair, delta, subgroup_ids)
@@ -1345,13 +1351,10 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
         elif self.action == "EXPORT_SETTINGS":
             state.final_view = not state.final_view
             naming = None
-            grouping = None
             if state.final_view:
                 pair = active_pair(state)
                 if pair is not None:
-                    from .export_grouping import synchronize_export_grouping
                     from .export_service import finalize_subgroup_naming
-                    grouping = synchronize_export_grouping(context.scene, pair)
                     naming = finalize_subgroup_naming(pair)
             if not state.final_view and state.preview_smoothing:
                 from .smooth_preview import clear_preview
@@ -1363,10 +1366,6 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                 message += "; finalized naming: HP {}, LP {}, renamed {}".format(
                     naming["hp"], naming["lp"], naming["changed"]
                 )
-                if grouping is not None:
-                    message += "; regrouped: HP {}, LP {}, collections {}".format(
-                        grouping["hp"], grouping["lp"], grouping["collections"]
-                    )
                 if naming["unassigned_hp"]:
                     log(state, "Export naming warning: {} unassigned HP mesh(es)".format(len(naming["unassigned_hp"])))
                 if naming["unassigned_lp"]:
@@ -1400,15 +1399,25 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
             )
         elif self.action == "EXPORT":
             from .export_service import build_export_plan, execute_export, finalize_subgroup_naming, resolve_scope
-            from .export_grouping import synchronize_export_grouping
             pair = active_pair(state)
             try:
                 for export_pair in resolve_scope(state, pair):
-                    synchronize_export_grouping(context.scene, export_pair)
                     finalize_subgroup_naming(export_pair)
-                plan = build_export_plan(state, pair, state.export_directory)
-                with progress_scope("Export", "Preparing FBX export") as progress:
-                    exported = execute_export(context, plan, progress)
+                if state.export_target == "MARMOSET":
+                    from .marmoset_bridge import export_package, launch_bridge
+                    with progress_scope("Marmoset export", "Preparing package") as progress:
+                        manifest = export_package(context, state, pair, state.export_directory, progress)
+                    exported = (manifest,)
+                    plan = None
+                    if self.value == "LAUNCH":
+                        try:
+                            launch_bridge(manifest)
+                        except (OSError, RuntimeError) as exc:
+                            log(state, "Marmoset package saved; automatic opening unavailable: {}".format(exc))
+                else:
+                    plan = build_export_plan(state, pair, state.export_directory)
+                    with progress_scope("Export", "Preparing FBX export") as progress:
+                        exported = execute_export(context, plan, progress)
             except ProgressCancelled:
                 message = "Export canceled"
                 state.export_status = message
@@ -1419,8 +1428,9 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                 state.export_status = message
                 log(state, message); self.report({"ERROR"}, message)
                 return {"CANCELLED"}
-            for warning in plan.warnings:
-                log(state, "Export warning: " + warning)
+            if plan is not None:
+                for warning in plan.warnings:
+                    log(state, "Export warning: " + warning)
             message = "Exported {} file(s) to {}".format(len(exported), state.export_directory)
             state.export_status = message
         elif self.action == "FIND_SUBGROUP":

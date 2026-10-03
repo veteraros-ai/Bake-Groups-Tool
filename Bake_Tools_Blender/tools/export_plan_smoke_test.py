@@ -54,6 +54,7 @@ for index in range(2):
     cage["bake_tools_cage"] = True; cage["bake_tools_pair_id"] = pair.item_id
 
 state.active_pair = 0; state.active_pair_id = state.pairs[0].item_id
+assert state.export_include_cage is False
 state.export_directory = str(Path(bpy.app.tempdir) / "BakeToolsPlan")
 state.export_scope = "BOOK"; state.export_include_hp = True
 state.export_include_lp = True; state.export_include_cage = True

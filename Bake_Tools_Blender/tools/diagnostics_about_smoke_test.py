@@ -1,4 +1,4 @@
-"""Headless verification of 1.0.0 diagnostics and Maya-style About UI."""
+"""Headless verification of 1.0.1 diagnostics and Maya-style About UI."""
 
 from __future__ import annotations
 
@@ -45,8 +45,8 @@ def main():
             assert expected <= set(archive.namelist())
             environment = json.loads(archive.read("environment.json"))
             manifest = json.loads(archive.read("package_manifest.json"))
-            assert environment["plugin_version"] == "1.0.0"
-            assert manifest["version"] == "1.0.0"
+            assert environment["plugin_version"] == "1.0.1"
+            assert manifest["version"] == "1.0.1"
 
     from Bake_Tools_Blender.addon.bake_tools_blender.about_update import AboutUpdateDialog
     from Bake_Tools_Blender.addon.bake_tools_blender import qt_window, update_service
@@ -55,16 +55,16 @@ def main():
     dialog = AboutUpdateDialog(None, lambda value: value)
     assert dialog.windowModality() == qt_window.QtCore.Qt.WindowModality.NonModal
     assert dialog.minimumWidth() == 520 and dialog.maximumWidth() == 560
-    assert dialog.installed.text() == "1.0.0"
+    assert dialog.installed.text() == "1.0.1"
     assert dialog.check.text() == "Check"
     assert dialog.manual.text() == "Show manual"
     assert dialog.rollback.text() == "Rollback"
     assert update_service.manual_path().is_file()
     dialog._set_result({
-        "current_version": "0.9.9", "remote_version": "1.0.0",
+        "current_version": "1.0.1", "remote_version": "1.0.2",
         "is_update_available": True, "release_notes": "Test release",
     })
-    assert dialog.latest.text() == "1.0.0" and not dialog.notes.isHidden()
+    assert dialog.latest.text() == "1.0.2" and not dialog.notes.isHidden()
     dialog.close()
     addon.unregister()
     print("BAKE_TOOLS_DIAGNOSTICS_ABOUT_OK")

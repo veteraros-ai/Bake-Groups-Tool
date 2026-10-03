@@ -16,6 +16,7 @@ from .domain.analysis import AnalysisGroup, AnalysisResult, AnalysisSettings, Me
 
 
 _EPSILON = 1.0e-9
+_VOLUME_EPSILON = _EPSILON ** 3
 
 
 def _distance(a, b):
@@ -44,7 +45,7 @@ def _bbox_overlaps(a, b, padding=0.0):
 
 
 def _volume_similarity(a, b):
-    high = max(a.bbox_volume, b.bbox_volume, _EPSILON)
+    high = max(a.bbox_volume, b.bbox_volume, _VOLUME_EPSILON)
     return max(0.0, 1.0 - abs(a.bbox_volume - b.bbox_volume) / high)
 
 
@@ -148,8 +149,8 @@ class AnalysisService:
     """Create an HP membership plan without reading or modifying Blender."""
 
     def analyze(self, hp_meshes, lp_meshes, settings, reserved_names=(), progress=None):
-        hp_meshes = tuple(hp_meshes)
-        lp_meshes = tuple(lp_meshes)
+        hp_meshes = tuple(sorted(hp_meshes, key=lambda mesh: (mesh.name, mesh.key)))
+        lp_meshes = tuple(sorted(lp_meshes, key=lambda mesh: (mesh.name, mesh.key)))
         if not hp_meshes:
             raise ValueError("No unlocked HP meshes found to analyze")
 
@@ -334,13 +335,19 @@ class AnalysisService:
         sizes = [mesh.diagonal for mesh in hp_meshes if mesh.diagonal > _EPSILON]
         radius = max((median(sizes) if sizes else 1.0) * 0.02, 0.0001)
         linked = 0
-        ordered = sorted(hp_meshes, key=lambda mesh: mesh.diagonal)
+        own_lp_keys = frozenset(owner_by_hp)
+        ordered = sorted(hp_meshes, key=lambda mesh: (mesh.diagonal, mesh.name, mesh.key))
         for floater in ordered:
             if floater.key in owner_by_hp:
                 continue
             candidates = []
             for parent in hp_meshes:
                 if parent.key == floater.key or parent.diagonal < floater.diagonal * 1.2:
+                    continue
+                # An unmatched HP can itself be a floater.  Letting it host a
+                # second unmatched part creates unstable chains and false
+                # bolt/fastener clusters.  Only a part with its own LP can host.
+                if parent.key not in own_lp_keys:
                     continue
                 if parent.is_zbrush != floater.is_zbrush:
                     continue
@@ -355,8 +362,7 @@ class AnalysisService:
             if candidates:
                 parent = min(candidates, key=lambda item: (item[0], item[1], item[2].name))[2]
                 union.union(parent.key, floater.key)
-                if parent.key in owner_by_hp:
-                    owner_by_hp[floater.key] = owner_by_hp[parent.key]
+                owner_by_hp[floater.key] = owner_by_hp[parent.key]
                 linked += 1
                 debug.append("FLOATER {} -> {}".format(floater.name, parent.name))
         return linked
@@ -376,7 +382,7 @@ class AnalysisService:
         meshes, _owners = component
         _minimum, _maximum, bbox_diagonal, bbox_volume = AnalysisService._component_bbox(component)
         total_volume = sum(max(mesh.bbox_volume, 0.0) for mesh in meshes)
-        fill_ratio = total_volume / max(bbox_volume, _EPSILON)
+        fill_ratio = total_volume / max(bbox_volume, _VOLUME_EPSILON)
         scattered = len(meshes) > 1 and fill_ratio < 0.05
         if scattered:
             equivalent_volume = max((mesh.bbox_volume for mesh in meshes), default=0.0) * 2.0
@@ -390,14 +396,14 @@ class AnalysisService:
         meshes = [mesh for component in components for mesh in component[0]]
         raw_diagonals = [
             mesh.diagonal for mesh in meshes
-            if mesh.diagonal > 0.001 and mesh.bbox_volume > 1.0e-6
+            if mesh.diagonal > _EPSILON and mesh.bbox_volume > _VOLUME_EPSILON
         ]
         scene_median = median(raw_diagonals or [1.0])
         valid = sorted(
             (
                 mesh.diagonal for mesh in meshes
-                if 0.001 < mesh.diagonal <= scene_median * 10.0
-                and mesh.bbox_volume > 1.0e-6
+                if _EPSILON < mesh.diagonal <= scene_median * 10.0
+                and mesh.bbox_volume > _VOLUME_EPSILON
             ),
             reverse=True,
         )
@@ -406,7 +412,7 @@ class AnalysisService:
         for mesh in meshes:
             if (
                 not mesh.is_zbrush
-                and mesh.bbox_volume > 1.0e-6
+                and mesh.bbox_volume > _VOLUME_EPSILON
                 and mesh.diagonal <= scene_median * 10.0
             ):
                 by_vertex_count[mesh.vertex_count].append(mesh.diagonal)

@@ -43,6 +43,24 @@ from .color_preview import PALETTE
 
 QtCore, QtGui, QtWidgets = enable_pyside6()
 
+_HELP_TOPICS = {
+    "Pick HP": "pick.hp", "Pick LP": "pick.lp",
+    "Create": "chapter.create", "Create Group": "groups.create",
+    "Combine": "hp.prepare.combine", "Separate": "hp.prepare.separate",
+    "Algorithm": "hp.algorithm", "Analyze HP": "hp.analyze",
+    "Assign LP": "lp.assign", "Find Sim": "hp.find_similar",
+    "Find All": "hp.find_similar", "Find ZBrush": "hp.zbrush",
+    "Check Before Analyze": "hp.check", "HP Visible": "hp.visibility",
+    "LP Visible": "lp.visibility", "Groups Vis": "groups.visibility",
+    "Export Settings": "export.settings", "Smooth View": "export.smooth",
+    "Export": "export.run", "LP Triangle": "export.settings",
+    "Create Cage": "cage.controls", "Delete Cage": "cage.controls",
+    "Toggle visibility": "groups.row", "Add selected mesh": "groups.row",
+    "Lock subgroup": "groups.row", "Unlock subgroup": "groups.row",
+    "Language": "guide.language", "About": "guide.language",
+    "Help": "guide.help",
+}
+
 
 def manager_is_visible():
     return _qt_window_manager.is_primary_visible()
@@ -114,6 +132,10 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self._responsive_narrow = False
         self._responsive_page = "main"
         self._snapshot = None
+        self._guide_window = None
+        self._help_mode = False
+        self._help_release_pending = False
+        self._help_pending_topic = None
         self._localized_language = ""
         self._dirty = True
         self._section_signatures = {}
@@ -202,6 +224,8 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
     def _button(self, text, callback=None, object_name=None, icon=None):
         button = QtWidgets.QPushButton(text)
         button.setProperty("bt_i18n_key", text)
+        if text in _HELP_TOPICS:
+            button.setProperty("bt_help_topic", _HELP_TOPICS[text])
         if object_name:
             button.setObjectName(object_name)
         if icon:
@@ -216,6 +240,8 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         button.setObjectName(object_name)
         button.setToolTip(tooltip)
         button.setProperty("bt_i18n_tooltip_key", tooltip)
+        if tooltip in _HELP_TOPICS:
+            button.setProperty("bt_help_topic", _HELP_TOPICS[tooltip])
         button.setIcon(QtGui.QIcon(_asset_path(icon)))
         button.setIconSize(QtCore.QSize(29, 29))
         button.setFixedSize(42, 42)
@@ -226,6 +252,8 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         button = QtWidgets.QToolButton()
         button.setToolTip(tooltip)
         button.setProperty("bt_i18n_tooltip_key", tooltip)
+        if tooltip in _HELP_TOPICS:
+            button.setProperty("bt_help_topic", _HELP_TOPICS[tooltip])
         button.setIcon(QtGui.QIcon(_asset_path(asset)))
         button.setIconSize(QtCore.QSize(icon_size, icon_size))
         button.setFixedSize(size, size)
@@ -494,6 +522,13 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             self._window_settings.setValue("windowGeometry", self.saveGeometry())
 
     def closeEvent(self, event):
+        self.cancel_help_mode()
+        if self._guide_window is not None:
+            try:
+                self._guide_window.close()
+            except RuntimeError:
+                pass
+            self._guide_window = None
         self._window_settings.setValue("windowGeometry", self.saveGeometry())
         self._window_settings.sync()
         super().closeEvent(event)
@@ -609,6 +644,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         # can infer its Maya help key, so keep the original Maya key explicitly.
         create.setToolTip(" Create Pair from Picked")
         create.setProperty("bt_i18n_tooltip_key", " Create Pair from Picked")
+        create.setProperty("bt_help_topic", "chapter.create")
         create.setIconSize(QtCore.QSize(52, 52))
         create.setFixedSize(76, 76)
         grid.addWidget(create, 0, 2, 2, 1)
@@ -729,6 +765,8 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         checks = self._compact(QtWidgets.QVBoxLayout(), (0, 0, 0, 0), 0)
         self.color_hp = QtWidgets.QCheckBox("Color HP")
         self.keep_hp = QtWidgets.QCheckBox("Keep HP")
+        self.color_hp.setProperty("bt_help_topic", "hp.color")
+        self.keep_hp.setProperty("bt_help_topic", "hp.keep")
         self.color_hp.toggled.connect(partial(self._setting, "color_subgroups"))
         self.keep_hp.toggled.connect(partial(self._setting, "keep_hp_structure"))
         checks.addWidget(self.color_hp); checks.addWidget(self.keep_hp)
@@ -996,6 +1034,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         header = QtWidgets.QWidget()
         header_row = self._compact(QtWidgets.QHBoxLayout(header), (0, 0, 0, 0), 2)
         self.algorithm_button = self._button("▶  Algorithm", self._toggle_algorithm)
+        self.algorithm_button.setProperty("bt_help_topic", "hp.algorithm")
         header_row.addWidget(self.algorithm_button)
         self.group_name = QtWidgets.QLineEdit(); self.group_name.setPlaceholderText("Group name")
         self.group_name.editingFinished.connect(
@@ -1066,6 +1105,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self.subgroup_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.subgroup_scroll.setMinimumHeight(220)
         self.subgroup_body = QtWidgets.QWidget()
+        self.subgroup_body.setProperty("bt_help_topic", "groups.row")
         self.subgroup_body.setMouseTracking(True)
         self.subgroup_body.installEventFilter(self)
         self.subgroup_layout = self._compact(QtWidgets.QVBoxLayout(self.subgroup_body), (3, 3, 3, 3), 3)
@@ -1117,12 +1157,14 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self.toc_panel = self._build_toc()
         self.cage_panel = self._build_cage_panel()
         self.export_panel = self._build_export_panel()
-        for widget in (self.matcher_panel, self.toc_panel, self.cage_panel, self.export_panel):
+        for widget in (self.toc_panel, self.cage_panel, self.export_panel):
             self.right_splitter.addWidget(widget)
         parent.addWidget(self.right_splitter, 1)
 
         session = self._compact(QtWidgets.QHBoxLayout(), (0, 0, 0, 0), 2)
-        session.addWidget(self._button("Save", lambda: self.controller.action("SAVE_SESSION")))
+        self.help_button = self._button("Help", self.toggle_help_mode)
+        self.help_button.setToolTip("Select a control to open its guide. Esc cancels.")
+        session.addWidget(self.help_button)
         self.language_button = self._button("Language")
         self.language_button.clicked.connect(self._show_language_menu)
         self.language_button.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1130,7 +1172,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         session.addWidget(self.language_button)
         session.addWidget(self._button("About", self._show_about))
         parent.addLayout(session)
-        self.right_splitter.setSizes([430, 380, 0, 0])
+        self.right_splitter.setSizes([380, 0, 0])
 
     def _build_matcher(self):
         group = QtWidgets.QGroupBox("HP -> LP Matcher")
@@ -1179,6 +1221,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         group = QtWidgets.QGroupBox("TABLE OF CONTENTS")
         layout = self._compact(QtWidgets.QVBoxLayout(group), (3, 3, 3, 3), 1)
         self.toc_tree = QtWidgets.QTreeWidget(); self.toc_tree.setHeaderHidden(True); self.toc_tree.setColumnCount(2)
+        self.toc_tree.setProperty("bt_help_topic", "toc")
         self.toc_tree.setIndentation(12); self.toc_tree.setRootIsDecorated(True)
         header = self.toc_tree.header(); header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -1249,20 +1292,37 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
 
     def _build_export_panel(self):
         panel = QtWidgets.QWidget()
+        panel.setProperty("bt_help_topic", "export.settings")
         layout = self._compact(QtWidgets.QVBoxLayout(panel), (3, 3, 3, 3), 2)
         header = QtWidgets.QLabel("EXPORT"); header.setObjectName("exportHeader"); header.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
         self.export_scope = QtWidgets.QComboBox(); self.export_scope.setObjectName("scope")
+        self.export_scope.setProperty("bt_help_topic", "export.scope")
         for text, data in (("Active Chapter", "CHAPTER"), ("Active Book", "BOOK"), ("All Books", "ALL")):
             self.export_scope.addItem(text, data)
         self.export_scope.currentIndexChanged.connect(self._export_scope_changed)
         layout.addWidget(self.export_scope)
-        layout.addWidget(QtWidgets.QLabel("Include"))
+        target_label = QtWidgets.QLabel("Target")
+        target_label.setProperty("bt_help_topic", "export.target")
+        layout.addWidget(target_label)
+        self.export_target = QtWidgets.QComboBox()
+        self.export_target.addItem("Standard FBX", "STANDARD_FBX")
+        self.export_target.addItem("Marmoset Toolbag", "MARMOSET")
+        self.export_target.currentIndexChanged.connect(
+            lambda: self._setting("export_target", self.export_target.currentData()))
+        self.export_target.setProperty("bt_help_topic", "export.target")
+        layout.addWidget(self.export_target)
+        include_label = QtWidgets.QLabel("Include")
+        include_label.setProperty("bt_help_topic", "export.files")
+        layout.addWidget(include_label)
         include = self._compact(QtWidgets.QHBoxLayout(), (0, 0, 0, 0), 3)
         self.export_hp = QtWidgets.QCheckBox("HP")
         self.export_lp = QtWidgets.QCheckBox("LP")
         self.export_lp_triangle = QtWidgets.QCheckBox("LP Triangle")
         self.export_cage = QtWidgets.QCheckBox("Cage")
+        for control in (self.export_hp, self.export_lp, self.export_lp_triangle,
+                        self.export_cage):
+            control.setProperty("bt_help_topic", "export.files")
         self.export_hp.toggled.connect(partial(self._setting, "export_include_hp"))
         self.export_lp.toggled.connect(partial(self._setting, "export_include_lp"))
         self.export_lp_triangle.toggled.connect(partial(self._setting, "export_lp_triangulate"))
@@ -1270,20 +1330,28 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self.export_lp_triangle.setToolTip("Temporarily triangulate LP meshes during FBX export")
         self.export_cage.setToolTip("Include a separately exported Cage FBX when a Cage exists")
         include.addWidget(self.export_hp); include.addWidget(self.export_lp); include.addWidget(self.export_lp_triangle); include.addStretch(1)
-        layout.addLayout(include); layout.addWidget(QtWidgets.QLabel("Files"))
+        layout.addLayout(include)
+        files_label = QtWidgets.QLabel("Files")
+        files_label.setProperty("bt_help_topic", "export.files")
+        layout.addWidget(files_label)
         files = self._compact(QtWidgets.QHBoxLayout(), (0, 0, 0, 0), 3)
         self.export_separate = QtWidgets.QRadioButton("Separate"); self.export_one = QtWidgets.QRadioButton("HP+LP one file")
+        self.export_separate.setProperty("bt_help_topic", "export.files")
+        self.export_one.setProperty("bt_help_topic", "export.files")
         self.export_separate.toggled.connect(lambda checked: checked and self._setting("export_files", "SEPARATE"))
         self.export_one.toggled.connect(lambda checked: checked and self._setting("export_files", "ONE"))
         files.addWidget(self.export_separate); files.addWidget(self.export_one); files.addStretch(1); layout.addLayout(files)
         flags = self._compact(QtWidgets.QHBoxLayout(), (0, 0, 0, 0), 3)
         self.export_by_material = QtWidgets.QCheckBox("By material")
         self.export_lp_one = QtWidgets.QCheckBox("LP in one file")
+        self.export_by_material.setProperty("bt_help_topic", "export.files")
+        self.export_lp_one.setProperty("bt_help_topic", "export.files")
         self.export_by_material.toggled.connect(partial(self._setting, "export_by_material"))
         self.export_lp_one.toggled.connect(partial(self._setting, "export_lp_one_file"))
         flags.addWidget(self.export_cage); flags.addWidget(self.export_by_material); flags.addWidget(self.export_lp_one); flags.addStretch(1); layout.addLayout(flags)
         path_row = self._compact(QtWidgets.QHBoxLayout(), (0, 0, 0, 0), 2)
         self.export_path = QtWidgets.QLineEdit()
+        self.export_path.setProperty("bt_help_topic", "export.run")
         self.export_path.setClearButtonEnabled(True)
         self.export_path.setPlaceholderText("Select Export Directory")
         self.export_path.editingFinished.connect(self._store_export_path)
@@ -1401,6 +1469,10 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         if not directory:
             return
         self.controller.set_setting("export_directory", directory)
+        state = self.controller.store.settings()
+        if state is not None and state.export_target == "MARMOSET":
+            self._export_marmoset()
+            return
         try:
             from .export_service import build_export_plan
             state = self.controller.store.settings()
@@ -1414,6 +1486,38 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             self._confirm("Export preflight", message, lambda: self.controller.action("EXPORT"))
         else:
             self.controller.action("EXPORT")
+
+    def _export_marmoset(self):
+        from .marmoset_bridge import bridge_status, install_bridge
+        try:
+            status = bridge_status()
+        except (OSError, RuntimeError) as exc:
+            self._warning("Marmoset bridge", str(exc))
+            return
+        if status == "current":
+            self.controller.action("EXPORT", "LAUNCH")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(self._tr("Marmoset bridge setup"))
+        box.setText(self._tr("Bake Groups Bridge is {}. Install it before export?".format(status)))
+        install_button = box.addButton(self._tr("Install Bridge"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        package_button = box.addButton(self._tr("Export Package Only"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(self._tr("Cancel"), QtWidgets.QMessageBox.ButtonRole.RejectRole)
+
+        def complete(button):
+            if button is install_button:
+                try:
+                    install_bridge()
+                except (OSError, RuntimeError) as exc:
+                    self._warning("Marmoset bridge", str(exc))
+                    return
+                self.controller.action("EXPORT", "LAUNCH")
+            elif button is package_button:
+                self.controller.action("EXPORT")
+
+        box.buttonClicked.connect(
+            lambda button: self._defer_dialog_action(lambda chosen=button: complete(chosen)))
+        self._open_nonblocking(box)
 
     def _set_combo(self, widget, value):
         index = widget.findData(value)
@@ -1434,6 +1538,11 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         if snapshot is None or (not force and snapshot == self._snapshot):
             return
         self._snapshot = snapshot
+        if self._guide_window is not None:
+            try:
+                self._guide_window.switch_language(i18n.canonical_language(snapshot.language))
+            except RuntimeError:
+                self._guide_window = None
         active = snapshot.active_chapter
         self.hp_edit.setText(snapshot.hp_object)
         self.lp_edit.setText(snapshot.lp_object)
@@ -1513,7 +1622,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
     def _refresh_mode(self, final_view, cage_wire):
         self.normal_actions.setVisible(not final_view); self.final_actions.setVisible(final_view)
         self.subgroups_title.setVisible(not final_view)
-        self.matcher_panel.setVisible(not final_view)
+        self.matcher_panel.setVisible(False)
         self.cage_panel.setVisible(final_view); self.export_panel.setVisible(final_view)
         self.cage_display.setIcon(QtGui.QIcon(_asset_path("Cage_Solid_Gray.png" if cage_wire else "Cage_Wireframe.png")))
         cage_tip = "Display: Solid gray" if cage_wire else "Display: Wireframe"
@@ -1523,15 +1632,20 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         if self._section_signatures.get("mode") != mode_sig:
             self._section_signatures["mode"] = mode_sig
             QtCore.QTimer.singleShot(0, lambda: self.right_splitter.setSizes(
-                [0, 360, 260, 190] if final_view else [430, 380, 0, 0]
+                [360, 260, 190] if final_view else [380, 0, 0]
             ))
 
     def _refresh_export_controls(self, snapshot):
         self._set_combo(self.export_scope, snapshot.export_scope)
+        self._set_combo(self.export_target, snapshot.export_target)
         self._set_checked(self.export_hp, snapshot.export_include_hp); self._set_checked(self.export_lp, snapshot.export_include_lp)
         self._set_checked(self.export_lp_triangle, snapshot.export_lp_triangulate)
         self._set_checked(self.export_cage, snapshot.export_include_cage and snapshot.export_has_cage)
-        self.export_cage.setEnabled(snapshot.export_has_cage)
+        is_standard = snapshot.export_target == "STANDARD_FBX"
+        self.export_cage.setEnabled(snapshot.export_has_cage and is_standard)
+        for control in (self.export_separate, self.export_one,
+                        self.export_by_material, self.export_lp_one):
+            control.setEnabled(is_standard)
         self.cage_export_button.setEnabled(snapshot.active_has_cage)
         self._set_checked(self.export_separate, snapshot.export_files == "SEPARATE")
         self._set_checked(self.export_one, snapshot.export_files == "ONE")
@@ -1594,10 +1708,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         name.doubleClicked.connect(lambda: self.controller.subgroup_action("SELECT_MESHES", subgroup.item_id))
         name.setStyleSheet(self._subgroup_name_style(subgroup, active)); name.setMinimumWidth(48)
         name.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed); layout.addWidget(name, 1)
-        add = self._icon_button(
-            "Plus.png", "Add selected mesh",
-            lambda: self._add_selected_to_subgroup(subgroup.item_id), "#315c3a"
-        )
+        add = self._icon_button("Plus.png", "Add selected mesh", lambda: self.controller.subgroup_action("ADD_SELECTED", subgroup.item_id), "#315c3a")
         layout.addWidget(add)
         lock = self._icon_button(
             "Look_Icon_Button.png" if subgroup.locked else "Unlook_Icon_Button.png",
@@ -1703,6 +1814,26 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self._refresh_final_selection_visuals()
 
     def eventFilter(self, watched, event):
+        if self._help_mode:
+            event_type = event.type()
+            if event_type == QtCore.QEvent.Type.KeyPress and event.key() == QtCore.Qt.Key.Key_Escape:
+                self.cancel_help_mode()
+                return True
+            if event_type == QtCore.QEvent.Type.MouseButtonRelease and self._help_release_pending:
+                topic = self._help_pending_topic or "overview"
+                self.cancel_help_mode()
+                QtCore.QTimer.singleShot(0, lambda value=topic: self.show_guide(value))
+                return True
+            if (event_type == QtCore.QEvent.Type.MouseButtonPress and
+                    event.button() == QtCore.Qt.MouseButton.LeftButton and
+                    isinstance(watched, QtWidgets.QWidget)):
+                widget = watched
+                while widget is not None and widget is not self:
+                    widget = widget.parentWidget()
+                if widget is self:
+                    self._help_pending_topic = self._help_topic_for(watched)
+                    self._help_release_pending = True
+                    return True
         if watched is self.subgroup_body and self._snapshot and self._snapshot.final_view:
             event_type = event.type()
             if event_type == QtCore.QEvent.Type.MouseButtonPress and event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -1733,6 +1864,63 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
                     self._select_final_rows_in_rect(rect, additive)
                 return True
         return super().eventFilter(watched, event)
+
+    def _help_topic_for(self, widget):
+        while isinstance(widget, QtWidgets.QWidget):
+            topic = widget.property("bt_help_topic")
+            if topic:
+                return str(topic)
+            if widget is self:
+                break
+            widget = widget.parentWidget()
+        return "overview"
+
+    def toggle_help_mode(self):
+        if self._help_mode:
+            self.cancel_help_mode()
+            return
+        self._help_mode = True
+        self.help_button.setText("?  " + self._tr("Help"))
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            app.setOverrideCursor(QtCore.Qt.CursorShape.WhatsThisCursor)
+
+    def cancel_help_mode(self):
+        if not self._help_mode:
+            return
+        self._help_mode = False
+        self._help_release_pending = False
+        self._help_pending_topic = None
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+            app.restoreOverrideCursor()
+        self.help_button.setText(self._tr("Help"))
+
+    def show_guide(self, topic="overview"):
+        from .guide_window import GuideWindow
+        try:
+            guide = self._guide_window
+            if guide is not None:
+                guide.isVisible()
+        except RuntimeError:
+            guide = None
+        if guide is None:
+            guide = GuideWindow(parent=self, initial_topic=topic)
+            self._guide_window = guide
+            guide.destroyed.connect(lambda *_args: setattr(self, "_guide_window", None))
+        else:
+            guide.go_to(topic)
+        return guide
+
+    def show_release_card_if_new(self):
+        from .guide_window import _CURRENT_VERSION, mark_whats_new_seen, whats_new_due
+        if not self.isVisible() or not whats_new_due(_CURRENT_VERSION):
+            return False
+        self.show_guide("release.whats_new")
+        mark_whats_new_seen(_CURRENT_VERSION)
+        return True
 
     def _subgroup_rgb(self, subgroup):
         if subgroup.custom_color is not None:
@@ -1897,7 +2085,6 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         subgroup_id = subgroup_id or self._selected_subgroup_id()
         menu = QtWidgets.QMenu(self); self._add_subgroup_menu_action(menu)
         if subgroup_id:
-            menu.addAction("Add selected meshes", lambda: self._add_selected_to_subgroup(subgroup_id))
             menu.addAction("Rename subgroup", lambda: self._rename_subgroup(subgroup_id))
             menu.addAction("Select subgroup meshes", lambda: self.controller.subgroup_action("SELECT_MESHES", subgroup_id))
             menu.addAction("Select Color", lambda: self._choose_subgroup_color(subgroup_id)); menu.addSeparator()
@@ -1905,42 +2092,6 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             menu.addAction("Group search by mesh", lambda: self.controller.action("FIND_SUBGROUP")); menu.addSeparator()
             menu.addAction("Delete", lambda: self._confirm_delete_subgroup(subgroup_id, "subgroup"))
         self._popup_menu(menu, global_pos)
-
-    def _add_selected_to_subgroup(self, subgroup_id):
-        """Add selection, asking for a side only for meshes outside the chapter."""
-        count, needs_side = self.controller.subgroup_add_selection_status(subgroup_id)
-        if not count or not needs_side:
-            self.controller.subgroup_action("ADD_SELECTED", subgroup_id)
-            return
-
-        hp_visible = bool(self._snapshot and self._snapshot.hp_visible)
-        lp_visible = bool(self._snapshot and self._snapshot.lp_visible)
-        if hp_visible != lp_visible:
-            side = "HP" if hp_visible else "LP"
-            self.controller.subgroup_action("ADD_SELECTED", subgroup_id, side)
-            return
-
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(self._tr("Add Meshes to Subgroup"))
-        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
-        box.setText(self._tr(
-            "The selection contains meshes outside the active chapter. "
-            "Which section should they be added to?"
-        ))
-        hp_button = box.addButton("HP", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        lp_button = box.addButton("LP", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-
-        def finished(_result):
-            clicked = box.clickedButton()
-            side = "HP" if clicked == hp_button else "LP" if clicked == lp_button else ""
-            if side:
-                self._defer_dialog_action(
-                    lambda: self.controller.subgroup_action("ADD_SELECTED", subgroup_id, side)
-                )
-
-        box.finished.connect(finished)
-        self._open_nonblocking(box)
 
     def _show_final_subgroup_menu(self, global_pos, subgroup_id):
         menu = QtWidgets.QMenu(self)
@@ -2095,9 +2246,9 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self._save_diagnostics_dialog("SUPPORT")
 
     def _show_about(self):
-        from .release_channel import create_about_dialog
+        from .about_update import AboutUpdateDialog
 
-        self._open_nonblocking(create_about_dialog(self, self._tr))
+        self._open_nonblocking(AboutUpdateDialog(self, self._tr))
 
 
 def notify_store_changed():
@@ -2193,10 +2344,57 @@ def show_manager(context=None):
     window._sync_pseudo_dock()
     window.raise_()
     _qt_window_manager.start_pump(_pump_events, first_interval=0.02)
-    from .release_channel import schedule_post_show
-
-    schedule_post_show(window)
+    QtCore.QTimer.singleShot(250, lambda: _offer_telemetry_consent(window))
+    if not bpy.app.background:
+        QtCore.QTimer.singleShot(600, window.show_release_card_if_new)
     return window
+
+
+def _offer_telemetry_consent(window):
+    """Ask once, non-modally, before the Blender port sends any telemetry."""
+    from . import telemetry
+
+    if telemetry.consent_value() is not None:
+        if telemetry.consent_value() is True:
+            try:
+                state = getattr(bpy.context.scene, "bake_tools_settings", None)
+                telemetry.report_async(getattr(state, "language", ""))
+            except (AttributeError, RuntimeError):
+                pass
+        return
+    existing = getattr(window, "_telemetry_consent_box", None)
+    if existing is not None and existing.isVisible():
+        return
+    box = QtWidgets.QMessageBox(window)
+    box.setWindowTitle(window._tr("Anonymous usage statistics"))
+    box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+    box.setText(window._tr("Help improve Bake Groups Tool?"))
+    box.setInformativeText(window._tr(
+        "Allow one installation/update event per version. The event contains a random client ID, "
+        "product and host versions, interface language, and platform. It never contains scene data, "
+        "names, or file paths. You can change this later in About."
+    ))
+    box.setStandardButtons(
+        QtWidgets.QMessageBox.StandardButton.Yes |
+        QtWidgets.QMessageBox.StandardButton.No
+    )
+    box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+    box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+    window._telemetry_consent_box = box
+
+    def finished(result):
+        enabled = result == int(QtWidgets.QMessageBox.StandardButton.Yes)
+        telemetry.set_consent(enabled)
+        if enabled:
+            try:
+                state = getattr(bpy.context.scene, "bake_tools_settings", None)
+                telemetry.report_async(getattr(state, "language", ""))
+            except (AttributeError, RuntimeError):
+                pass
+        window._telemetry_consent_box = None
+
+    box.finished.connect(finished)
+    box.open()
 
 
 def hide_manager():

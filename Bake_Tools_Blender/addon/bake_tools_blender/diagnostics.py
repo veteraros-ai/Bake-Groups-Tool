@@ -14,7 +14,7 @@ import bpy
 from . import native_core
 
 
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.0.1"
 PLUGIN_NAME = "Bake Groups Tool"
 AUTHOR_NAME = "Veteraros AI"
 

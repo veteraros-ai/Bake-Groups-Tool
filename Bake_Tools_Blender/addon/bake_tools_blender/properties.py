@@ -153,6 +153,13 @@ def _export_files_items(_self, _context):
     )
 
 
+def _export_target_items(_self, _context):
+    return (
+        ("STANDARD_FBX", "Standard FBX", "Export FBX with external HP subdivision when supported"),
+        ("MARMOSET", "Marmoset Toolbag", "Export a package for Bake Groups Bridge"),
+    )
+
+
 class BakeToolsSettings(bpy.types.PropertyGroup):
     hp_object: StringProperty(name="Picked HP", default="")
     lp_object: StringProperty(name="Picked LP", default="")
@@ -220,9 +227,10 @@ class BakeToolsSettings(bpy.types.PropertyGroup):
     strict_geo_check: BoolProperty(name="Strict Geo Check", default=True)
 
     export_scope: EnumProperty(name="Export Scope", items=_export_scope_items, default=0)
+    export_target: EnumProperty(name="Target", items=_export_target_items, default=0)
     export_include_hp: BoolProperty(name="Include HP", default=True)
     export_include_lp: BoolProperty(name="Include LP", default=True)
-    export_include_cage: BoolProperty(name="Include Cage", default=True)
+    export_include_cage: BoolProperty(name="Include Cage", default=False)
     export_lp_triangulate: BoolProperty(
         name="LP Triangle",
         description="Temporarily triangulate LP meshes during FBX export",

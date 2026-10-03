@@ -40,14 +40,14 @@ The package includes `bg_math_core.pyd` builds for:
 - Maya 2026
 - Maya 2027
 
-## Blender 1.0.0
+## Blender 1.0.1
 
-The first public Blender build supports Blender 4.2+ on Windows x64. Install the
-published `Bake_Tools_Blender-1.0.0-win64.zip` from Blender Preferences without
+The Blender build supports Blender 4.2+ on Windows x64. Install the
+published `Bake_Tools_Blender-1.0.1-win64.zip` from Blender Preferences without
 unpacking it. The release archive bundles the matching PySide6 Essentials and
 shiboken6 runtime; the large binary runtime is intentionally not committed to Git.
-The artist-authored visual manual is bundled as
-`Bake_Tools_Blender/docs/Manual.pur` and opens in PureRef from About.
+The built-in Bake Guide opens from Help. The original artist-authored PureRef
+manual remains bundled as `Bake_Tools_Blender/docs/Manual.pur` and opens from About.
 
 Blender telemetry is disabled until the artist explicitly opts in. It sends one
 pseudonymous installation/update event per version and never sends scene data,

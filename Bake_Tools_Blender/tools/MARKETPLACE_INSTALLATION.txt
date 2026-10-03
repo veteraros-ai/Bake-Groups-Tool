@@ -1,4 +1,4 @@
-BAKE GROUPS TOOL FOR BLENDER 1.0.0
+BAKE GROUPS TOOL FOR BLENDER 1.0.1
 INSTALLATION / УСТАНОВКА
 
 РУССКИЙ
@@ -25,9 +25,9 @@ INSTALLATION / УСТАНОВКА
 3. Перезапустите Blender и включите Bake Groups Tool в Preferences -> Add-ons.
 
 Дополнительная установка Python или PySide6 не требуется — нужный runtime уже
-входит в комплект. Основной визуальный мануал находится в
-Bake_Tools_Blender\docs\Manual.pur и открывается в PureRef. Кнопка Show manual
-в окне About открывает этот файл.
+входит в комплект. Встроенный Bake Guide открывается через кнопку Help.
+Исходный мануал PureRef находится в Bake_Tools_Blender\docs\Manual.pur;
+кнопка Show manual в окне About открывает этот файл.
 
 При первом запуске Blender отдельно спросит разрешение на анонимную статистику.
 Отказ не ограничивает функциональность и позже меняется в окне About.
@@ -57,8 +57,9 @@ Option 2 — manual installation:
 3. Restart Blender and enable Bake Groups Tool in Preferences -> Add-ons.
 
 No separate Python or PySide6 installation is required; the required runtime is
-bundled. The main visual manual is Bake_Tools_Blender\docs\Manual.pur and opens
-in PureRef. The Show manual button in About opens this file.
+bundled. Open the built-in Bake Guide with the Help button. The original
+PureRef manual is at Bake_Tools_Blender\docs\Manual.pur; Show manual in About
+opens that file.
 
 On first launch Blender separately asks for anonymous telemetry consent. Declining
 does not limit any functionality and the setting can be changed later in About.
