@@ -1,6 +1,22 @@
 {
     "language":  "en",
     "texts":  {
+                  "Freeze LP normals": "Freeze LP normals",
+                  "Freeze LP normals tooltip": "Preserve the existing LP normals on temporary export copies before triangulation. Original meshes are not modified.",
+                  "Marmoset connection":  "Marmoset connection",
+                  "Marmoset meshes updated: {name}":  "Marmoset meshes updated: {name}",
+                  "Marmoset sync failed: {error}":  "Marmoset sync failed: {error}",
+                  "Import into current scene":  "Import into current scene",
+                  "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.":  "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.",
+                  "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.":  "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.",
+                  "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.":  "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.",
+                  "Several Toolbag sessions are open. Leave only one session with this project open.":  "Several Toolbag sessions are open. Leave only one session with this project open.",
+                  "This package is not loaded in the current Marmoset scene. Import it into this scene?":  "This package is not loaded in the current Marmoset scene. Import it into this scene?",
+                  "Exclude from export":  "Exclude from export",
+                  "Include in export":  "Include in export",
+                  "Excluded from export":  "Excluded from export",
+                  "Chapter '{name}' is excluded from export.":  "Chapter '{name}' is excluded from export.",
+                  "Nothing to export in this scope.":  "Nothing to export in this scope.",
                   "Target":  "Target",
                   "Select Marmoset Package Folder":  "Select Marmoset Package Folder",
                   "Preparing Marmoset package...":  "Preparing Marmoset package...",
@@ -443,6 +459,10 @@
                      "Marmoset launch failed: {error}": "Package exported, but Toolbag could not be opened: {error}",
                      "External HP OBJ helper missing":  "External OBJ export helper is missing. Reinstall or restore Bake Groups.",
                      "Converting HP to OBJ...":  "Converting HP to OBJ...",
-                     "External HP OBJ export failed: {error}":  "External HP OBJ export failed: {error}"
+                     "External HP OBJ export failed: {error}":  "External HP OBJ export failed: {error}",
+                     "Cage scan incomplete.": "Cage scan incomplete.",
+                     "No detected intersections. Check coplanar contacts manually.": "No detected intersections. Check coplanar contacts manually.",
+                     "Cage or HP changed. Run Find intersections again.": "Cage or HP changed. Run Find intersections again.",
+                     "Cage with multi-material LP requires Separate files.": "Cage with multi-material LP requires Separate files."
                  }
 }

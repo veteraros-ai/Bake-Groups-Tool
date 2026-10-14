@@ -79,6 +79,13 @@ HELP_TARGETS = {
 
 
 class TOCNameDelegate(QtWidgets.QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super(TOCNameDelegate, self).initStyleOption(option, index)
+        foreground = index.data(QtCore.Qt.ForegroundRole)
+        if foreground and foreground.color() == QtGui.QColor("#ffd54f"):
+            # An excluded chapter must remain yellow even while selected.
+            option.palette.setColor(QtGui.QPalette.HighlightedText, foreground.color())
+
     def createEditor(self, parent, option, index):
         editor = super(TOCNameDelegate, self).createEditor(parent, option, index)
         if isinstance(editor, QtWidgets.QLineEdit):
@@ -516,6 +523,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if app is not None:
             app.setOverrideCursor(QtCore.Qt.WhatsThisCursor)
             self._help_cursor_set = True
+        # Explain the question-mark mode immediately; keep it armed so the
+        # next click on a plugin control opens help, not the control's action.
+        self.show_guide('guide.help')
 
     def cancel_help_mode(self):
         self._help_mode = False
@@ -972,7 +982,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             QTreeWidget { background-color: #1e1e1e; border: 1px solid #333333; border-radius: 4px; outline: 0; }
             QTreeWidget::item { padding: 4px 2px; margin-bottom: 2px; border-radius: 3px; }
             QTreeWidget::item:hover { background-color: #3e3e3e; }
-            QTreeWidget::item:selected { background-color: #3a5375; color: #ffffff; }
+            QTreeWidget::item:selected { background-color: #3a5375; }
             QScrollArea { border: none; background-color: transparent; }
             QSplitter::handle { background: #333333; }
             QSplitter::handle:horizontal { width: 2px; }
@@ -2346,6 +2356,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not self._stop_update_worker_for_close():
             self._is_closing = False
             return False
+        finish_cage = getattr(self, '_cage_finish_edits', None)
+        if finish_cage:
+            finish_cage()
         self.cancel_help_mode()
         guide = getattr(self, '_guide_window', None)
         if guide is not None:
@@ -3129,32 +3142,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.set_localized_button_state(btn, "{} Visible".format(type_str) if state else "{} Hidden".format(type_str))
         btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
         if parent_node and cmds.objExists(parent_node):
+            # Root visibility gates the whole side without changing the user's
+            # subgroup eyes or individually hidden mesh transforms.
             cmds.setAttr("{}.visibility".format(parent_node), state)
-            # Turning a root Visible must actually reveal its geometry: mesh or
-            # subgroup transforms hidden at their OWN level stay hidden because
-            # the root toggle can't reach them. So on show, if anything under the
-            # root is hidden, un-hide the whole subtree (all meshes in all
-            # subgroups) and refresh the panel so the per-subgroup buttons match.
-            if state and self._reveal_hidden_transforms_under(parent_node):
-                self.refresh_left_panel()
-
-    def _reveal_hidden_transforms_under(self, root_node):
-        """Un-hide every transform under ``root_node`` that is hidden at its own
-        level - individual mesh transforms and subgroup transforms that the
-        root-visibility toggle can't reach. One scan of the subtree; only the
-        nodes that are actually hidden get a setAttr. Returns True if anything
-        was revealed (so the caller can refresh dependent UI)."""
-        if not root_node or not cmds.objExists(root_node):
-            return False
-        revealed = False
-        for node in cmds.listRelatives(root_node, allDescendents=True, type='transform', fullPath=True) or []:
-            try:
-                if cmds.objExists(node) and not cmds.getAttr(node + ".visibility"):
-                    cmds.setAttr(node + ".visibility", True)
-                    revealed = True
-            except Exception:
-                pass  # visibility locked/connected - skip, don't abort the pass
-        return revealed
 
     def _hide_cage_root_if_not_export(self):
         """The whole Cage_BG hierarchy is only meant to be seen inside Export

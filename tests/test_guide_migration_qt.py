@@ -64,7 +64,7 @@ def run():
         assert not changed and again == migrated
 
         # A saved 1.4.5 board has the current manual schema, but its release
-        # heading must still follow the installed plugin version.
+        # heading must still follow the bundled release range.
         previous = json.loads(json.dumps(bundled))
         release_title = next(entry for entry in previous["items"]
                              if entry.get("anchor") == "release.whats_new"
@@ -80,7 +80,7 @@ def run():
         assert changed
         assert release_title["text"].endswith("1.4.5")  # input is not mutated
         assert any(entry.get("anchor") == "release.whats_new" and
-                   entry.get("text", "").endswith("1.4.6")
+                   entry.get("text", "") == bg_guide_manual.release_title(language)
                    for entry in refreshed["items"])
         assert refreshed["items"][-1] == previous["items"][-1]
         assert not bg_guide._upgrade_document(refreshed, language)[1]

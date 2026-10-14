@@ -31,6 +31,7 @@ class FinalExportProcessor(object):
     _viewport_was_suspended = False
     _undo_session_depth = 0
     _undo_was_enabled = False
+    _freeze_lp_normals = True
 
     @classmethod
     @contextlib.contextmanager
@@ -44,10 +45,15 @@ class FinalExportProcessor(object):
                 "FBXExportInputConnections": cls._query_fbx_bool("FBXExportInputConnections"),
                 "FBXExportGenerateLog": cls._query_fbx_bool("FBXExportGenerateLog"),
                 "FBXExportSmoothMesh": cls._query_fbx_bool("FBXExportSmoothMesh"),
+                "FBXExportTriangulate": cls._query_fbx_bool("FBXExportTriangulate"),
             }
             cls._set_fbx_bool("FBXExportGenerateLog", False)
             cls._set_fbx_bool("FBXExportInputConnections", False)
             cls._set_fbx_bool("FBXExportSmoothMesh", False)
+            # LP/Cage are explicitly triangulated on copies. A user's global
+            # FBX Triangulate checkbox must not turn base HP quads into triangles
+            # before Catmull-Clark subdivision in Toolbag or the external helper.
+            cls._set_fbx_bool("FBXExportTriangulate", False)
         cls._fbx_session_depth += 1
         try:
             yield
@@ -113,19 +119,25 @@ class FinalExportProcessor(object):
 
     @classmethod
     @contextlib.contextmanager
-    def export_session(cls):
+    def export_session(cls, freeze_lp_normals=None):
         """One safe context for a complete single or batch export operation."""
-        outermost = cls._fbx_session_depth == 0
-        with cls._fbx_settings_session():
-            with cls._viewport_suspended():
-                with cls._undo_disabled():
-                    if outermost:
-                        cls._cleanup_stale_export_temps()
-                    try:
-                        yield
-                    finally:
+        previous_freeze = cls._freeze_lp_normals
+        if freeze_lp_normals is not None:
+            cls._freeze_lp_normals = bool(freeze_lp_normals)
+        try:
+            outermost = cls._fbx_session_depth == 0
+            with cls._fbx_settings_session():
+                with cls._viewport_suspended():
+                    with cls._undo_disabled():
                         if outermost:
                             cls._cleanup_stale_export_temps()
+                        try:
+                            yield
+                        finally:
+                            if outermost:
+                                cls._cleanup_stale_export_temps()
+        finally:
+            cls._freeze_lp_normals = previous_freeze
 
     @staticmethod
     def _query_fbx_bool(command):
@@ -158,7 +170,8 @@ class FinalExportProcessor(object):
 
         ``reusable_temp_nodes`` are already-disposable meshes produced by the
         material splitter, so they can be triangulated in place. Every original
-        LP/Cage mesh is duplicated under a temporary root first. This removes the
+        LP is duplicated under a temporary root; cage copies use their source LP
+        connectivity and cage world points. This removes the
         expensive global ``cmds.undo()`` and keeps the artist's Undo queue intact.
         """
         reusable = set(reusable_temp_nodes or [])
@@ -167,11 +180,17 @@ class FinalExportProcessor(object):
             return False
 
         def needs_triangulation(node):
-            return triangulate_all or "_low" in node.split('|')[-1].lower()
+            short = node.split('|')[-1].lower()
+            return (triangulate_all or "_low" in short or is_cage_mesh(node))
+
+        def is_cage_mesh(node):
+            return (node.split('|')[-1].lower().endswith("_cage") or
+                    cmds.attributeQuery("bgCageSource", node=node, exists=True))
 
         temp_root = None
         prepared = []
         disposable = []
+        flattened_disposable = []
         try:
             for node in export_nodes:
                 if not needs_triangulation(node):
@@ -179,17 +198,27 @@ class FinalExportProcessor(object):
                     if FinalExportProcessor._is_export_temp_node(node):
                         disposable.append(node)
                     continue
-                tri_node = node
-                if node not in reusable:
+                is_cage = is_cage_mesh(node)
+                if is_cage or node not in reusable:
                     if temp_root is None:
                         temp_root = cmds.group(em=True, name="BG_Export_Tri_Temp#", world=True)
                         temp_root = (cmds.ls(temp_root, long=True) or [temp_root])[0]
+                if is_cage:
+                    # Import lazily: cage helpers are not needed for HP/LP-only
+                    # export, and the original cage must never be triangulated.
+                    import bg_cage
+                    lp = bg_cage.CageProcessor.source_lp(node, allow_legacy=True)
+                    if not lp:
+                        raise ValueError("No valid source LP for cage '{}'".format(node))
+                    bg_cage.CageProcessor.validate_pair(lp, node)
+                    tri_node = FinalExportProcessor._make_cage_export_copy(node, lp, temp_root)
+                elif node not in reusable:
                     tri_node = FinalExportProcessor._duplicate_under_temp_root(node, temp_root)
+                else:
+                    tri_node = node
                 disposable.append(tri_node)
-                try:
-                    cmds.polyTriangulate(tri_node, constructionHistory=False)
-                except Exception as exc:
-                    cmds.warning("Could not triangulate export copy '{}': {}".format(node, exc))
+                if not is_cage:
+                    FinalExportProcessor._triangulate_export_copy(tri_node)
                 prepared.append(tri_node)
 
             # FBX Export Selected includes ancestors. Detach disposable meshes
@@ -203,10 +232,21 @@ class FinalExportProcessor(object):
                 original_short = node.split('|')[-1]
                 if node in disposable_set or FinalExportProcessor._is_export_temp_node(node):
                     short_name = node.split('|')[-1]
+                    if short_name.lower().endswith("_cage") and cmds.objExists('|' + short_name):
+                        # A world-root original would make Maya append a digit
+                        # AFTER _cage. Keep the suffix without renaming the original.
+                        base, suffix = short_name[:-5], short_name[-5:]
+                        index = 1
+                        short_name = "{}{}{}".format(base, index, suffix)
+                        while cmds.objExists('|' + short_name):
+                            index += 1
+                            short_name = "{}{}{}".format(base, index, suffix)
                     node = cmds.parent(node, world=True, absolute=True)[0]
+                    # Track the new path immediately, including rename failures.
+                    flattened_disposable.append(node)
                     node = cmds.rename(node, short_name)
                     node = (cmds.ls(node, long=True) or [node])[0]
-                    flattened_disposable.append(node)
+                    flattened_disposable[-1] = node
                 if original_short in mapped_levels:
                     flattened_levels[node.split('|')[-1]] = mapped_levels[original_short]
                 flattened.append(node)
@@ -221,13 +261,166 @@ class FinalExportProcessor(object):
             cmds.select(prepared, replace=True)
             FinalExportProcessor.export_selected_fbx(export_path)
             return True
+        except Exception as exc:
+            cmds.warning("Export/triangulation failed for '{}': {}".format(export_path, exc))
+            return False
         finally:
+            FinalExportProcessor._delete_temp_nodes(flattened_disposable)
             FinalExportProcessor._delete_temp_nodes(disposable)
             if temp_root and cmds.objExists(temp_root):
                 try:
                     cmds.delete(temp_root)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _export_mesh_fn(node):
+        if om is None:
+            raise RuntimeError("Maya mesh API is required for topology-safe export")
+        shapes = cmds.listRelatives(
+            node, shapes=True, noIntermediate=True, fullPath=True, type='mesh') or []
+        if len(shapes) != 1:
+            raise ValueError("Expected exactly one mesh shape on '{}'".format(node))
+        selection = om.MSelectionList()
+        selection.add(shapes[0])
+        return om.MFnMesh(selection.getDagPath(0))
+
+    @staticmethod
+    def _freeze_export_copy_normals(node):
+        """Freeze the existing shared normal table on a DISPOSABLE copy only.
+
+        Lock Normals / lockFaceVertexNormals split the table and can change
+        Maya's tangent basis. Rewriting the current user-normal array preserves
+        the face-corner mapping, hard edges and existing tangent basis instead.
+        API writes deliberately occur inside the undo-disabled export session.
+        """
+        mesh = FinalExportProcessor._export_mesh_fn(node)
+        normals = mesh.getNormals(om.MSpace.kObject)
+        counts, ids = mesh.getNormalIds()
+        mesh.setNormals(normals, om.MSpace.kObject)
+        mesh.updateSurface()
+        after_counts, after_ids = mesh.getNormalIds()
+        if (mesh.numNormals != len(normals) or
+                list(counts) != list(after_counts) or list(ids) != list(after_ids) or
+                not all(mesh.isNormalLocked(i) for i in set(after_ids))):
+            raise ValueError("Freezing normals changed their corner mapping: '{}'".format(node))
+        return mesh
+
+    @staticmethod
+    def _triangulate_export_copy(node):
+        """Use identical Maya options for LP exports and cage connectivity."""
+        normal_snapshot = None
+        if FinalExportProcessor._freeze_lp_normals:
+            # Detach the copy from inherited history before writing user normals.
+            # Never delete history or change normals on an artist's source mesh.
+            cmds.delete(node, constructionHistory=True)
+            mesh = FinalExportProcessor._freeze_export_copy_normals(node)
+            normals = mesh.getNormals(om.MSpace.kObject)
+            face_counts, vertices = mesh.getVertices()
+            _counts, normal_ids = mesh.getNormalIds()
+            per_face = []
+            offset = 0
+            for count in face_counts:
+                per_face.append(dict(zip(vertices[offset:offset + count],
+                                         normal_ids[offset:offset + count])))
+                offset += count
+            triangle_counts, triangle_vertices = mesh.getTriangles()
+            triangles = {}
+            offset = 0
+            for face, count in enumerate(triangle_counts):
+                for _ in range(count):
+                    key = tuple(sorted(triangle_vertices[offset:offset + 3]))
+                    if key in triangles:
+                        raise ValueError("Ambiguous duplicate LP triangle: '{}'".format(node))
+                    triangles[key] = per_face[face]
+                    offset += 3
+            normal_snapshot = (normals, triangles)
+        cmds.polyTriangulate(node, constructionHistory=False)
+        mesh = FinalExportProcessor._export_mesh_fn(node)
+        counts, vertices = mesh.getVertices()
+        if not counts or any(count != 3 for count in counts):
+            raise ValueError("Triangulation did not produce only triangles: '{}'".format(node))
+        if normal_snapshot is not None:
+            # Maya can renumber AND recalculate even shared user normals during
+            # polyTriangulate (notably on tweaked/non-planar quads). Restore by
+            # actual triangle + vertex correspondence, never by old normal ID.
+            original_normals, original_triangles = normal_snapshot
+            restored = mesh.getNormals(om.MSpace.kObject)
+            normal_counts, normal_ids = mesh.getNormalIds()
+            assigned = {}
+            used_triangles = set()
+            corner_normals = om.MVectorArray()
+            corner_faces = om.MIntArray()
+            corner_vertices = om.MIntArray()
+            offset = 0
+            for face, count in enumerate(counts):
+                key = tuple(sorted(vertices[offset:offset + count]))
+                source = original_triangles.get(key)
+                if source is None or key in used_triangles:
+                    raise ValueError("LP triangle correspondence changed: '{}'".format(node))
+                used_triangles.add(key)
+                for vertex, normal_id in zip(vertices[offset:offset + count],
+                                             normal_ids[offset:offset + count]):
+                    desired = original_normals[source[vertex]]
+                    if normal_id in assigned:
+                        prior = assigned[normal_id]
+                        if (prior - desired).length() > 1e-6:
+                            raise ValueError("Triangulation merged distinct LP normals: '{}'".format(node))
+                    assigned[normal_id] = desired
+                    restored[normal_id] = desired
+                    corner_normals.append(om.MVector(desired))
+                    corner_faces.append(face)
+                    corner_vertices.append(vertex)
+                offset += count
+            if used_triangles != set(original_triangles):
+                raise ValueError("Triangulation lost an LP triangle: '{}'".format(node))
+            mesh.setNormals(restored, om.MSpace.kObject)
+            mesh.updateSurface()
+            after_counts, after_ids = mesh.getNormalIds()
+            if list(normal_counts) != list(after_counts) or list(normal_ids) != list(after_ids):
+                raise ValueError("Restoring LP normals changed their corner mapping: '{}'".format(node))
+            def corners_match():
+                for face, vertex, desired in zip(corner_faces, corner_vertices, corner_normals):
+                    actual = mesh.getFaceVertexNormal(face, vertex, om.MSpace.kObject)
+                    if (actual.normal() - desired.normal()).length() > 1e-6:
+                        return False
+                return True
+            if not corners_match():
+                # Whole-table writes alone are insufficient on some triangulated
+                # meshes. Correct explicit export corners only when the measured
+                # directions differ. This is never applied to the source mesh.
+                mesh.setFaceVertexNormals(corner_normals, corner_faces, corner_vertices,
+                                          om.MSpace.kObject)
+                mesh.updateSurface()
+                if not corners_match():
+                    raise ValueError("Could not preserve LP corner normals: '{}'".format(node))
+
+    @staticmethod
+    def _make_cage_export_copy(cage, lp, temp_root):
+        """Deform a triangulated LP copy using cage points by vertex index.
+
+        Duplicating the LP carries its ordered connectivity, UV sets, per-corner
+        normals, smoothing and material assignments into FBX. Only the copy's
+        points change; Maya must not choose diagonals on inflated cage geometry.
+        """
+        cage_points = FinalExportProcessor._export_mesh_fn(cage).getPoints(om.MSpace.kWorld)
+        tri_node = FinalExportProcessor._duplicate_under_temp_root(lp, temp_root)
+        FinalExportProcessor._triangulate_export_copy(tri_node)
+        mesh = FinalExportProcessor._export_mesh_fn(tri_node)
+        if mesh.numVertices != len(cage_points):
+            raise ValueError("LP triangulation changed the cage vertex correspondence")
+        # kObject points avoid assumptions about the LP's transform, including
+        # non-uniform scale, mirrored transforms and different cage parenting.
+        inverse = mesh.dagPath().inclusiveMatrixInverse()
+        # Lock LP normals BEFORE deformation. Otherwise Maya recomputes them
+        # during setPoints or rename/FBX evaluation, potentially changing FBX's
+        # per-corner vertex correspondence.
+        counts, vertices = mesh.getVertices()
+        faces = om.MIntArray([face for face, count in enumerate(counts) for _ in range(count)])
+        mesh.lockFaceVertexNormals(faces, vertices)
+        mesh.setPoints(om.MPointArray([point * inverse for point in cage_points]), om.MSpace.kObject)
+        return FinalExportProcessor._rename_child_under_parent(
+            tri_node, temp_root, lp.split('|')[-1] + "_cage")
 
     @staticmethod
     def _unique_existing(nodes):
@@ -246,9 +439,13 @@ class FinalExportProcessor(object):
         short_name = node.split('|')[-1]
         dup = cmds.duplicate(node, returnRootsOnly=True)[0]
         dup = (cmds.ls(dup, long=True) or [dup])[0]
-        dup = cmds.parent(dup, temp_root, absolute=True)[0]
-        dup = cmds.rename(dup, short_name)
-        return FinalExportProcessor._resolve_child_under_parent(dup, temp_root)
+        try:
+            dup = cmds.parent(dup, temp_root, absolute=True)[0]
+            dup = cmds.rename(dup, short_name)
+            return FinalExportProcessor._resolve_child_under_parent(dup, temp_root)
+        except Exception:
+            FinalExportProcessor._delete_temp_nodes([dup])
+            raise
 
     @staticmethod
     def _is_export_temp_node(node):

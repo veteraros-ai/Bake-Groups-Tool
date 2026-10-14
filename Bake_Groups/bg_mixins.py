@@ -3515,6 +3515,17 @@ class FinalViewMixin:
         if not groups:
             self.log("No finalized LP meshes found for cage.", "red")
             return {}
+        try:
+            for sg, meshes in groups.items():
+                if only_subgroups and sg not in only_subgroups:
+                    continue
+                for lp in meshes['lp']:
+                    fn, _dag = bg_cage.CageProcessor._fn_mesh(lp)
+                    if fn.numVertices == 0 or fn.numPolygons == 0:
+                        raise ValueError("LP has no polygons: {}".format(lp))
+        except Exception as exc:
+            self.log(str(exc), "red")
+            return {'made': 0, 'updated': 0, 'errors': [str(exc)]}
 
         # All chapter HP meshes: obstacle HP for a subgroup is everything except
         # its own HP (other subgroups' geometry the cage must not intersect).
@@ -3531,6 +3542,7 @@ class FinalViewMixin:
         t['collect'] = _time.time() - _t0; _t0 = _time.time()
 
         made = updated = 0
+        cage_errors = []
         expected = set()
 
         # Progress bar for the build (stays up until the viewport redraw starts).
@@ -3593,9 +3605,21 @@ class FinalViewMixin:
                     sg_mode = params.get('display_mode', 'solid')
                     for lp in meshes['lp']:
                         cage_name = lp.split('|')[-1] + bg_cage.SUFFIX_CAGE
-                        existing = cage_index.get(cage_name)
+                        try:
+                            existing = bg_cage.CageProcessor.find_cage_for_lp(lp, cage_index)
+                        except ValueError as exc:
+                            self.log(str(exc), "red")
+                            cage_errors.append(str(exc))
+                            continue
                         existing = existing if (existing and cmds.objExists(existing)) else None
                         if create_missing_only and existing:
+                            folder = bg_cage.CageProcessor.ensure_relative_folders(
+                                chapter_grp, bg_cage.CageProcessor.relative_folders_for_lp(lp, lp_main))
+                            parent = cmds.listRelatives(existing, parent=True, fullPath=True) or []
+                            if parent != [folder]:
+                                existing = cmds.parent(existing, folder, absolute=True)[0]
+                                existing = (cmds.ls(existing, long=True) or [existing])[0]
+                            cage_index['source:' + (cmds.ls(lp, uuid=True) or [''])[0]] = existing
                             continue  # keep the existing (possibly sculpted) cage untouched
                         if batchable_sg and not existing:
                             folder = bg_cage.CageProcessor.ensure_relative_folders(
@@ -3697,7 +3721,7 @@ class FinalViewMixin:
             self.log("Cage timing (s): " + "  ".join("{}={:.2f}".format(k, v) for k, v in t.items())
                      + "  total={:.2f}".format(total), "orange")
         self.save_cage_states()
-        return {'made': made, 'updated': updated}
+        return {'made': made, 'updated': updated, 'errors': cage_errors}
 
     def save_cage_states(self):
         pair = self._active_pair()
@@ -3772,6 +3796,8 @@ class FinalViewMixin:
         export, whenever a cage exists AND the chapter's 'export cage' flag
         (enabled by Create Cage) is on. No-op (returns False) if there is no cage or
         the flag is off - there is no separate Export Cage button anymore."""
+        if pair.get('export_excluded', False):
+            return False
         base_name = pair.get('base', 'Chapter')
         settings = pair.get('cage_settings') or {}
         if not settings.get('export_enabled', False):
@@ -3779,6 +3805,8 @@ class FinalViewMixin:
         cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
                        else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
         if not cage_meshes:
+            return False
+        if not self._validate_cage_export(pair, cage_meshes, snapshot):
             return False
         export_name = "{}_cage".format(base_name)
         export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
@@ -3799,10 +3827,14 @@ class FinalViewMixin:
         pair = self._active_pair()
         if not pair:
             return cmds.warning("No active chapter selected.")
+        if not self._allow_chapter_export(pair):
+            return
         base_name = pair.get('base', 'Chapter')
         cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
         if not cage_meshes:
             return cmds.warning("No cage to export - press Create Cage first.")
+        if not self._validate_cage_export(pair, cage_meshes):
+            return False
 
         export_dir = pair.get('export_dir')
         if not export_dir or not os.path.isdir(export_dir):
@@ -3897,7 +3929,7 @@ class FinalViewMixin:
 
     def _enable_cage_export_on_creation(self, pair, result):
         """Arm Cage export only after Create Cage actually produced/found meshes."""
-        if not result:
+        if not result or result.get('errors'):
             return False
         if not (result.get('made') or bg_cage.CageProcessor.get_chapter_cage_meshes(
                 pair.get('base', 'Chapter'))):
@@ -3913,6 +3945,10 @@ class FinalViewMixin:
 
     def build_cage_settings_panel(self, pair):
         """Build the embedded Cage settings panel on the right side."""
+        finish_previous = getattr(self, '_cage_finish_edits', None)
+        if finish_previous:
+            finish_previous()
+        from bg_cage_undo import MeshEditTransaction
         settings = dict(pair.get('cage_settings') or {})
         fitted = {'v': bool(settings.get('fitted', False))}
 
@@ -3996,7 +4032,7 @@ class FinalViewMixin:
         # are easy to dial - cage deltas are typically a couple % of the diagonal.
         # The Expansion row, status and checkbox are added later, in the assembly
         # block, so the panel reads in the final visual order.
-        inflate_row, inflate_spin, inflate_slider, _ = self._make_cage_slider_row(
+        inflate_row, inflate_spin, inflate_slider, inflate_sync = self._make_cage_slider_row(
             -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
         inflate_spin.setProperty("bg_help_id", "cage.inflation")
         inflate_slider.setProperty("bg_help_id", "cage.inflation")
@@ -4084,7 +4120,13 @@ class FinalViewMixin:
             _recenter(inflate_spin, inflate_slider)
             self._cage_islands = {}  # stale intersection islands no longer valid
             save_settings(set(groups.keys()), True)  # inflate=0 global, overrides cleared
-            result = self.rebuild_active_cage(only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
+            try:
+                result = self.rebuild_active_cage(
+                    only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
+            except Exception as exc:
+                status.setText(str(exc))
+                cmds.warning(str(exc))
+                return
             if self._enable_cage_export_on_creation(pair, result):
                 bg_core.BakeSessionModel.save(self.root_pairs)
             try:
@@ -4097,7 +4139,10 @@ class FinalViewMixin:
             self._ensure_cage_visible(pair)
             # The cage now exists: flip the LP Visible button to Cage Vis.
             self.sync_toggle_buttons(hp_main, lp_main)
-            status.setText(bg_l10n.text("Cage created.") + " [" + bg_l10n.text("all subgroups") + "]")
+            if result.get('errors'):
+                status.setText("; ".join(result['errors']))
+            else:
+                status.setText(bg_l10n.text("Cage created.") + " [" + bg_l10n.text("all subgroups") + "]")
 
         # The Expansion jog applies LIVE while the handle moves, so the cage
         # inflates smoothly in real time (not one jump on release). Because the
@@ -4111,7 +4156,7 @@ class FinalViewMixin:
             for meshes in groups.values() for lp in meshes.get('lp', []))
 
         def _lp_for(cage):
-            return lp_by_cage_short.get(cage.split('|')[-1])
+            return bg_cage.CageProcessor.source_lp(cage)
 
         def _expansion_targets():
             """[(cage, lp), ...] plus a scope label, in priority order: cage
@@ -4138,17 +4183,53 @@ class FinalViewMixin:
                         targets.append((cage, _lp_for(cage)))
             return targets, bg_l10n.text("visible subgroups")
 
-        expo = {'last': 0.0, 'targets': [], 'label': '', 'open': False}
+        expo = {'last': 0.0, 'targets': [], 'label': '', 'transaction': None,
+                'directions': {}, 'error': None}
+
+        def commit_edit(state):
+            transaction = state['transaction']
+            state['transaction'] = None
+            if transaction is None:
+                return False
+            try:
+                return transaction.commit()
+            except Exception as exc:
+                state['error'] = str(exc)
+                status.setText(str(exc))
+                cmds.warning(str(exc))
+                return False
 
         def expansion_begin():
+            if expo['transaction'] is not None:
+                return
             fitted['v'] = False
+            expo['error'] = None
             expo['targets'], expo['label'] = _expansion_targets()
             expo['last'] = 0.0  # the jog always starts from the centre
             if expo['targets']:
-                cmds.undoInfo(openChunk=True, chunkName="CageExpansion")
-                expo['open'] = True
+                try:
+                    directions = {}
+                    for cage, lp in expo['targets']:
+                        bg_cage.CageProcessor.validate_pair(lp, cage)
+                        fn, _dag = bg_cage.CageProcessor._fn_mesh(lp)
+                        directions[cage] = [
+                            (v.x, v.y, v.z) for v in fn.getVertexNormals(True, om.MSpace.kWorld)]
+                    expo['directions'] = directions
+                    expo['transaction'] = MeshEditTransaction("CageExpansion")
+                    for cage, lp in expo['targets']:
+                        expo['transaction'].capture(cage)
+                except Exception as exc:
+                    expo['error'] = str(exc)
+                    expo['transaction'] = None
+                    expo['targets'] = []
+                    status.setText(str(exc))
+                    cmds.warning(str(exc))
 
         def expansion_live():
+            if inflate_sync['syncing']:
+                return  # a typed value is applied once by editingFinished
+            if expo['transaction'] is None:
+                expansion_begin()
             if not expo['targets']:
                 return
             cur = inflate_spin.value()
@@ -4156,27 +4237,36 @@ class FinalViewMixin:
             if abs(delta) < 1e-9:
                 return
             expo['last'] = cur
-            for cage, lp in expo['targets']:
-                if cmds.objExists(cage):
-                    bg_cage.CageProcessor.inflate_existing_cage(cage, delta, lp)
+            try:
+                for cage, lp in expo['targets']:
+                    bg_cage.CageProcessor.inflate_existing_cage(
+                        cage, delta, lp, transaction=expo['transaction'],
+                        directions=expo['directions'][cage])
+            except Exception as exc:
+                expo['error'] = str(exc)
+                if expo['transaction']:
+                    expo['transaction'].cancel()
+                expo['transaction'] = None
+                expo['targets'] = []
+                status.setText(str(exc))
+                cmds.warning(str(exc))
+                return
+            if not inflate_slider.isSliderDown():
+                expansion_idle.start(180)
 
         def expansion_end():
-            if expo['open']:
-                cmds.undoInfo(closeChunk=True)
-                expo['open'] = False
+            expansion_idle.stop()
+            with bg_core.undo_chunk("CageExpansion"):
+                changed = commit_edit(expo)
+                if changed:
+                    self._ensure_cage_visible(pair)
+            self._cage_islands = {}
             # No absolute inflate is stored: the slider is a relative jog that
             # always starts at 0, and per-subgroup absolute values diverge (that
             # divergence caused the old partial-deflation bug).
-            cs = pair.setdefault('cage_settings', {})
-            cs['unit'] = 'absolute'
-            cs['inflate'] = 0.0
-            cs['fitted'] = False
-            cs.setdefault('display_mode', 'solid')
-            cs.setdefault('export_enabled', False)
-            (pair.setdefault('cage_overrides', {})).clear()
-            bg_core.BakeSessionModel.save(self.root_pairs)
-            if expo['targets']:
-                self._ensure_cage_visible(pair)
+            if expo['error']:
+                status.setText(expo['error'])
+            elif expo['targets']:
                 status.setText(bg_l10n.text("Expansion adjusted (sculpting preserved).")
                                + " [" + expo['label'] + "]")
             else:
@@ -4184,6 +4274,7 @@ class FinalViewMixin:
             _recenter(inflate_spin, inflate_slider)
             expo['last'] = 0.0
             expo['targets'] = []
+            expo['directions'] = {}
 
         def expansion_spin_commit():
             # Typed value / spinbox focus-out: apply the net delta in one step.
@@ -4193,6 +4284,10 @@ class FinalViewMixin:
             expansion_begin()
             expansion_live()
             expansion_end()
+
+        expansion_idle = QtCore.QTimer(panel)
+        expansion_idle.setSingleShot(True)
+        expansion_idle.timeout.connect(expansion_end)
 
         def do_fit():
             # Hidden from the UI (unreliable) but kept intact: forces a full
@@ -4279,7 +4374,7 @@ class FinalViewMixin:
         # Bipolar jog (centre = 0), same live real-time behaviour and cubic
         # (scale-adaptive) response as Expansion: fine control near the centre,
         # coarse near the ends, applied smoothly while the handle moves.
-        ix_row, ix_spin, ix_slider, _ = self._make_cage_slider_row(
+        ix_row, ix_spin, ix_slider, ix_sync = self._make_cage_slider_row(
             -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
         ix_spin.setProperty("bg_help_id", "cage.inflation")
         ix_slider.setProperty("bg_help_id", "cage.inflation")
@@ -4287,21 +4382,38 @@ class FinalViewMixin:
         def do_find_intersections():
             pairs = _scoped_cage_hp_pairs()
             self._cage_islands = {}
+            self._cage_island_stamps = {}
             faces_sel = []
             n_isl = 0
+            failures = []
             cmds.refresh(suspend=True)
             try:
                 for cage, hp_nodes in pairs:
-                    isls = bg_cage.CageProcessor.find_hp_intersection_islands(cage, hp_nodes)
+                    try:
+                        lp = bg_cage.CageProcessor.source_lp(cage)
+                        bg_cage.CageProcessor.validate_pair(lp, cage)
+                        isls = bg_cage.CageProcessor.find_hp_intersection_islands(cage, hp_nodes)
+                    except Exception as exc:
+                        failures.append(str(exc))
+                        continue
                     if isls:
                         self._cage_islands[cage] = isls
+                        self._cage_island_stamps[cage] = {
+                            'cage': bg_cage.CageProcessor.geometry_stamp(cage),
+                            'hp': [(hp, bg_cage.CageProcessor.geometry_stamp(
+                                hp, allow_instances=True)) for hp in hp_nodes]}
                         n_isl += len(isls)
                         for isl in isls:
                             faces_sel.extend("{}.f[{}]".format(cage, f) for f in isl['faces'])
             finally:
                 cmds.refresh(suspend=False)
             _recenter(ix_spin, ix_slider)  # start the jog from the centre
-            if faces_sel:
+            if failures:
+                self._cage_islands = {}
+                self._cage_island_stamps = {}
+                status.setText(bg_l10n.text("Cage scan incomplete.") + " " + "; ".join(failures))
+                cmds.warning(status.text())
+            elif faces_sel:
                 try:
                     cmds.select(faces_sel, replace=True)
                 except Exception:
@@ -4309,38 +4421,64 @@ class FinalViewMixin:
                 status.setText(bg_l10n.text("Found {n} intersection island(s).").format(n=n_isl))
             else:
                 cmds.select(clear=True)
-                status.setText(bg_l10n.text("No cage/HP intersections found."))
+                status.setText(bg_l10n.text("No detected intersections. Check coplanar contacts manually."))
 
         # Normal move jogs the found islands LIVE while the handle moves, exactly
         # like Expansion, so the touch-up is smooth at any scale. Incremental and
         # reversible (move_islands along a fixed object-space normal).
-        nmove = {'last': 0.0, 'open': False}
+        nmove = {'last': 0.0, 'transaction': None, 'error': None}
 
         def normal_begin():
+            if nmove['transaction'] is not None:
+                return
             nmove['last'] = 0.0
+            nmove['error'] = None
             if getattr(self, '_cage_islands', None):
-                cmds.undoInfo(openChunk=True, chunkName="CageNormalMove")
-                nmove['open'] = True
+                try:
+                    self._validate_cage_island_cache()
+                    nmove['transaction'] = MeshEditTransaction("CageNormalMove")
+                    for cage in self._cage_islands:
+                        nmove['transaction'].capture(cage)
+                except Exception as exc:
+                    nmove['transaction'] = None
+                    self._cage_islands = {}
+                    status.setText(str(exc))
+                    cmds.warning(str(exc))
 
         def normal_live():
+            if ix_sync['syncing']:
+                return
+            if nmove['transaction'] is None:
+                normal_begin()
             islands_map = getattr(self, '_cage_islands', None) or {}
-            if not islands_map:
+            if not islands_map or nmove['transaction'] is None:
                 return
             cur = ix_spin.value()
             delta = cur - nmove['last']
             if abs(delta) < 1e-9:
                 return
             nmove['last'] = cur
-            for cage, isls in islands_map.items():
-                if cmds.objExists(cage):
-                    bg_cage.CageProcessor.move_islands(cage, isls, delta)
+            try:
+                for cage, isls in islands_map.items():
+                    bg_cage.CageProcessor.move_islands(
+                        cage, isls, delta, transaction=nmove['transaction'])
+            except Exception as exc:
+                nmove['transaction'].cancel()
+                nmove['transaction'] = None
+                self._cage_islands = {}
+                status.setText(str(exc))
+                cmds.warning(str(exc))
+            if not ix_slider.isSliderDown():
+                normal_idle.start(180)
 
         def normal_end():
-            if nmove['open']:
-                cmds.undoInfo(closeChunk=True)
-                nmove['open'] = False
-            if getattr(self, '_cage_islands', None):
-                self._ensure_cage_visible(pair)
+            normal_idle.stop()
+            with bg_core.undo_chunk("CageNormalMove"):
+                changed = commit_edit(nmove)
+                if changed:
+                    self._refresh_cage_island_stamps()
+                if changed and getattr(self, '_cage_islands', None):
+                    self._ensure_cage_visible(pair)
             _recenter(ix_spin, ix_slider)
             nmove['last'] = 0.0
 
@@ -4351,6 +4489,28 @@ class FinalViewMixin:
             normal_begin()
             normal_live()
             normal_end()
+
+        normal_idle = QtCore.QTimer(panel)
+        normal_idle.setSingleShot(True)
+        normal_idle.timeout.connect(normal_end)
+
+        def finish_transactions(*_args):
+            for timer in (expansion_idle, normal_idle):
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+            for state in (expo, nmove):
+                transaction = state['transaction']
+                if transaction:
+                    try:
+                        transaction.commit()
+                    except Exception as exc:
+                        cmds.warning(str(exc))
+                    finally:
+                        state['transaction'] = None
+        self._cage_finish_edits = finish_transactions
+        panel.destroyed.connect(finish_transactions)
 
         ix_slider.sliderPressed.connect(normal_begin)
         ix_slider.valueChanged.connect(normal_live)
@@ -4479,8 +4639,9 @@ class FinalViewMixin:
         prefix = "{}_{}_low".format(base_name, display_name)
         out = []
         for tr in cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []:
-            short = tr.split('|')[-1]
-            if short.startswith(prefix) and short.endswith(bg_cage.SUFFIX_CAGE) \
+            lp = bg_cage.CageProcessor.source_lp(tr)
+            short = (lp or tr).split('|')[-1]
+            if short.startswith(prefix) \
                     and cmds.listRelatives(tr, shapes=True, type='mesh'):
                 out.append(tr)
         return out
@@ -4490,14 +4651,31 @@ class FinalViewMixin:
         """Display name of the subgroup a cage mesh belongs to, parsed from its
         name ({base}_{sg}_low..._cage) - same convention as
         _collect_cage_subgroups. None if it doesn't match."""
-        short = mesh.split('|')[-1]
+        source = bg_cage.CageProcessor.source_lp(mesh)
+        short = (source or mesh).split('|')[-1]
         prefix = base_name + '_'
-        if not (short.startswith(prefix) and short.endswith(bg_cage.SUFFIX_CAGE)):
+        if not short.startswith(prefix):
             return None
         rest = short[len(prefix):]
         if '_low' not in rest:
             return None
         return rest.split('_low')[0]
+
+    def _validate_cage_island_cache(self):
+        stamps = getattr(self, '_cage_island_stamps', {})
+        for cage in getattr(self, '_cage_islands', {}):
+            saved = stamps.get(cage)
+            if (not saved or
+                    saved['cage'] != bg_cage.CageProcessor.geometry_stamp(cage) or
+                    any(stamp != bg_cage.CageProcessor.geometry_stamp(hp, allow_instances=True)
+                        for hp, stamp in saved['hp'])):
+                raise ValueError(bg_l10n.text("Cage or HP changed. Run Find intersections again."))
+            bg_cage.CageProcessor.validate_pair(bg_cage.CageProcessor.source_lp(cage), cage)
+
+    def _refresh_cage_island_stamps(self):
+        for cage, saved in getattr(self, '_cage_island_stamps', {}).items():
+            if cmds.objExists(cage):
+                saved['cage'] = bg_cage.CageProcessor.geometry_stamp(cage)
 
     def _selected_cage_meshes(self, base_name):
         """Cage meshes of this chapter that are directly selected in the
@@ -4512,7 +4690,9 @@ class FinalViewMixin:
             if not node.startswith(chapter_prefix):
                 continue
             short = node.split('|')[-1]
-            if short.endswith(bg_cage.SUFFIX_CAGE) and cmds.listRelatives(node, shapes=True, type='mesh'):
+            if (short.endswith(bg_cage.SUFFIX_CAGE) or cmds.attributeQuery(
+                    bg_cage.SOURCE_ATTR, node=node, exists=True)) and cmds.listRelatives(
+                    node, shapes=True, type='mesh'):
                 hits.append(node)
         return hits
 
@@ -4618,6 +4798,9 @@ class FinalViewMixin:
         splitter.setSizes([toc_h, cage_h, exp_h])
 
     def exit_cage_config(self):
+        finish = getattr(self, '_cage_finish_edits', None)
+        if finish:
+            finish()
         self.is_cage_config = False
         container = getattr(self, 'cage_container', None)
         if container is not None:
@@ -4764,6 +4947,29 @@ class FinalViewMixin:
 class ExportMixin:
     """Methods for final export, batch export, and combine."""
 
+    def _export_freeze_normals_enabled(self):
+        checkbox = getattr(self, 'exp_freeze_lp_normals', None)
+        if checkbox is not None:
+            try:
+                return checkbox.isChecked()
+            except RuntimeError:
+                # The export panel may have been deleted by a language/view
+                # rebuild; keep the stored choice for context-menu exports.
+                pass
+        return bool(getattr(self, '_export_freeze_lp_normals', True))
+
+    @staticmethod
+    def _included_export_pairs(pairs):
+        """Export exclusion is independent of chapter/subgroup visibility."""
+        return [p for p in pairs or [] if not p.get('export_excluded', False)]
+
+    def _allow_chapter_export(self, pair):
+        if pair.get('export_excluded', False):
+            cmds.warning(bg_l10n.text("Chapter '{name}' is excluded from export.").format(
+                name=pair.get('base', 'Chapter')))
+            return False
+        return True
+
     @staticmethod
     def _export_snapshot_key(pair):
         return pair.get('id') if pair and pair.get('id') is not None else id(pair)
@@ -4772,7 +4978,7 @@ class ExportMixin:
         """Collect each chapter once and reuse it across preflight/HP/LP/Cage."""
         snapshots = {}
         seen = set()
-        for pair in pairs or []:
+        for pair in self._included_export_pairs(pairs):
             key = self._export_snapshot_key(pair)
             if key in seen:
                 continue
@@ -4821,6 +5027,8 @@ class ExportMixin:
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return self.log("No active pair selected for export.", "red")
+        if not self._allow_chapter_export(pair):
+            return
 
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         base_name = pair.get('base', 'Chapter_Export')
@@ -4842,7 +5050,8 @@ class ExportMixin:
 
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                with bg_final_export.FinalExportProcessor.export_session():
+                with bg_final_export.FinalExportProcessor.export_session(
+                        freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Suspended viewport isolation for export...", "lightblue")
                     if mode == 'separate':
                         exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
@@ -4878,7 +5087,8 @@ class ExportMixin:
         if not active_book:
             return cmds.warning("Active chapter is not in any book. Please group it into a book first.")
 
-        book_pairs = [p for p in self.root_pairs if p.get('book') == active_book]
+        book_pairs = self._included_export_pairs(
+            [p for p in self.root_pairs if p.get('book') == active_book])
         if not book_pairs:
             return
 
@@ -4893,7 +5103,8 @@ class ExportMixin:
         success_count = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                with bg_final_export.FinalExportProcessor.export_session():
+                with bg_final_export.FinalExportProcessor.export_session(
+                        freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Batch Exporting Book (Isolation Disabled)...", "lightblue")
                     for pair in book_pairs:
                         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
@@ -4944,19 +5155,24 @@ class ExportMixin:
             if not books:
                 return cmds.warning("No books to export by material.")
 
+        target_pairs = self._included_export_pairs(
+            [p for p in self.root_pairs if p.get('book') in books])
+        if not target_pairs:
+            return cmds.warning(bg_l10n.text("Nothing to export in this scope."))
+        books = [book for book in books if any(p.get('book') == book for p in target_pairs)]
         export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Folder for Export by Material"))
         if not export_dirs:
             return
         export_dir = export_dirs[0]
         self.save_final_smooth_states()
         self.disable_preview_smoothing_for_export()
-        target_pairs = [p for p in self.root_pairs if p.get('book') in books]
         snapshots = self._prepare_export_snapshots(target_pairs)
 
         total = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                with bg_final_export.FinalExportProcessor.export_session():
+                with bg_final_export.FinalExportProcessor.export_session(
+                        freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Export by material (isolation disabled)...", "lightblue")
                     for book in books:
                         total += self._export_book_by_material(
@@ -4972,7 +5188,8 @@ class ExportMixin:
         chapters into one {book}_HP/LP/cage; otherwise the book is a container so
         each chapter goes out on its own (named by chapter). ``inc_*`` pick which
         parts to write. Returns how many chapters/files groups were written."""
-        book_pairs = [p for p in self.root_pairs if p.get('book') == book]
+        book_pairs = self._included_export_pairs(
+            [p for p in self.root_pairs if p.get('book') == book])
         if snapshots is None:
             snapshots = self._prepare_export_snapshots(book_pairs)
         chapters = [
@@ -5038,6 +5255,9 @@ class ExportMixin:
         book is exported as a single material file)."""
         cage_meshes = []
         for ch in chapters:
+            if ch.get('cage_meshes') and not self._validate_cage_export(
+                    ch['pair'], ch['cage_meshes'], ch):
+                return False
             cage_meshes.extend(ch.get('cage_meshes') or [])
         if not cage_meshes:
             return False
@@ -5059,10 +5279,14 @@ class ExportMixin:
         """Export the chapter's cage as {base}_cage.fbx (triangulated). Cage
         inclusion is now decided by the Export panel's Cage checkbox, so this
         always exports when a cage exists (no per-chapter flag)."""
+        if pair.get('export_excluded', False):
+            return False
         base_name = pair.get('base', 'Chapter')
         cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
                        else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
         if not cage_meshes:
+            return False
+        if not self._validate_cage_export(pair, cage_meshes, snapshot):
             return False
         export_name = "{}_cage".format(base_name)
         export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
@@ -5076,6 +5300,20 @@ class ExportMixin:
         cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
         return False
 
+    def _validate_cage_export(self, pair, cage_meshes, snapshot=None):
+        try:
+            if snapshot is not None:
+                lp_nodes = snapshot.get('lp_all') or []
+            else:
+                _hp, lp_root, _group = self.core.resolve_main_nodes(pair)
+                lp_nodes = bg_final_export.FinalExportProcessor.get_valid_mesh_transforms(lp_root)
+            bg_cage.CageProcessor.validate_export_pairs(lp_nodes, cage_meshes)
+            return True
+        except Exception as exc:
+            cmds.warning(str(exc))
+            self.log(str(exc), "red")
+            return False
+
     def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage,
                               single, snapshot=None, status_callback=None,
                               file_callback=None, cancel_check=None,
@@ -5083,6 +5321,8 @@ class ExportMixin:
         """Export one chapter's requested parts. ``single`` merges HP+LP into one
         file only when both are included; otherwise HP and LP go to separate
         files. Returns True if anything was written."""
+        if pair.get('export_excluded', False):
+            return False
         if snapshot is None:
             snapshot = self._snapshot_for_pair(self._prepare_export_snapshots([pair]), pair)
         hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
@@ -5130,6 +5370,7 @@ class ExportMixin:
         """Merge the LP of every given chapter into one {file_base}_LP.fbx
         (triangulated). Used by the 'LP in one file' option. Returns the file
         base name written, or None."""
+        pairs = self._included_export_pairs(pairs)
         if snapshots is None:
             snapshots = self._prepare_export_snapshots(pairs)
         chapters = [
@@ -5203,6 +5444,15 @@ class ExportMixin:
         inc_row.addStretch(1)
         outer.addLayout(inc_row)
 
+        self.exp_freeze_lp_normals = QtWidgets.QCheckBox(bg_l10n.text("Freeze LP normals"))
+        self.exp_freeze_lp_normals.setProperty("bg_help_id", "export.files")
+        self.exp_freeze_lp_normals.setToolTip(bg_l10n.text("Freeze LP normals tooltip"))
+        self.exp_freeze_lp_normals.setChecked(
+            bool(getattr(self, '_export_freeze_lp_normals', True)))
+        self.exp_freeze_lp_normals.toggled.connect(
+            lambda checked: setattr(self, '_export_freeze_lp_normals', bool(checked)))
+        outer.addWidget(self.exp_freeze_lp_normals)
+
         _lbl("Files")
         files_row = QtWidgets.QHBoxLayout()
         self.exp_files_sep = QtWidgets.QRadioButton(bg_l10n.text("Separate")); self.exp_files_sep.setChecked(True)
@@ -5261,8 +5511,6 @@ class ExportMixin:
         if is_marmoset:
             if not getattr(self, '_marmoset_target_active', False):
                 self._standard_cage_include = self.exp_inc_cage.isChecked()
-            self.exp_inc_hp.setChecked(True)
-            self.exp_inc_lp.setChecked(True)
             self.exp_inc_cage.setChecked(False)
             self.exp_files_sep.setChecked(True)
             self.exp_bymat.setChecked(False)
@@ -5271,8 +5519,6 @@ class ExportMixin:
             self.exp_inc_cage.setChecked(bool(getattr(self, '_standard_cage_include', False)))
         self._marmoset_target_active = is_marmoset
         general_controls = (
-            getattr(self, 'exp_inc_hp', None),
-            getattr(self, 'exp_inc_lp', None),
             getattr(self, 'exp_inc_cage', None),
             getattr(self, 'exp_files_sep', None),
             getattr(self, 'exp_files_one', None),
@@ -5280,6 +5526,8 @@ class ExportMixin:
         for control in general_controls:
             if control is not None:
                 control.setEnabled(not is_marmoset)
+        self.exp_inc_hp.setEnabled(True)
+        self.exp_inc_lp.setEnabled(True)
         self.exp_files_one.setEnabled(not is_marmoset)
         is_chapter = (
             hasattr(self, 'exp_scope') and self.exp_scope.currentIndex() == 0)
@@ -5334,7 +5582,10 @@ class ExportMixin:
         self._marmoset_bridge_ready = True
         return True
 
-    def _export_marmoset_package(self, targets, snapshots):
+    def _export_marmoset_package(self, targets, snapshots, inc_hp=True, inc_lp=True):
+        targets = self._included_export_pairs(targets)
+        if not targets:
+            return cmds.warning(bg_l10n.text("Nothing to export in this scope."))
         if not self._ensure_marmoset_plugin():
             return
         export_dirs = cmds.fileDialog2(
@@ -5342,6 +5593,24 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
+        manifest_path = os.path.join(export_dir, bg_marmoset_bridge.MANIFEST_NAME)
+        connection = None
+        if self._marmoset_bridge_ready:
+            try:
+                connection = bg_marmoset_bridge.find_toolbag_project(
+                    manifest_path, cmds.file(query=True, sceneName=True) or "",
+                    process_events=QtWidgets.QApplication.processEvents)
+            except Exception as exc:
+                cmds.warning(str(exc))
+                return
+        import_new = False
+        if connection and connection.get("state") != "matching":
+            choice = self._ask_marmoset_connection(connection)
+            if choice == "cancel":
+                return
+            import_new = choice == "import"
+            if not import_new:
+                connection = None
         progress = QtWidgets.QProgressDialog(
             bg_l10n.text("Preparing Marmoset package..."),
             bg_l10n.text("Cancel"), 0, max(1, len(targets)), self)
@@ -5361,11 +5630,13 @@ class ExportMixin:
         try:
             with self.suspend_subgroup_color_preview():
                 with self.suspend_isolation():
-                    with bg_final_export.FinalExportProcessor.export_session():
+                    with bg_final_export.FinalExportProcessor.export_session(
+                            freeze_lp_normals=self._export_freeze_normals_enabled()):
                         manifest = bg_marmoset_bridge.MarmosetPackageExporter.export_package(
                             targets, snapshots, export_dir,
                             status_callback=status,
-                            cancel_check=progress.wasCanceled)
+                            cancel_check=progress.wasCanceled,
+                            inc_hp=inc_hp, inc_lp=inc_lp)
             if progress.wasCanceled() or not manifest:
                 if hasattr(self, 'exp_status'):
                     self.exp_status.setText(bg_l10n.text("Export cancelled"))
@@ -5380,21 +5651,54 @@ class ExportMixin:
             cmds.inViewMessage(
                 amg="Marmoset package exported: {}".format(manifest),
                 pos='midCenter', fade=True)
+        except Exception as exc:
+            cmds.warning("Marmoset export failed: {}".format(exc))
+            if hasattr(self, 'exp_status'):
+                self.exp_status.setText(str(exc))
+            return
         finally:
             progress.close()
-        if self._marmoset_bridge_ready:
+        if connection:
             try:
-                bg_marmoset_bridge.launch_toolbag_bridge(manifest)
+                bg_marmoset_bridge.sync_toolbag_project(
+                    connection, manifest, import_new=import_new,
+                    process_events=QtWidgets.QApplication.processEvents)
                 if hasattr(self, 'exp_status'):
                     self.exp_status.setText(
-                        bg_l10n.text("Opening Marmoset package: {name}").format(
+                        bg_l10n.text("Marmoset meshes updated: {name}").format(
                             name=os.path.basename(manifest)))
             except Exception as exc:
-                message = bg_l10n.text("Marmoset launch failed: {error}").format(
+                message = bg_l10n.text("Marmoset sync failed: {error}").format(
                     error=exc)
                 cmds.warning(message)
                 if hasattr(self, 'exp_status'):
                     self.exp_status.setText(message)
+
+    def _ask_marmoset_connection(self, connection):
+        messages = {
+            "not_running": "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.",
+            "bridge_unavailable": "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.",
+            "other_project": "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.",
+            "ambiguous": "Several Toolbag sessions are open. Leave only one session with this project open.",
+            "empty": "This package is not loaded in the current Marmoset scene. Import it into this scene?"}
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(bg_l10n.text("Marmoset connection"))
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText(bg_l10n.text(messages.get(connection.get("state"), messages["bridge_unavailable"])))
+        box.setInformativeText("\n".join(filter(None, (
+            connection.get("scene_path"), connection.get("detail")))))
+        import_button = None
+        if connection.get("state") == "empty":
+            import_button = box.addButton(bg_l10n.text("Import into current scene"),
+                                          QtWidgets.QMessageBox.AcceptRole)
+        export_button = box.addButton(bg_l10n.text("Export package only"),
+                                      QtWidgets.QMessageBox.ActionRole)
+        cancel_button = box.addButton(bg_l10n.text("Cancel"), QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec_() if hasattr(box, 'exec_') else box.exec()
+        if import_button is not None and box.clickedButton() == import_button:
+            return "import"
+        return "export_only" if box.clickedButton() == export_button else "cancel"
 
     def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage, snapshots=None):
         """One validation pass over the chapters about to be exported. Returns
@@ -5410,11 +5714,11 @@ class ExportMixin:
             name = pair.get('base', '?')
             snapshot = self._snapshot_for_pair(snapshots, pair) or {}
             hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
-            if not hp_main or not lp_main:
+            if (inc_hp and not hp_main) or ((inc_lp or inc_cage) and not lp_main):
                 errors.append(bg_l10n.text("Chapter '{name}': HP or LP root group not found.").format(name=name))
                 continue
             loose = snapshot.get('loose_lp') or []
-            if loose:
+            if inc_lp and loose:
                 warnings.append(bg_l10n.text("Chapter '{name}': {n} LP mesh(es) not distributed (run Assign LP Meshes).").format(name=name, n=len(loose)))
             if inc_hp and not snapshot.get('hp_all'):
                 warnings.append(bg_l10n.text("Chapter '{name}': no HP meshes to export.").format(name=name))
@@ -5422,6 +5726,21 @@ class ExportMixin:
                 warnings.append(bg_l10n.text("Chapter '{name}': no LP meshes to export.").format(name=name))
             if inc_cage and not snapshot.get('cage_meshes'):
                 warnings.append(bg_l10n.text("Chapter '{name}': cage included but no cage exists.").format(name=name))
+            elif inc_cage:
+                try:
+                    bg_cage.CageProcessor.validate_export_pairs(
+                        snapshot.get('lp_all') or [], snapshot['cage_meshes'])
+                    # Combined HP+LP export splits LP by its materials. Until
+                    # matching cage splits exist, fail closed for that case.
+                    combined = bool(getattr(self, 'exp_files_one', None) and
+                                    self.exp_files_one.isChecked() and inc_hp and inc_lp)
+                    if combined:
+                        for lp in snapshot.get('lp_all') or []:
+                            if len(bg_final_export.FinalExportProcessor._get_mesh_materials_and_faces(lp)) > 1:
+                                raise ValueError(bg_l10n.text(
+                                    "Cage with multi-material LP requires Separate files."))
+                except Exception as exc:
+                    errors.append("{}: {}".format(name, exc))
         return errors, warnings
 
     def _confirm_export_preflight(self, errors, warnings):
@@ -5456,6 +5775,8 @@ class ExportMixin:
 
     def _export_run(self):
         """Launched by the main Export button. Reads the Export panel settings."""
+        if getattr(self, '_marmoset_export_in_progress', False):
+            return
         if not hasattr(self, 'exp_scope'):
             return self.export_final_group_ui('separate')  # panel not built (fallback)
         inc_hp = self.exp_inc_hp.isChecked()
@@ -5491,9 +5812,11 @@ class ExportMixin:
         else:
             books = sorted(set(p.get('book') for p in self.root_pairs if p.get('book')))
             targets = list(self.root_pairs)
+        targets = self._included_export_pairs(targets)
         if not targets:
-            return cmds.warning("Nothing to export in this scope.")
+            return cmds.warning(bg_l10n.text("Nothing to export in this scope."))
 
+        books = [book for book in books if any(p.get('book') == book for p in targets)]
         self.save_final_smooth_states()
         snapshots = self._prepare_export_snapshots(targets)
 
@@ -5501,12 +5824,18 @@ class ExportMixin:
             hasattr(self, 'exp_target') and self.exp_target.currentIndex() == 1)
         if is_marmoset:
             errors, warnings = self._export_preflight(
-                targets, True, True, False, snapshots=snapshots)
+                targets, inc_hp, inc_lp, False, snapshots=snapshots)
             if ((errors or warnings) and
                     not self._confirm_export_preflight(errors, warnings)):
                 return
-            self.disable_preview_smoothing_for_export()
-            return self._export_marmoset_package(targets, snapshots)
+            if inc_hp:
+                self.disable_preview_smoothing_for_export()
+            self._marmoset_export_in_progress = True
+            try:
+                return self._export_marmoset_package(
+                    targets, snapshots, inc_hp=inc_hp, inc_lp=inc_lp)
+            finally:
+                self._marmoset_export_in_progress = False
 
         # Single preflight before the artist even picks a folder: block on broken
         # scenes, and let them confirm past soft issues (undistributed LP, empty
@@ -5567,14 +5896,15 @@ class ExportMixin:
                 with self.suspend_isolation():
                     # The progress reaches its final value inside this session,
                     # before export_session resumes and redraws the viewport.
-                    with bg_final_export.FinalExportProcessor.export_session():
+                    with bg_final_export.FinalExportProcessor.export_session(
+                            freeze_lp_normals=self._export_freeze_normals_enabled()):
                         if lp_one and inc_lp and not cancel_check():
                             if scope == 1:
                                 lp_base = self._sanitize_export_name(books[0])
                                 lp_pairs = targets
                             else:
                                 lp_base = self._scene_name_base()
-                                lp_pairs = list(self.root_pairs)
+                                lp_pairs = targets
                             if self._export_lp_combined(
                                     lp_pairs, lp_base, export_dir, snapshots=snapshots,
                                     status_callback=status_callback,
@@ -5640,6 +5970,8 @@ class ExportMixin:
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             return
+        if not self._allow_chapter_export(pair):
+            return
         export_dir = cmds.fileDialog2(fileMode=3, dialogStyle=2, caption=bg_l10n.text("Select folder for LP export"))
         if not export_dir:
             return
@@ -5649,7 +5981,8 @@ class ExportMixin:
         snapshot = self._snapshot_for_pair(snapshots, pair)
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                with bg_final_export.FinalExportProcessor.export_session():
+                with bg_final_export.FinalExportProcessor.export_session(
+                        freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Exporting Active LP Only (Isolation Disabled)...", "lightblue")
                     if self._export_lp_for_pair(pair, export_dir, snapshot=snapshot):
                         cmds.inViewMessage(amg="LP meshes successfully exported!", pos='midCenter', fade=True)
@@ -5658,8 +5991,9 @@ class ExportMixin:
         cmds.select(clear=True)
 
     def batch_export_all_lp_only(self):
-        if not self.root_pairs:
-            cmds.warning("Chapter list is empty.")
+        export_pairs = self._included_export_pairs(self.root_pairs)
+        if not export_pairs:
+            cmds.warning(bg_l10n.text("Nothing to export in this scope."))
             return
         confirm = cmds.confirmDialog(
             title=bg_l10n.text('Batch LP Export'),
@@ -5673,13 +6007,14 @@ class ExportMixin:
             return
         export_dir = export_dir[0]
         self.disable_preview_smoothing_for_export()
-        snapshots = self._prepare_export_snapshots(self.root_pairs)
+        snapshots = self._prepare_export_snapshots(export_pairs)
         success_count = 0
         with self.suspend_subgroup_color_preview():
             with self.suspend_isolation():
-                with bg_final_export.FinalExportProcessor.export_session():
+                with bg_final_export.FinalExportProcessor.export_session(
+                        freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Batch Exporting All LP (Isolation Disabled)...", "lightblue")
-                    for pair in self.root_pairs:
+                    for pair in export_pairs:
                         if self._export_lp_for_pair(
                                 pair, export_dir,
                                 snapshot=self._snapshot_for_pair(snapshots, pair)):
@@ -5696,7 +6031,8 @@ class ExportMixin:
         active_book = active_pair.get('book')
         if not active_book:
             return cmds.warning("Active chapter is not in any book. Please group it into a book first.")
-        book_pairs = [p for p in self.root_pairs if p.get('book') == active_book]
+        book_pairs = self._included_export_pairs(
+            [p for p in self.root_pairs if p.get('book') == active_book])
         if not book_pairs:
             return
         export_dirs = cmds.fileDialog2(fileMode=3, caption=bg_l10n.text("Select Folder for Book LP Export ({name})").format(name=active_book))
@@ -5707,7 +6043,8 @@ class ExportMixin:
         snapshots = self._prepare_export_snapshots(book_pairs)
         success_count = 0
         with self.suspend_subgroup_color_preview():
-            with bg_final_export.FinalExportProcessor.export_session():
+            with bg_final_export.FinalExportProcessor.export_session(
+                    freeze_lp_normals=self._export_freeze_normals_enabled()):
                 for pair in book_pairs:
                     if self._export_lp_for_pair(
                             pair, export_dir,
@@ -5722,7 +6059,8 @@ class ExportMixin:
         if not meshes:
             return False
         try:
-            with bg_final_export.FinalExportProcessor.export_session():
+            with bg_final_export.FinalExportProcessor.export_session(
+                    freeze_lp_normals=self._export_freeze_normals_enabled()):
                 return bg_final_export.FinalExportProcessor._export_with_lp_triangulation_rollback(
                     meshes, export_path, triangulate_all=True)
         except Exception as e:
@@ -5730,6 +6068,8 @@ class ExportMixin:
             return False
 
     def _export_lp_for_pair(self, pair, export_dir, snapshot=None):
+        if pair.get('export_excluded', False):
+            return False
         base_name = pair.get('base', 'Chapter_Export')
         if snapshot is None:
             snapshot = self._snapshot_for_pair(self._prepare_export_snapshots([pair]), pair)
@@ -5754,6 +6094,7 @@ class ExportMixin:
         is (re)entered, so on an already-finalized chapter (the common case)
         it used to fire a real rename per mesh for nothing every single time,
         which is real, measurable overhead on a production scene."""
+        bg_cage.CageProcessor.migrate_legacy_links(base_name)
         hp_count = 0
         lp_count = 0
         with bg_core.undo_chunk("FinalizeSubgroupNaming"):
@@ -8464,10 +8805,14 @@ class TOCMixin:
                 pair_item.setData(0, QtCore.Qt.UserRole, p['id'])
                 if ("PAIR", p['id']) in selected_keys:
                     pair_item.setSelected(True)
-                if not hp_node or not lp_node:
+                if p.get('export_excluded', False):
+                    pair_item.setForeground(0, QtGui.QColor("#ffd54f"))
+                    pair_item.setToolTip(0, bg_l10n.text("Excluded from export"))
+                elif not hp_node or not lp_node:
                     pair_item.setForeground(0, QtGui.QColor("#ff5555"))
                 elif self.active_root_id == p['id']:
                     pair_item.setForeground(0, QtGui.QColor("#ffffff"))
+                if self.active_root_id == p['id']:
                     font = pair_item.font(0)
                     font.setBold(True)
                     pair_item.setFont(0, font)
@@ -9147,6 +9492,14 @@ class TOCMixin:
             self.refresh_right_panel()
             self.log("Added selected items to: {}".format(target_book_name), "lightgreen")
 
+    def set_chapter_export_excluded(self, pair_id, excluded):
+        pair = next((p for p in self.root_pairs if p.get('id') == pair_id), None)
+        if not pair:
+            return
+        pair['export_excluded'] = bool(excluded)
+        bg_core.BakeSessionModel.save(self.root_pairs)
+        self.refresh_right_panel()
+
     def show_toc_context_menu(self, pos):
         items = self.toc_tree.selectedItems()
         clicked_item = self.toc_tree.itemAt(pos)
@@ -9165,6 +9518,15 @@ class TOCMixin:
         menu.addAction(act_sel)
 
         if clicked_pair:
+            excluded = bool(clicked_pair.get('export_excluded', False))
+            action_text = "Include in export" if excluded else "Exclude from export"
+            act_export = QAction(action_text, self)
+            act_export.triggered.connect(
+                lambda checked=False, p_id=clicked_pair.get('id'), value=not excluded:
+                self.run_undoable_bg_action(
+                    "Chapter Export Exclusion", self.set_chapter_export_excluded, p_id, value))
+            menu.addAction(act_export)
+
             act_move_mesh = QAction("Move Mesh to", self)
             act_move_mesh.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Move Mesh to Chapter", self.move_selected_meshes_to_chapter, p_id))
             menu.addAction(act_move_mesh)

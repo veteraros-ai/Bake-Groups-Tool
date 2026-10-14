@@ -46,13 +46,55 @@ def _test_export_panel():
     harness.exp_target.setCurrentIndex(1)
     assert harness.exp_inc_hp.isChecked() and harness.exp_inc_lp.isChecked()
     assert not harness.exp_inc_cage.isChecked()
-    assert not harness.exp_inc_hp.isEnabled()
+    assert harness.exp_inc_hp.isEnabled() and harness.exp_inc_lp.isEnabled()
+    assert not harness.exp_inc_cage.isEnabled()
     assert not harness.exp_files_one.isEnabled()
+    harness.exp_inc_lp.setChecked(False)
+    harness.exp_scope.setCurrentIndex(1)
+    assert not harness.exp_inc_lp.isChecked()
+    harness.exp_target.setCurrentIndex(0)
+    harness.exp_target.setCurrentIndex(1)
+    assert harness.exp_inc_hp.isChecked() and not harness.exp_inc_lp.isChecked()
+    harness.exp_inc_hp.setChecked(False)
+    harness.exp_inc_lp.setChecked(True)
+    harness._update_export_target_controls()
+    assert not harness.exp_inc_hp.isChecked() and harness.exp_inc_lp.isChecked()
     harness.exp_target.setCurrentIndex(0)
     assert harness.exp_inc_hp.isEnabled()
+    harness.exp_scope.setCurrentIndex(0)
     assert not harness.exp_bymat.isEnabled()  # Active Chapter
     harness.exp_scope.setCurrentIndex(1)
     assert harness.exp_bymat.isEnabled()
+    panel.close()
+    harness.close()
+
+
+def _test_export_role_routing():
+    harness = _PanelHarness()
+    panel = harness.build_export_panel({})
+    harness.exp_target.setCurrentIndex(1)
+    pair = {"id": "routing", "base": "Routing", "book": "Book"}
+    harness.root_pairs = [pair]
+    harness.active_root_id = "routing"
+    harness.save_final_smooth_states = lambda: None
+    harness._prepare_export_snapshots = lambda targets: {"routing": {}}
+    preflights, exports, preview = [], [], []
+    harness._export_preflight = lambda targets, hp, lp, cage, **kw: (
+        preflights.append((hp, lp, cage)) or ([], []))
+    harness.disable_preview_smoothing_for_export = lambda: preview.append(True)
+    harness._export_marmoset_package = lambda targets, snapshots, **kw: exports.append(kw)
+    harness.exp_inc_hp.setChecked(False)
+    harness._export_run()
+    assert preflights[-1] == (False, True, False)
+    assert exports[-1] == {"inc_hp": False, "inc_lp": True}
+    assert not preview, "LP-only export must not disable the HP preview"
+    harness.exp_inc_hp.setChecked(True)
+    harness.exp_inc_lp.setChecked(False)
+    harness._export_run()
+    assert preflights[-1] == (True, False, False)
+    assert exports[-1] == {"inc_hp": True, "inc_lp": False}
+    assert preview == [True]
+    assert not harness._marmoset_export_in_progress
     panel.close()
     harness.close()
 
@@ -104,6 +146,25 @@ def _test_missing_plugin_offer():
         harness.close()
 
 
+def _test_toolbag_connection_states():
+    original_pids = bg_marmoset_bridge.toolbag_running_pids
+    original_link = os.environ.get("BG_TOOLBAG_LINK_DIR")
+    root = tempfile.mkdtemp(prefix="bg_toolbag_connection_test_")
+    try:
+        os.environ["BG_TOOLBAG_LINK_DIR"] = root
+        bg_marmoset_bridge.toolbag_running_pids = lambda: set()
+        assert bg_marmoset_bridge.find_toolbag_project("package.json")["state"] == "not_running"
+        bg_marmoset_bridge.toolbag_running_pids = lambda: {12345}
+        assert bg_marmoset_bridge.find_toolbag_project("package.json")["state"] == "bridge_unavailable"
+    finally:
+        bg_marmoset_bridge.toolbag_running_pids = original_pids
+        if original_link is None:
+            os.environ.pop("BG_TOOLBAG_LINK_DIR", None)
+        else:
+            os.environ["BG_TOOLBAG_LINK_DIR"] = original_link
+        shutil.rmtree(root)
+
+
 def _test_toolbag_launch_command():
     root = tempfile.mkdtemp(prefix="bg_toolbag_launch_test_")
     manifest = os.path.join(root, "BakeGroups_Marmoset.json")
@@ -137,8 +198,10 @@ def _long(node):
 
 def run():
     _test_export_panel()
+    _test_export_role_routing()
     _test_plugin_installation()
     _test_missing_plugin_offer()
+    _test_toolbag_connection_states()
     _test_toolbag_launch_command()
     cmds.file(new=True, force=True)
     hp_root = cmds.group(empty=True, name="Chapter_HP")
@@ -166,6 +229,8 @@ def run():
     original_export = bg_final_export.FinalExportProcessor.export_selected_fbx
 
     def capture(path):
+        with open(path, 'wb') as stream:
+            stream.write(b"FBX test placeholder")
         selected = cmds.ls(selection=True, long=True, type="transform") or []
         captured.append({
             "path": path,
@@ -196,6 +261,50 @@ def run():
         assert cmds.polyEvaluate(hp_nodes[0], face=True) == 6
         assert cmds.polyEvaluate(lp, face=True) == 4
         assert not cmds.ls("BG_Marmoset_Export_Temp*", type="transform")
+        combined_path = os.path.join(out_dir, "models", "Chapter_Marmoset.fbx")
+        combined_stat = os.stat(combined_path)
+        exporter = bg_marmoset_bridge.MarmosetPackageExporter
+        # Existing combined packages, including schema-1 legacy packages, can
+        # be upgraded without dropping records or overwriting the other role.
+        manifest["chapters"][0].pop("models")
+        manifest["chapters"][0].pop("update_roles")
+        bg_marmoset_bridge._atomic_write_json(manifest_path, manifest)
+        exporter.export_package([pair], {"chapter-id": snapshot}, out_dir, inc_lp=False)
+        with open(manifest_path) as stream:
+            partial = json.load(stream)["chapters"][0]
+        assert partial["update_roles"] == ["high"]
+        assert len(partial["meshes"]) == 3
+        assert sorted(captured[-1]["faces"]) == [6, 6]
+        assert len(captured[-1]["names"]) == 2
+        assert len(partial["models"]) == 2
+        assert os.stat(combined_path).st_mtime_ns == combined_stat.st_mtime_ns
+        hp_path = os.path.join(out_dir, "models", "Chapter_Marmoset_HP.fbx")
+        hp_stat = os.stat(hp_path)
+        exporter.export_package([pair], {"chapter-id": snapshot}, out_dir, inc_hp=False)
+        with open(manifest_path) as stream:
+            partial = json.load(stream)["chapters"][0]
+        assert partial["update_roles"] == ["low"]
+        assert len(partial["meshes"]) == 3
+        assert captured[-1]["faces"] == [8]
+        assert len(captured[-1]["names"]) == 1
+        assert os.stat(hp_path).st_mtime_ns == hp_stat.st_mtime_ns
+        assert {m["path"] for m in partial["models"]} == {
+            "models/Chapter_Marmoset_HP.fbx", "models/Chapter_Marmoset_LP.fbx"}
+        before = len(captured)
+        assert exporter.export_package(
+            [pair], {"chapter-id": snapshot}, out_dir, inc_hp=False, inc_lp=False) is None
+        assert len(captured) == before
+        # Validation must only complain about the requested root/role.
+        harness = _PanelHarness()
+        partial_snapshot = dict(snapshot, lp=None, loose_lp=["irrelevant"])
+        errors, warnings = harness._export_preflight(
+            [pair], True, False, False, {"chapter-id": partial_snapshot})
+        assert not errors and not warnings, (errors, warnings)
+        errors, warnings = harness._export_preflight(
+            [pair], False, True, False,
+            {"chapter-id": dict(snapshot, hp=None, loose_lp=[])})
+        assert not errors and not warnings, (errors, warnings)
+        harness.close()
         print("Marmoset Maya bridge test: OK")
     finally:
         bg_final_export.FinalExportProcessor.export_selected_fbx = original_export

@@ -1,6 +1,22 @@
 ﻿{
     "language":  "ja",
     "texts":  {
+                  "Freeze LP normals": "LP 法線を固定",
+                  "Freeze LP normals tooltip": "三角形化の前に、一時的なエクスポート用コピーの LP 法線を保持します。元のメッシュは変更されません。",
+                  "Marmoset connection":  "Marmoset 接続",
+                  "Marmoset meshes updated: {name}":  "Marmoset のメッシュを更新しました: {name}",
+                  "Marmoset sync failed: {error}":  "Marmoset の同期に失敗しました: {error}",
+                  "Import into current scene":  "現在のシーンにインポート",
+                  "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.":  "Marmoset が起動していません。エクスポート前に Toolbag と Bake Groups Bridge を開いてください。",
+                  "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.":  "Marmoset は起動していますが、ブリッジが応答しません。Toolbag で Bake Groups Bridge を開くか再起動してください。",
+                  "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.":  "エクスポート対象のプロジェクトが Marmoset で開かれていません。Toolbag シーンと Bake Groups Bridge のパッケージを開いてください。",
+                  "Several Toolbag sessions are open. Leave only one session with this project open.":  "複数の Toolbag セッションが開いています。このプロジェクトのセッションを一つだけ開いてください。",
+                  "This package is not loaded in the current Marmoset scene. Import it into this scene?":  "現在の Marmoset シーンにこのパッケージは読み込まれていません。このシーンにインポートしますか？",
+                  "Exclude from export":  "エクスポートから除外",
+                  "Include in export":  "エクスポートに含める",
+                  "Excluded from export":  "エクスポートから除外されています",
+                  "Chapter '{name}' is excluded from export.":  "チャプター「{name}」はエクスポートから除外されています。",
+                  "Nothing to export in this scope.":  "この範囲にエクスポート対象のチャプターはありません。",
                   "Manual HPs:":  "手動 HP:",
                   "Empty manual cluster. Use Link later to replace it with selected HP meshes.":  "空の手動クラスター。後で Link を押して、選択した HP メッシュに置き換えてください。",
                   "Create Cage":  "Cage を作成",
@@ -512,6 +528,10 @@
                      "Marmoset launch failed: {error}": "パッケージは書き出されましたが、Toolbagを起動できませんでした: {error}",
                      "External HP OBJ helper missing":  "外部OBJ書き出しツールが見つかりません。Bake Groupsを再インストールまたは復元してください。",
                      "Converting HP to OBJ...":  "HPをOBJに変換中...",
-                     "External HP OBJ export failed: {error}":  "外部HP OBJの書き出しに失敗しました: {error}"
+                     "External HP OBJ export failed: {error}":  "外部HP OBJの書き出しに失敗しました: {error}",
+                     "Cage scan incomplete.": "Cage の検査は完了していません。",
+                     "No detected intersections. Check coplanar contacts manually.": "交差は検出されませんでした。同一平面上の接触は手動で確認してください。",
+                     "Cage or HP changed. Run Find intersections again.": "Cage または HP が変更されました。Find intersections を再実行してください。",
+                     "Cage with multi-material LP requires Separate files.": "複数マテリアルの LP と Cage は Separate files で書き出してください。"
                  }
 }

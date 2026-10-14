@@ -1,6 +1,22 @@
 ﻿{
     "language":  "ru",
     "texts":  {
+                  "Freeze LP normals": "Фриз нормалей LP",
+                  "Freeze LP normals tooltip": "Сохранить исходные нормали LP на временных экспортных копиях перед триангуляцией. Исходные меши не изменяются.",
+                  "Marmoset connection":  "Связь с Marmoset",
+                  "Marmoset meshes updated: {name}":  "Меши Marmoset обновлены: {name}",
+                  "Marmoset sync failed: {error}":  "Не удалось обновить Marmoset: {error}",
+                  "Import into current scene":  "Импортировать в текущую сцену",
+                  "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.":  "Marmoset не запущен. Перед экспортом откройте Toolbag и Bake Groups Bridge.",
+                  "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.":  "Marmoset запущен, но мост не отвечает. Откройте или перезапустите Bake Groups Bridge в Toolbag.",
+                  "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.":  "Экспортируемый проект не открыт в Marmoset. Откройте его сцену Toolbag и пакет в Bake Groups Bridge.",
+                  "Several Toolbag sessions are open. Leave only one session with this project open.":  "Открыто несколько сессий Toolbag. Оставьте одну сессию с нужным проектом.",
+                  "This package is not loaded in the current Marmoset scene. Import it into this scene?":  "Этот пакет ещё не загружен в текущую сцену Marmoset. Импортировать его в эту сцену?",
+                  "Exclude from export":  "Исключить из экспорта",
+                  "Include in export":  "Включить в экспорт",
+                  "Excluded from export":  "Исключена из экспорта",
+                  "Chapter '{name}' is excluded from export.":  "Глава «{name}» исключена из экспорта.",
+                  "Nothing to export in this scope.":  "В этой области нет глав для экспорта.",
                   "Target":  "Назначение",
                   "Select Marmoset Package Folder":  "Выберите папку пакета Marmoset",
                   "Preparing Marmoset package...":  "Подготовка пакета Marmoset...",
@@ -544,6 +560,10 @@
                      "Marmoset launch failed: {error}": "Пакет экспортирован, но открыть Toolbag не удалось: {error}",
                      "External HP OBJ helper missing":  "Не найдена утилита внешнего экспорта OBJ. Переустановите или восстановите Bake Groups.",
                      "Converting HP to OBJ...":  "Преобразование HP в OBJ...",
-                     "External HP OBJ export failed: {error}":  "Не удалось экспортировать внешний HP OBJ: {error}"
+                     "External HP OBJ export failed: {error}":  "Не удалось экспортировать внешний HP OBJ: {error}",
+                     "Cage scan incomplete.": "Проверка Cage не завершена.",
+                     "No detected intersections. Check coplanar contacts manually.": "Пересечений не обнаружено. Копланарные контакты проверьте вручную.",
+                     "Cage or HP changed. Run Find intersections again.": "Cage или HP изменён. Повторите Find intersections.",
+                     "Cage with multi-material LP requires Separate files.": "Для Cage с несколькими материалами LP выберите Separate files."
                  }
 }

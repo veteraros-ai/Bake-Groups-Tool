@@ -1,6 +1,22 @@
 ﻿{
     "language":  "zh-CN",
     "texts":  {
+                  "Freeze LP normals": "冻结 LP 法线",
+                  "Freeze LP normals tooltip": "三角化前保留临时导出副本的 LP 法线。不修改原始网格。",
+                  "Marmoset connection":  "Marmoset 连接",
+                  "Marmoset meshes updated: {name}":  "Marmoset 网格已更新：{name}",
+                  "Marmoset sync failed: {error}":  "Marmoset 同步失败：{error}",
+                  "Import into current scene":  "导入当前场景",
+                  "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.":  "Marmoset 未运行。导出前请打开 Toolbag 和 Bake Groups Bridge。",
+                  "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.":  "Marmoset 已运行，但桥接插件未响应。请在 Toolbag 中打开或重启 Bake Groups Bridge。",
+                  "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.":  "要导出的项目未在 Marmoset 中打开。请打开其 Toolbag 场景，并在 Bake Groups Bridge 中打开对应数据包。",
+                  "Several Toolbag sessions are open. Leave only one session with this project open.":  "已打开多个 Toolbag 会话。请仅保留一个打开此项目的会话。",
+                  "This package is not loaded in the current Marmoset scene. Import it into this scene?":  "当前 Marmoset 场景尚未加载此数据包。是否导入此场景？",
+                  "Exclude from export":  "从导出中排除",
+                  "Include in export":  "包含在导出中",
+                  "Excluded from export":  "已从导出中排除",
+                  "Chapter '{name}' is excluded from export.":  "章节“{name}”已从导出中排除。",
+                  "Nothing to export in this scope.":  "此范围内没有可导出的章节。",
                   "Manual HPs:":  "手动 HP：",
                   "Empty manual cluster. Use Link later to replace it with selected HP meshes.":  "空的手动簇。稍后点击 Link，用所选的 HP 网格替换它。",
                   "Create Cage":  "创建 Cage",
@@ -512,6 +528,10 @@
                      "Marmoset launch failed: {error}": "已导出包，但无法打开 Toolbag：{error}",
                      "External HP OBJ helper missing":  "找不到外部 OBJ 导出工具。请重新安装或恢复 Bake Groups。",
                      "Converting HP to OBJ...":  "正在将 HP 转换为 OBJ...",
-                     "External HP OBJ export failed: {error}":  "外部 HP OBJ 导出失败：{error}"
+                     "External HP OBJ export failed: {error}":  "外部 HP OBJ 导出失败：{error}",
+                     "Cage scan incomplete.": "Cage 检查未完成。",
+                     "No detected intersections. Check coplanar contacts manually.": "未检测到相交。请手动检查共面接触。",
+                     "Cage or HP changed. Run Find intersections again.": "Cage 或 HP 已更改。请重新运行 Find intersections。",
+                     "Cage with multi-material LP requires Separate files.": "LP 包含多个材质时，请使用 Separate files 导出 Cage。"
                  }
 }

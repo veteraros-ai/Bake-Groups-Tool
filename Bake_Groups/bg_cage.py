@@ -17,12 +17,18 @@ polygon cuts into HP.
 from __future__ import print_function, division, absolute_import
 
 import math
+import hashlib
+import struct
+from collections import deque
 
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 
 CAGE_ROOT = "Cage_BG"
 SUFFIX_CAGE = "_cage"
+SOURCE_ATTR = "bgCageSource"
+SOURCE_UUID_ATTR = "bgCageSourceUuid"
+TOPOLOGY_ATTR = "bgCageTopology"
 
 
 class CageProcessor(object):
@@ -34,17 +40,144 @@ class CageProcessor(object):
     # Geometry helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _shape_dag(transform):
+    def _shape_dag(transform, allow_instances=False):
+        shapes = cmds.listRelatives(
+            transform, shapes=True, noIntermediate=True, fullPath=True, type='mesh') or []
+        if len(shapes) != 1:
+            raise ValueError("Expected one mesh shape: {}".format(transform))
         sel = om.MSelectionList()
-        sel.add(transform)
+        sel.add(shapes[0])
         dag = sel.getDagPath(0)
-        dag.extendToShape()
+        if dag.isInstanced() and not allow_instances:
+            raise ValueError("Instanced Cage/LP meshes are not supported: {}".format(transform))
         return dag
 
     @staticmethod
-    def _fn_mesh(transform):
-        dag = CageProcessor._shape_dag(transform)
+    def _fn_mesh(transform, allow_instances=False):
+        dag = CageProcessor._shape_dag(transform, allow_instances=allow_instances)
         return om.MFnMesh(dag), dag
+
+    @staticmethod
+    def topology_signature(node, allow_instances=False):
+        fn, _ = CageProcessor._fn_mesh(node, allow_instances=allow_instances)
+        counts, indices = fn.getVertices()
+        return (fn.numVertices, tuple(counts), tuple(indices))
+
+    @staticmethod
+    def _topology_digest(node):
+        return hashlib.sha256(repr(CageProcessor.topology_signature(node)).encode('ascii')).hexdigest()
+
+    @staticmethod
+    def validate_pair(lp, cage):
+        if not lp or not cage or not cmds.objExists(lp) or not cmds.objExists(cage):
+            raise ValueError("Cage source LP is missing: {}".format(cage))
+        if CageProcessor.topology_signature(lp) != CageProcessor.topology_signature(cage):
+            raise ValueError("LP/Cage topology or vertex order differs: {} / {}".format(lp, cage))
+        if cmds.attributeQuery(TOPOLOGY_ATTR, node=cage, exists=True):
+            saved = cmds.getAttr(cage + '.' + TOPOLOGY_ATTR)
+            if saved and saved != CageProcessor._topology_digest(lp):
+                raise ValueError("LP topology changed; existing Cage preserved: {}".format(cage))
+
+    @staticmethod
+    def bind_source(lp, cage):
+        CageProcessor.validate_pair(lp, cage)
+        existing = CageProcessor.source_lp(cage, allow_legacy=False)
+        if existing and (cmds.ls(existing, uuid=True) or []) != (cmds.ls(lp, uuid=True) or []):
+            raise ValueError("Cage already belongs to another LP: {}".format(cage))
+        if not cmds.attributeQuery(SOURCE_ATTR, node=cage, exists=True):
+            cmds.addAttr(cage, longName=SOURCE_ATTR, attributeType='message')
+        if not cmds.isConnected(lp + '.message', cage + '.' + SOURCE_ATTR):
+            cmds.connectAttr(lp + '.message', cage + '.' + SOURCE_ATTR)
+        for attr, value in (
+                (SOURCE_UUID_ATTR, (cmds.ls(lp, uuid=True) or [''])[0]),
+                (TOPOLOGY_ATTR, CageProcessor._topology_digest(lp))):
+            if not cmds.attributeQuery(attr, node=cage, exists=True):
+                cmds.addAttr(cage, longName=attr, dataType='string')
+            if cmds.getAttr(cage + '.' + attr) != value:
+                cmds.setAttr(cage + '.' + attr, value, type='string')
+
+    @staticmethod
+    def source_lp(cage, allow_legacy=True):
+        if not cage or not cmds.objExists(cage):
+            return None
+        if cmds.attributeQuery(SOURCE_ATTR, node=cage, exists=True):
+            nodes = cmds.listConnections(
+                cage + '.' + SOURCE_ATTR, source=True, destination=False) or []
+            if len(nodes) == 1:
+                return (cmds.ls(nodes[0], long=True) or [None])[0]
+        if cmds.attributeQuery(SOURCE_UUID_ATTR, node=cage, exists=True):
+            identity = cmds.getAttr(cage + '.' + SOURCE_UUID_ATTR)
+            nodes = (cmds.ls(identity, long=True, type='transform') or []) if identity else []
+            return nodes[0] if len(nodes) == 1 else None
+        if allow_legacy:
+            short = cage.split('|')[-1]
+            if short.endswith(SUFFIX_CAGE):
+                candidates = cmds.ls(short[:-len(SUFFIX_CAGE)], long=True, type='transform') or []
+                if len(candidates) == 1:
+                    CageProcessor.bind_source(candidates[0], cage)
+                    return candidates[0]
+        return None
+
+    @staticmethod
+    def migrate_legacy_links(base_name):
+        for cage in CageProcessor.get_chapter_cage_meshes(base_name):
+            try:
+                CageProcessor.source_lp(cage)
+            except ValueError as exc:
+                cmds.warning(str(exc))
+
+    @staticmethod
+    def find_cage_for_lp(lp, index):
+        identity = (cmds.ls(lp, uuid=True) or [''])[0]
+        cage = index.get('source:' + identity)
+        if not cage:
+            candidate = index.get(lp.split('|')[-1] + SUFFIX_CAGE)
+            source = CageProcessor.source_lp(candidate) if candidate else None
+            if source and (cmds.ls(source, uuid=True) or [''])[0] == identity:
+                cage = candidate
+        if not cage:
+            connections = cmds.listConnections(
+                lp + '.message', source=False, destination=True, plugs=True) or []
+            candidates = []
+            for plug in connections:
+                if plug.endswith('.' + SOURCE_ATTR):
+                    paths = cmds.ls(plug.rsplit('.', 1)[0], long=True) or []
+                    candidates.extend(paths)
+            candidates = sorted(set(candidates))
+            if len(candidates) > 1:
+                raise ValueError("Several cages refer to the same LP: {}".format(lp))
+            if candidates:
+                cage = candidates[0]
+        if cage:
+            CageProcessor.validate_pair(lp, cage)
+        return cage
+
+    @staticmethod
+    def validate_export_pairs(lp_nodes, cage_nodes):
+        sources = {}
+        lp_ids = {(cmds.ls(lp, uuid=True) or [''])[0] for lp in lp_nodes}
+        for cage in cage_nodes:
+            lp = CageProcessor.source_lp(cage)
+            CageProcessor.validate_pair(lp, cage)
+            identity = (cmds.ls(lp, uuid=True) or [''])[0]
+            if identity not in lp_ids:
+                raise ValueError("Cage refers to LP outside the exported chapter: {}".format(cage))
+            if identity in sources:
+                raise ValueError("Several cages refer to the same LP: {}".format(lp))
+            sources[identity] = cage
+        for lp in lp_nodes:
+            if (cmds.ls(lp, uuid=True) or [''])[0] not in sources:
+                raise ValueError("LP has no matching Cage: {}".format(lp))
+        return sources
+
+    @staticmethod
+    def geometry_stamp(node, allow_instances=False):
+        fn, _ = CageProcessor._fn_mesh(node, allow_instances=allow_instances)
+        digest = hashlib.sha256(repr(CageProcessor.topology_signature(
+            node, allow_instances=allow_instances)).encode('ascii'))
+        for point in fn.getPoints(om.MSpace.kWorld):
+            digest.update(struct.pack('<3d', point.x, point.y, point.z))
+        return digest.hexdigest()
 
     @staticmethod
     def _bbox_diag(transform):
@@ -150,7 +283,8 @@ class CageProcessor(object):
         return points, normals, [float(amount)] * n
 
     @staticmethod
-    def inflate_existing_cage(cage_transform, delta, lp_transform=None):
+    def inflate_existing_cage(cage_transform, delta, lp_transform=None,
+                              transaction=None, directions=None):
         """Push every vertex of an ALREADY-BUILT cage mesh outward (or inward,
         for a negative delta) by ``delta`` along a STABLE direction, added on
         top of the vertex's current position - so it never recomputes topology
@@ -171,24 +305,24 @@ class CageProcessor(object):
         fn, _dag = CageProcessor._fn_mesh(cage_transform)
         pts = fn.getPoints(om.MSpace.kWorld)
         n = len(pts)
-        nrm = None
-        if lp_transform and cmds.objExists(lp_transform):
-            try:
-                lp_fn, _d = CageProcessor._fn_mesh(lp_transform)
-                lp_nrm = lp_fn.getVertexNormals(True, om.MSpace.kWorld)
-                if len(lp_nrm) == n:
-                    nrm = lp_nrm
-            except Exception:
-                nrm = None
-        if nrm is None:
-            nrm = fn.getVertexNormals(True, om.MSpace.kWorld)  # fallback (drifts)
+        if directions is None:
+            lp_transform = lp_transform or CageProcessor.source_lp(cage_transform)
+            CageProcessor.validate_pair(lp_transform, cage_transform)
+            lp_fn, _d = CageProcessor._fn_mesh(lp_transform)
+            directions = lp_fn.getVertexNormals(True, om.MSpace.kWorld)
+        if len(directions) != n:
+            raise ValueError("Cage direction field no longer matches topology.")
         out = om.MPointArray()
         for i in range(n):
             out.append(om.MPoint(
-                pts[i].x + nrm[i].x * delta,
-                pts[i].y + nrm[i].y * delta,
-                pts[i].z + nrm[i].z * delta))
-        fn.setPoints(out, om.MSpace.kWorld)
+                pts[i].x + directions[i][0] * delta,
+                pts[i].y + directions[i][1] * delta,
+                pts[i].z + directions[i][2] * delta))
+        if transaction is not None:
+            transaction.set_points(cage_transform, out)
+        else:
+            from bg_cage_undo import set_points_undoable
+            set_points_undoable(cage_transform, out)
 
     # ------------------------------------------------------------------
     # Cage <-> HP intersection islands (manual normal-move touch-up)
@@ -202,26 +336,39 @@ class CageProcessor(object):
         The averaged object-space normal is stored so a later slider can push
         the island straight out along it (reversibly, via setPoints)."""
         islands = []
-        if not cmds.objExists(cage_transform):
-            return islands
-        try:
-            sel = om.MSelectionList(); sel.add(cage_transform)
-            dag = sel.getDagPath(0); dag.extendToShape()
-        except Exception:
-            return islands
+        fn_cage, dag = CageProcessor._fn_mesh(cage_transform)
+        cage_bbox = cmds.exactWorldBoundingBox(cage_transform)
+        epsilon = max(CageProcessor._bbox_diag(cage_transform) * 1e-7, 1e-10)
+
+        def overlaps(a, b):
+            return all(a[i] <= b[i + 3] + epsilon and b[i] <= a[i + 3] + epsilon
+                       for i in range(3))
+
+        def segment_box(a, b):
+            return [min(a[i], b[i]) for i in range(3)] + [max(a[i], b[i]) for i in range(3)]
+
+        def hit_segment(fn, accel, p0, p1):
+            ray = p1 - p0
+            length = ray.length()
+            if length <= epsilon:
+                return None
+            ray.normalize()
+            return fn.closestIntersection(
+                om.MFloatPoint(p0.x, p0.y, p0.z),
+                om.MFloatVector(ray.x, ray.y, ray.z),
+                om.MSpace.kWorld, length, False, accelParams=accel,
+                tolerance=epsilon)
 
         hp_fns = []
         for hp in hp_transforms or []:
             if not hp or not cmds.objExists(hp):
-                continue
-            try:
-                s = om.MSelectionList(); s.add(hp); d = s.getDagPath(0); d.extendToShape()
-                if not d.hasFn(om.MFn.kMesh):
-                    continue
-                fn = om.MFnMesh(d)
-                hp_fns.append((fn, fn.autoUniformGridParams()))
-            except Exception:
-                continue
+                raise ValueError("HP mesh disappeared during Cage scan: {}".format(hp))
+            bbox = cmds.exactWorldBoundingBox(hp)
+            if overlaps(cage_bbox, bbox):
+                fn, hp_dag = CageProcessor._fn_mesh(hp, allow_instances=True)
+                hp_fns.append((fn, fn.autoUniformGridParams(), hp_dag, bbox))
+        if not hp_transforms:
+            raise ValueError("No HP meshes for Cage intersection scan.")
         if not hp_fns:
             return islands
 
@@ -230,34 +377,68 @@ class CageProcessor(object):
         while not edge_it.isDone():
             p0 = edge_it.point(0, om.MSpace.kWorld)
             p1 = edge_it.point(1, om.MSpace.kWorld)
-            ray = p1 - p0
-            length = ray.length()
-            if length > 1e-5:
-                ray.normalize()
-                src = om.MFloatPoint(p0.x, p0.y, p0.z)
-                dirv = om.MFloatVector(ray.x, ray.y, ray.z)
-                for fn, accel in hp_fns:
-                    try:
-                        if fn.closestIntersection(src, dirv, om.MSpace.kWorld, length, False, accelParams=accel):
-                            for f in edge_it.getConnectedFaces():
-                                intersecting.add(f)
-                            break
-                    except Exception:
-                        pass
+            for fn, accel, hp_dag, bbox in hp_fns:
+                if overlaps(segment_box(p0, p1), bbox) and hit_segment(fn, accel, p0, p1):
+                    intersecting.update(edge_it.getConnectedFaces())
+                    break
             edge_it.next()
+
+        # Reverse probes catch an HP edge crossing the INTERIOR of a Cage
+        # polygon even when none of that polygon's own edges intersects HP.
+        cage_accel = fn_cage.autoUniformGridParams()
+        for fn, accel, hp_dag, bbox in hp_fns:
+            ray_max = max(sum(abs(bbox[i+3] - bbox[i]) for i in range(3)),
+                          sum(abs(cage_bbox[i+3] - cage_bbox[i]) for i in range(3))) * 2
+            hp_edge = om.MItMeshEdge(hp_dag)
+            closed = True
+            while not hp_edge.isDone():
+                if len(hp_edge.getConnectedFaces()) != 2:
+                    closed = False
+                p0 = hp_edge.point(0, om.MSpace.kWorld)
+                p1 = hp_edge.point(1, om.MSpace.kWorld)
+                if overlaps(segment_box(p0, p1), cage_bbox):
+                    hit = hit_segment(fn_cage, cage_accel, p0, p1)
+                    if hit:
+                        intersecting.add(int(hit[2]))
+                hp_edge.next()
+            if not closed:
+                continue  # containment is undefined on an open surface
+            vertex_it = om.MItMeshVertex(dag)
+            while not vertex_it.isDone():
+                point = vertex_it.position(om.MSpace.kWorld)
+                if all(bbox[i] + epsilon < point[i] < bbox[i + 3] - epsilon for i in range(3)):
+                    cp, _face = fn.getClosestPoint(point, om.MSpace.kWorld)
+                    if (cp - point).length() > epsilon:
+                        votes = 0
+                        for vector in ((1, .371, .529), (.217, 1, .613), (.419, .283, 1)):
+                            direction = om.MVector(*vector).normal()
+                            result = fn.allIntersections(
+                                om.MFloatPoint(point.x, point.y, point.z),
+                                om.MFloatVector(direction.x, direction.y, direction.z),
+                                om.MSpace.kWorld, ray_max,
+                                False, accelParams=accel, sortHits=True, tolerance=epsilon)
+                            distances = sorted(result[1])
+                            unique = []
+                            for distance in distances:
+                                if not unique or abs(distance - unique[-1]) > epsilon:
+                                    unique.append(distance)
+                            votes += len(unique) % 2
+                        if votes >= 2:
+                            intersecting.update(vertex_it.getConnectedFaces())
+                vertex_it.next()
         if not intersecting:
             return islands
 
         visited = set()
         poly_it = om.MItMeshPolygon(dag)
-        for fid in intersecting:
+        for fid in sorted(intersecting):
             if fid in visited:
                 continue
             island_faces = []
-            queue = [fid]
+            queue = deque([fid])
             visited.add(fid)
             while queue:
-                cur = queue.pop(0)
+                cur = queue.popleft()
                 island_faces.append(cur)
                 poly_it.setIndex(cur)
                 for conn in poly_it.getConnectedFaces():
@@ -268,16 +449,21 @@ class CageProcessor(object):
             verts = set()
             for f in island_faces:
                 poly_it.setIndex(f)
-                avg += poly_it.getNormal(om.MSpace.kObject)
+                avg += poly_it.getNormal(om.MSpace.kWorld)
                 verts.update(poly_it.getVertices())
             if avg.length() > 1e-5:
                 avg.normalize()
-            islands.append({'faces': island_faces, 'verts': sorted(verts),
-                            'normal': (avg.x, avg.y, avg.z)})
+            island = {'faces': island_faces, 'verts': sorted(verts),
+                      'normal': (avg.x, avg.y, avg.z), 'normal_space': 'world'}
+            if avg.length() < 1e-5:
+                normals = fn_cage.getVertexNormals(True, om.MSpace.kWorld)
+                island['vertex_directions'] = {
+                    vi: (normals[vi].x, normals[vi].y, normals[vi].z) for vi in verts}
+            islands.append(island)
         return islands
 
     @staticmethod
-    def move_islands(cage_transform, islands, delta):
+    def move_islands(cage_transform, islands, delta, transaction=None):
         """Push every island's vertices by ``delta`` along that island's fixed
         object-space normal. setPoints-based (no history), reversible: +d then
         -d returns exactly. Shared border vertices move too, so neighbouring
@@ -286,16 +472,32 @@ class CageProcessor(object):
         if not cmds.objExists(cage_transform) or abs(delta) < 1e-9 or not islands:
             return
         fn, _dag = CageProcessor._fn_mesh(cage_transform)
-        pts = fn.getPoints(om.MSpace.kObject)
+        pts = fn.getPoints(om.MSpace.kWorld)
+        dag = CageProcessor._shape_dag(cage_transform)
         n = len(pts)
+        directions_by_vertex = {}
         for isl in islands:
-            nx, ny, nz = isl.get('normal', (0.0, 0.0, 0.0))
+            direction = om.MVector(*isl.get('normal', (0.0, 0.0, 0.0)))
+            if isl.get('normal_space') != 'world':
+                direction = direction * dag.inclusiveMatrixInverse().transpose()
+                if direction.length() > 1e-12:
+                    direction.normalize()
             for vi in isl.get('verts', []):
-                if 0 <= vi < n:
-                    pts[vi] = om.MPoint(pts[vi].x + nx * delta,
-                                        pts[vi].y + ny * delta,
-                                        pts[vi].z + nz * delta)
-        fn.setPoints(pts, om.MSpace.kObject)
+                if not 0 <= vi < n:
+                    raise ValueError("Intersection island vertex no longer exists.")
+                local_direction = om.MVector(*isl.get('vertex_directions', {}).get(
+                    vi, (direction.x, direction.y, direction.z)))
+                directions_by_vertex.setdefault(vi, om.MVector())
+                directions_by_vertex[vi] += local_direction
+        for vi, direction in directions_by_vertex.items():
+            if direction.length() > 1e-12:
+                direction.normalize()
+            pts[vi] += direction * delta
+        if transaction is not None:
+            transaction.set_points(cage_transform, pts)
+        else:
+            from bg_cage_undo import set_points_undoable
+            set_points_undoable(cage_transform, pts)
 
     @staticmethod
     def fit_offsets(lp_transform, target_hp, obstacle_hp, inflate, gap):
@@ -441,7 +643,8 @@ class CageProcessor(object):
             out = om.MPointArray()
             for (x, y, z) in pos:
                 out.append(om.MPoint(x, y, z))
-            fn.setPoints(out, om.MSpace.kWorld)
+            from bg_cage_undo import set_points_undoable
+            set_points_undoable(cage, out)
 
         def _cage_fn(cage):
             try:
@@ -616,27 +819,37 @@ class CageProcessor(object):
 
         ``specs`` = [{'lp':.., 'name':.., 'folder':..}]. Returns cage full paths
         in the same order (None where a spec failed)."""
-        specs = [s for s in (specs or []) if s.get('lp') and cmds.objExists(s['lp'])]
+        specs = list(specs or [])
         if not specs:
             return []
+        for spec in specs:
+            fn, _dag = CageProcessor._fn_mesh(spec['lp'])
+            if fn.numVertices == 0 or fn.numPolygons == 0:
+                raise ValueError("LP has no polygons: {}".format(spec['lp']))
+            if not spec.get('folder') or not cmds.objExists(spec['folder']):
+                raise ValueError("Cage target folder is missing.")
         lp_list = [s['lp'] for s in specs]
         dups = cmds.duplicate(lp_list, returnRootsOnly=True, inputConnections=False)
-        cages = []
-        for spec, dup in zip(specs, dups):
-            try:
+        identities = [(cmds.ls(dup, uuid=True) or [''])[0] for dup in dups]
+        try:
+            if len(dups) != len(specs):
+                raise ValueError("Cage duplication returned an unexpected number of meshes.")
+            cages = []
+            for spec, dup in zip(specs, dups):
                 d = cmds.parent(dup, spec['folder'], absolute=True)[0]
                 d = cmds.rename(d, spec['name'])
                 cages.append(cmds.ls(d, long=True)[0])
-            except Exception:
-                cages.append(None)
-        valid = [c for c in cages if c]
-        if valid:
-            try:
-                cmds.delete(valid, constructionHistory=True)
-            except Exception:
-                pass
-            CageProcessor.apply_cage_display_batch(valid, display_mode)
-        return cages
+            cmds.delete(cages, constructionHistory=True)
+            for spec, cage in zip(specs, cages):
+                CageProcessor.bind_source(spec['lp'], cage)
+            CageProcessor.apply_cage_display_batch(cages, display_mode)
+            return cages
+        except Exception:
+            owned = [node for identity in identities if identity
+                     for node in (cmds.ls(identity, long=True, type='transform') or [])]
+            if owned:
+                cmds.delete(owned)
+            raise
 
     @staticmethod
     def set_chapter_cage_display(base_name, mode):
@@ -648,13 +861,16 @@ class CageProcessor(object):
     def _apply_offsets(cage_transform, points, normals, offsets):
         fn, _ = CageProcessor._fn_mesh(cage_transform)
         new_pts = om.MPointArray()
-        count = min(len(points), fn.numVertices)
+        count = fn.numVertices
+        if len(points) != count or len(normals) != count or len(offsets) != count:
+            raise ValueError("Cage offsets no longer match LP topology.")
         for i in range(count):
             vx, vy, vz = points[i]
             nx, ny, nz = normals[i]
             o = offsets[i]
             new_pts.append(om.MPoint(vx + nx * o, vy + ny * o, vz + nz * o))
-        fn.setPoints(new_pts, om.MSpace.kWorld)
+        from bg_cage_undo import set_points_undoable
+        set_points_undoable(cage_transform, new_pts)
 
     @staticmethod
     def index_existing_cages(chapter_grp):
@@ -666,8 +882,19 @@ class CageProcessor(object):
             return index
         for tr in cmds.listRelatives(chapter_grp, allDescendents=True, fullPath=True, type='transform') or []:
             short = tr.split('|')[-1]
-            if short.endswith(SUFFIX_CAGE) and cmds.listRelatives(tr, shapes=True, type='mesh'):
+            if (short.endswith(SUFFIX_CAGE) or cmds.attributeQuery(SOURCE_ATTR, node=tr, exists=True)) \
+                    and cmds.listRelatives(tr, shapes=True, type='mesh'):
                 index.setdefault(short, tr)
+                try:
+                    source = CageProcessor.source_lp(tr)
+                except ValueError as exc:
+                    cmds.warning(str(exc))
+                    source = None
+                if source:
+                    key = 'source:' + (cmds.ls(source, uuid=True) or [''])[0]
+                    if key in index and index[key] != tr:
+                        raise ValueError("Duplicate Cage for LP: {}".format(source))
+                    index[key] = tr
         return index
 
     @staticmethod
@@ -695,11 +922,12 @@ class CageProcessor(object):
         target_folder = CageProcessor.ensure_relative_folders(chapter_grp, folders)
 
         if existing_index is not None:
-            existing = existing_index.get(cage_name)
+            existing = CageProcessor.find_cage_for_lp(lp_transform, existing_index)
             if existing and not cmds.objExists(existing):
                 existing = None
         else:
-            existing = CageProcessor.find_cage(chapter_grp, cage_name)
+            existing = CageProcessor.find_cage_for_lp(
+                lp_transform, CageProcessor.index_existing_cages(chapter_grp))
 
         # Lazy geometry: a fresh DEFLATED cage (inflate=0, not fitted) is just the
         # LP duplicate, so we skip reading normals and the per-vertex setPoints
@@ -720,11 +948,7 @@ class CageProcessor(object):
             if not parent or parent[0] != target_folder:
                 existing = cmds.parent(existing, target_folder, absolute=True)[0]
                 existing = cmds.ls(existing, long=True)[0]
-            # Topology changed on the LP (re-analysed)? Fall back to recreate.
-            fn, _ = CageProcessor._fn_mesh(existing)
-            if points is not None and fn.numVertices != len(points):
-                cmds.delete(existing)
-                existing = None
+            CageProcessor.validate_pair(lp_transform, existing)
 
         created = False
         if existing:
@@ -740,6 +964,7 @@ class CageProcessor(object):
             cage = cmds.ls(dup, long=True)[0]
             created = True
 
+        CageProcessor.bind_source(lp_transform, cage)
         if points is not None:
             CageProcessor._apply_offsets(cage, points, normals, offsets)
         CageProcessor.apply_cage_display(cage, params.get('display_mode', 'solid'))
@@ -811,7 +1036,9 @@ class CageProcessor(object):
             short = tr.split('|')[-1]
             if short.endswith(SUFFIX_CAGE) and cmds.listRelatives(tr, shapes=True, type='mesh'):
                 if short not in expected_names:
-                    cmds.delete(tr)
+                    # Preserve sculpted/stale cages. Explicit Delete Cage is
+                    # the only removal action; a rename is not deletion consent.
+                    cmds.warning("Unmatched Cage preserved: {}".format(tr))
         remaining = cmds.listRelatives(chapter_grp, allDescendents=True, fullPath=True, type='transform') or []
         mesh_paths = [tr for tr in remaining if cmds.listRelatives(tr, shapes=True, type='mesh')]
         for tr in remaining:

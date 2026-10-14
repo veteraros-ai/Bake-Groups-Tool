@@ -163,4 +163,5 @@ finally:
     if result_path:
         with open(result_path, "w", encoding="utf-8") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2)
-    mset.quit(0 if result.get("ok") else 1)
+    # Toolbag 5.02 has no returnCode argument.
+    mset.quit()

@@ -53,6 +53,17 @@ Blender telemetry is disabled until the artist explicitly opts in. It sends one
 pseudonymous installation/update event per version and never sends scene data,
 object names or file paths. See `Bake_Tools_Blender/PRIVACY.md`.
 
+## Maya 1.4.7
+
+The Maya release adds context-help instructions, default-on LP normal preservation
+before triangulation, safer Cage editing/export, chapter export exclusions, and
+Marmoset HP/LP synchronization fixes. HP is exported to Toolbag without baking
+Maya Smooth Preview before subdivision. See
+[Maya 1.4.7 release notes](docs/RELEASE_NOTES_MAYA_1.4.7.md).
+
+Download `Bake_Groups_1.4.7.zip` from the GitHub release or use the plugin's updater.
+The archive includes native Maya 2022–2027 modules and the external HP subdivider.
+
 ## Installation
 
 Copy the `Bake_Groups` folder into:

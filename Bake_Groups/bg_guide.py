@@ -14,9 +14,11 @@ import uuid
 try:
     from bg_guide_manual import build_document as _build_manual_document
     from bg_guide_manual import guide_font_family as _guide_font_family
+    from bg_guide_manual import release_title as _release_title
 except ImportError:
     _build_manual_document = None
     _guide_font_family = lambda language: "Arial"
+    _release_title = None
 
 from bg_guide_translations import CARDS as _TRANSLATED_CARDS, RELEASE as _TRANSLATED_RELEASE
 from bg_version import __version__ as _CURRENT_VERSION
@@ -164,27 +166,40 @@ def _upgrade_document(saved, language):
     if saved.get("manual_version", 0) < version:
         return bundled, True
 
-    # The release banner changes without a manual schema bump. Update only
-    # its shipped heading so a user's saved Guide layout and notes survive.
+    # Refresh shipped content without resetting unrelated saved layout/notes.
+    updated = dict(saved)
+    updated["items"] = list(saved["items"])
+    changed = False
+    if saved.get("help_card_revision", 0) < bundled.get("help_card_revision", 0):
+        key = "guide.help"
+        new_items = [entry for entry in bundled["items"] if entry.get("anchor") == key]
+        new_frame = next(entry for entry in new_items if entry.get("type") == "rect")
+        old_frame = next((entry for entry in saved["items"]
+                          if entry.get("anchor") == key and entry.get("type") == "rect"), new_frame)
+        dx, dy = old_frame["x"] - new_frame["x"], old_frame["y"] - new_frame["y"]
+        updated["items"] = [entry for entry in updated["items"] if entry.get("anchor") != key]
+        updated["items"].extend(dict(entry, x=entry["x"] + dx, y=entry["y"] + dy)
+                                for entry in new_items)
+        updated["help_card_revision"] = bundled["help_card_revision"]
+        changed = True
+
+    version_pattern = r"\d+[.,]\d+[.,]\d+(?:\s*-\s*\d+[.,]\d+[.,]\d+)?"
+    title_pattern = (r"^(?:New in version|Что нового в версии) " + version_pattern +
+                     r"$|^バージョン " + version_pattern + r" の新機能$|^版本 " +
+                     version_pattern + r" 的新功能$")
     heading = next((entry.get("text") for entry in bundled.get("items", [])
                     if entry.get("type") == "text" and
                     entry.get("anchor") == "release.whats_new" and
-                    re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$|^バージョン \d+\.\d+\.\d+ の新機能$|^版本 \d+\.\d+\.\d+ 的新功能$",
-                             entry.get("text", ""))), None)
-    if heading is None:
-        return saved, False
-    for index, entry in enumerate(saved.get("items", [])):
-        if (entry.get("type") == "text" and
+                    re.match(title_pattern, entry.get("text", ""))), None)
+    for index, entry in enumerate(updated["items"]):
+        if (heading is not None and entry.get("type") == "text" and
                 entry.get("anchor") == "release.whats_new" and
-                re.match(r"^(?:New in version|Что нового в версии) \d+\.\d+\.\d+$|^バージョン \d+\.\d+\.\d+ の新機能$|^版本 \d+\.\d+\.\d+ 的新功能$",
-                         entry.get("text", ""))):
-            if entry["text"] == heading:
-                return saved, False
-            updated = dict(saved)
-            updated["items"] = list(saved["items"])
-            updated["items"][index] = dict(entry, text=heading)
-            return updated, True
-    return saved, False
+                re.match(title_pattern, entry.get("text", ""))):
+            if entry["text"] != heading:
+                updated["items"][index] = dict(entry, text=heading)
+                changed = True
+            break
+    return (updated, True) if changed else (saved, False)
 
 
 class GuideStroke(QtWidgets.QGraphicsPathItem):
@@ -436,7 +451,9 @@ class GuideWindow(QtWidgets.QMainWindow):
         self.topic_box.blockSignals(True)
         self.topic_box.clear()
         for key, en, ru, _, _ in TOPICS:
-            if key == "release.whats_new" and self.language in _TRANSLATED_RELEASE:
+            if key == "release.whats_new" and _release_title is not None:
+                title = _release_title(self.language)
+            elif key == "release.whats_new" and self.language in _TRANSLATED_RELEASE:
                 title = _TRANSLATED_RELEASE[self.language]["title"].format(_CURRENT_VERSION)
             elif self.language in _TRANSLATED_CARDS:
                 title = _TRANSLATED_CARDS[self.language].get(key, (en,))[0]
@@ -600,7 +617,8 @@ class GuideWindow(QtWidgets.QMainWindow):
                              thickness=item.pen().widthF())
             items.append(entry)
         return {"schema": 1, "language": self.language, "items": items,
-                "manual_version": self.document_data.get("manual_version", 0)}
+                "manual_version": self.document_data.get("manual_version", 0),
+                "help_card_revision": self.document_data.get("help_card_revision", 0)}
 
     def _schedule_save(self, *args):
         if not self._loading and self.edit_mode:
@@ -670,7 +688,7 @@ class GuideWindow(QtWidgets.QMainWindow):
             return
         self._resize_for_topic(key)
         rect = matches[0].sceneBoundingRect().adjusted(-25, -25, 25, 25)
-        if rect.height() > rect.width() * 1.15:
+        if key != "guide.help" and rect.height() > rect.width() * 1.15:
             # Tall illustrated cards must remain readable. Start at the top;
             # the user can pan down instead of seeing a tiny full-page preview.
             self.view.resetTransform()

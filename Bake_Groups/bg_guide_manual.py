@@ -13,6 +13,18 @@ try:
 except ImportError:
     CURRENT_VERSION = ""
 
+RELEASE_VERSION_RANGE = "1.4.6 - 1.4.7"
+HELP_CARD_REVISION = 1
+
+
+def release_title(language):
+    translation = RELEASE.get(language)
+    if translation:
+        return translation["title"].format(RELEASE_VERSION_RANGE)
+    if language == "ru":
+        return "Что нового в версии " + RELEASE_VERSION_RANGE
+    return "New in version " + RELEASE_VERSION_RANGE
+
 try:
     from PySide6 import QtGui
 except ImportError:
@@ -282,8 +294,14 @@ SECTIONS = (
                ((_figure("Untitled(52).png", "Expansion, Normal move and export flag", "Expansion, Normal move и флажок экспорта"),),
                 (_figure("Untitled(62).png", "Include Cage in the output", "Включить Cage в результат экспорта"),))),
          _card("guide.help", "Context help", "Контекстная справка",
-               "Click ? Help, then a Bake Groups control. This Guide opens the related card. Close it with the standard window X.",
-               "Нажмите ? Help, затем элемент Bake Groups. Guide откроет нужную карточку. Закрывайте его обычным крестиком окна.",
+               "1. Click Help in Bake Groups. This instruction card opens and the cursor becomes a question mark.\n\n"
+               "2. Click the button, checkbox or section you want explained in the Bake Groups window. The Guide jumps to its card; that click does NOT run the command or change its setting. The question-mark mode then ends.\n\n"
+               "3. To ask about another control, click Help again. Cancel without selecting anything with Esc, a right-click or another click on Help.\n\n"
+               "On the board: drag with the middle mouse button to pan, use the wheel to zoom, and double-click an image to enlarge it. Close the Guide with the ordinary window X.",
+               "1. Нажмите Help в Bake Groups. Откроется эта инструкция, а курсор станет знаком вопроса.\n\n"
+               "2. В окне Bake Groups нажмите кнопку, флажок или секцию, о которой хотите узнать. Гайд перейдёт к нужной карточке. Этот щелчок НЕ выполняет команду и НЕ меняет настройку. После выбора режим «?» выключается.\n\n"
+               "3. Для справки о другом элементе снова нажмите Help. Отменить режим без выбора можно клавишей Esc, правым щелчком или повторным нажатием Help.\n\n"
+               "На доске: перемещайте полотно средней кнопкой мыши, масштабируйте колесом, увеличивайте картинки двойным щелчком. Закрывайте гайд обычным крестиком окна.",
                ((_figure("Untitled(86).png", "Help mode off", "Режим справки выключен"),
                  _figure("Untitled(88).png", "Help mode active", "Режим справки активен")),)),
          _card("guide.language", "Language and About", "Язык и информация",
@@ -355,8 +373,7 @@ def _release_card(language):
              {"type": "rect", "x": x + 24, "y": y + 22, "w": 1152, "h": 86,
               "color": "#09a773", "fill": "#09a773", "thickness": 1},
              {"type": "text", "x": x + 42, "y": y + 32, "w": 1100,
-              "text": (translation["title"].format(CURRENT_VERSION) if translation else
-                       ("Что нового в версии " if ru else "New in version ") + CURRENT_VERSION),
+              "text": release_title(language),
               "size": 32, "color": "#f5fff9", "anchor": key}]
 
     feature_index = [0]
@@ -461,4 +478,5 @@ def build_document(language):
             column_y[column] += height + 22
         y = max(column_y)
         y += 34
-    return {"schema": 1, "language": language, "items": items, "manual_version": 5}
+    return {"schema": 1, "language": language, "items": items, "manual_version": 5,
+            "help_card_revision": HELP_CARD_REVISION}
