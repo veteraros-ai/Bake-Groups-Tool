@@ -50,9 +50,9 @@ class FinalExportProcessor(object):
             cls._set_fbx_bool("FBXExportGenerateLog", False)
             cls._set_fbx_bool("FBXExportInputConnections", False)
             cls._set_fbx_bool("FBXExportSmoothMesh", False)
-            # LP/Cage are explicitly triangulated on copies. A user's global
+            # LP meshes are explicitly triangulated on copies. A user's global
             # FBX Triangulate checkbox must not turn base HP quads into triangles
-            # before Catmull-Clark subdivision in Toolbag or the external helper.
+            # before Catmull-Clark subdivision in the external helper.
             cls._set_fbx_bool("FBXExportTriangulate", False)
         cls._fbx_session_depth += 1
         try:
@@ -170,8 +170,7 @@ class FinalExportProcessor(object):
 
         ``reusable_temp_nodes`` are already-disposable meshes produced by the
         material splitter, so they can be triangulated in place. Every original
-        LP is duplicated under a temporary root; cage copies use their source LP
-        connectivity and cage world points. This removes the
+        LP is duplicated under a temporary root. This removes the
         expensive global ``cmds.undo()`` and keeps the artist's Undo queue intact.
         """
         reusable = set(reusable_temp_nodes or [])
@@ -181,15 +180,12 @@ class FinalExportProcessor(object):
 
         def needs_triangulation(node):
             short = node.split('|')[-1].lower()
-            return (triangulate_all or "_low" in short or is_cage_mesh(node))
-
-        def is_cage_mesh(node):
-            return (node.split('|')[-1].lower().endswith("_cage") or
-                    cmds.attributeQuery("bgCageSource", node=node, exists=True))
+            return triangulate_all or "_low" in short
 
         temp_root = None
         prepared = []
         disposable = []
+        triangulated = set()
         flattened_disposable = []
         try:
             for node in export_nodes:
@@ -198,27 +194,17 @@ class FinalExportProcessor(object):
                     if FinalExportProcessor._is_export_temp_node(node):
                         disposable.append(node)
                     continue
-                is_cage = is_cage_mesh(node)
-                if is_cage or node not in reusable:
+                if node not in reusable:
                     if temp_root is None:
                         temp_root = cmds.group(em=True, name="BG_Export_Tri_Temp#", world=True)
                         temp_root = (cmds.ls(temp_root, long=True) or [temp_root])[0]
-                if is_cage:
-                    # Import lazily: cage helpers are not needed for HP/LP-only
-                    # export, and the original cage must never be triangulated.
-                    import bg_cage
-                    lp = bg_cage.CageProcessor.source_lp(node, allow_legacy=True)
-                    if not lp:
-                        raise ValueError("No valid source LP for cage '{}'".format(node))
-                    bg_cage.CageProcessor.validate_pair(lp, node)
-                    tri_node = FinalExportProcessor._make_cage_export_copy(node, lp, temp_root)
-                elif node not in reusable:
+                if node not in reusable:
                     tri_node = FinalExportProcessor._duplicate_under_temp_root(node, temp_root)
                 else:
                     tri_node = node
                 disposable.append(tri_node)
-                if not is_cage:
-                    FinalExportProcessor._triangulate_export_copy(tri_node)
+                FinalExportProcessor._triangulate_export_copy(tri_node)
+                triangulated.add(tri_node)
                 prepared.append(tri_node)
 
             # FBX Export Selected includes ancestors. Detach disposable meshes
@@ -230,23 +216,18 @@ class FinalExportProcessor(object):
             flattened_levels = {}
             for node in prepared:
                 original_short = node.split('|')[-1]
+                is_lp_copy = node in triangulated
                 if node in disposable_set or FinalExportProcessor._is_export_temp_node(node):
                     short_name = node.split('|')[-1]
-                    if short_name.lower().endswith("_cage") and cmds.objExists('|' + short_name):
-                        # A world-root original would make Maya append a digit
-                        # AFTER _cage. Keep the suffix without renaming the original.
-                        base, suffix = short_name[:-5], short_name[-5:]
-                        index = 1
-                        short_name = "{}{}{}".format(base, index, suffix)
-                        while cmds.objExists('|' + short_name):
-                            index += 1
-                            short_name = "{}{}{}".format(base, index, suffix)
                     node = cmds.parent(node, world=True, absolute=True)[0]
                     # Track the new path immediately, including rename failures.
                     flattened_disposable.append(node)
                     node = cmds.rename(node, short_name)
                     node = (cmds.ls(node, long=True) or [node])[0]
                     flattened_disposable[-1] = node
+                    FinalExportProcessor._bake_export_offset_matrix(node)
+                    if is_lp_copy:
+                        FinalExportProcessor._bake_mirrored_lp(node)
                 if original_short in mapped_levels:
                     flattened_levels[node.split('|')[-1]] = mapped_levels[original_short]
                 flattened.append(node)
@@ -308,7 +289,7 @@ class FinalExportProcessor(object):
 
     @staticmethod
     def _triangulate_export_copy(node):
-        """Use identical Maya options for LP exports and cage connectivity."""
+        """Use identical Maya triangulation options for all LP exports."""
         normal_snapshot = None
         if FinalExportProcessor._freeze_lp_normals:
             # Detach the copy from inherited history before writing user normals.
@@ -395,32 +376,6 @@ class FinalExportProcessor(object):
                 if not corners_match():
                     raise ValueError("Could not preserve LP corner normals: '{}'".format(node))
 
-    @staticmethod
-    def _make_cage_export_copy(cage, lp, temp_root):
-        """Deform a triangulated LP copy using cage points by vertex index.
-
-        Duplicating the LP carries its ordered connectivity, UV sets, per-corner
-        normals, smoothing and material assignments into FBX. Only the copy's
-        points change; Maya must not choose diagonals on inflated cage geometry.
-        """
-        cage_points = FinalExportProcessor._export_mesh_fn(cage).getPoints(om.MSpace.kWorld)
-        tri_node = FinalExportProcessor._duplicate_under_temp_root(lp, temp_root)
-        FinalExportProcessor._triangulate_export_copy(tri_node)
-        mesh = FinalExportProcessor._export_mesh_fn(tri_node)
-        if mesh.numVertices != len(cage_points):
-            raise ValueError("LP triangulation changed the cage vertex correspondence")
-        # kObject points avoid assumptions about the LP's transform, including
-        # non-uniform scale, mirrored transforms and different cage parenting.
-        inverse = mesh.dagPath().inclusiveMatrixInverse()
-        # Lock LP normals BEFORE deformation. Otherwise Maya recomputes them
-        # during setPoints or rename/FBX evaluation, potentially changing FBX's
-        # per-corner vertex correspondence.
-        counts, vertices = mesh.getVertices()
-        faces = om.MIntArray([face for face, count in enumerate(counts) for _ in range(count)])
-        mesh.lockFaceVertexNormals(faces, vertices)
-        mesh.setPoints(om.MPointArray([point * inverse for point in cage_points]), om.MSpace.kObject)
-        return FinalExportProcessor._rename_child_under_parent(
-            tri_node, temp_root, lp.split('|')[-1] + "_cage")
 
     @staticmethod
     def _unique_existing(nodes):
@@ -432,6 +387,49 @@ class FinalExportProcessor(object):
             seen.add(node)
             out.append(node)
         return out
+
+    @staticmethod
+    def _bake_export_offset_matrix(node):
+        """Move offsetParentMatrix into FBX-compatible transform channels."""
+        offset_attr = node + ".offsetParentMatrix"
+        if not cmds.objExists(offset_attr):
+            return
+        identity = (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+        if tuple(cmds.getAttr(offset_attr)) == identity:
+            return
+        world = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+        cmds.setAttr(offset_attr, lock=False)
+        cmds.setAttr(offset_attr, *identity, type="matrix")
+        cmds.xform(node, worldSpace=True, matrix=world)
+        actual = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+        if any(abs(before - after) > 1e-6 * max(1, abs(before))
+               for before, after in zip(world, actual)):
+            raise RuntimeError("Could not preserve FBX export transform for '{}'".format(node))
+
+    @staticmethod
+    def _bake_mirrored_lp(node):
+        world = om.MMatrix(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+        if world.det3x3() >= 0:
+            return
+        cmds.delete(node, constructionHistory=True)
+        mesh = FinalExportProcessor._export_mesh_fn(node)
+        points = mesh.getPoints(om.MSpace.kWorld)
+        normals = mesh.getNormals(om.MSpace.kWorld)
+        counts, vertices = mesh.getVertices()
+        _, normal_ids = mesh.getNormalIds()
+        face_ids = om.MIntArray()
+        for face, count in enumerate(counts):
+            for _ in range(count):
+                face_ids.append(face)
+
+        # Bake the reflection into the points and reverse the winding once.
+        cmds.xform(node, worldSpace=True, matrix=list(om.MMatrix()))
+        mesh.setPoints(points, om.MSpace.kObject)
+        cmds.polyNormal(node, normalMode=0, constructionHistory=False)
+        mesh = FinalExportProcessor._export_mesh_fn(node)
+        mesh.setFaceVertexNormals(
+            om.MVectorArray([om.MVector(normals[i]) for i in normal_ids]),
+            face_ids, vertices, om.MSpace.kObject)
 
     @staticmethod
     def _duplicate_under_temp_root(node, temp_root):
@@ -453,7 +451,6 @@ class FinalExportProcessor(object):
             "BG_HP_Export_Zero_Temp",
             "BG_Export_Tri_Temp",
             "BG_Material_Export_Temp",
-            "BG_Marmoset_Export_Temp",
         )
         return any(
             part.startswith(prefixes)
@@ -461,16 +458,8 @@ class FinalExportProcessor(object):
 
     @staticmethod
     def _is_zbrush_mesh(mesh_transform):
-        if not mesh_transform or not cmds.objExists(mesh_transform):
-            return False
-
-        shapes = cmds.listRelatives(mesh_transform, shapes=True, fullPath=True) or []
-
-        layers = cmds.listConnections(mesh_transform, type="displayLayer") or []
-        for shape in shapes:
-            layers.extend(cmds.listConnections(shape, type="displayLayer") or [])
-
-        return any(layer and "zbrush" in layer.lower() for layer in layers)
+        from bg_mesh_check import is_zbrush
+        return is_zbrush(mesh_transform)
 
     @staticmethod
     def _smooth_level_from_item(item):

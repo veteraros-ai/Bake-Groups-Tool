@@ -1,8 +1,8 @@
 {
-  "latest_version": "1.0.1",
-  "package_sha256": "6e86eaa81746bdb26e896529f63f312a0a844c4213e5926781cc13380e11403c",
+  "latest_version": "1.0.2",
+  "package_sha256": "5f05aa6ff0b8bc29ef213cc68bf4c78023ccd285fa9b86121546838f13a723d8",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
-  "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/tag/blender-1.0.1",
-  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/blender-1.0.1/Bake_Tools_Blender-1.0.1-win64.zip",
-  "release_notes": "Updated HP analysis and freeze safeguards, LP Triangle export, Marmoset Toolbag bridge, and a Blender Bake Guide with contextual Help and English, Russian, Japanese and Chinese content."
+  "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/tag/blender-1.0.2",
+  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/blender-1.0.2/Bake_Tools_Blender-1.0.2-win64.zip",
+  "release_notes": "Mesh Check tab, LP surface-based material chapters, Color HP palettes and context help."
 }

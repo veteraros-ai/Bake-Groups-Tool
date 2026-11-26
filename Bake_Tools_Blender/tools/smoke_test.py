@@ -203,48 +203,18 @@ def main():
     assert {"Check Now", "Continue", "Cancel"} <= structure_buttons
     structure_dialog.close()
 
-    # The checker exposes resolution actions rather than one read-only report.
+    # Results and scoped repair actions now live in the Mesh Check tab.
     payload = {
         "pair_id": snapshot.active_pair_id,
-        "duplicates": [["A", "B"]], "zbrush": [], "combined": [],
-        "issue_count": 2, "report": "fixture",
+        "duplicates": [["A", "B"]], "combined": ["Combined_A"], "empty": ["Empty_A"],
     }
-    window._show_duplicate_check(payload)
-    duplicate_dialog = next(
-        dialog for dialog in window._open_dialogs
-        if isinstance(dialog, qt_window.QtWidgets.QMessageBox)
-        and dialog.windowTitle() == "Duplicate Meshes Found"
-    )
-    duplicate_buttons = {button.text() for button in duplicate_dialog.buttons()}
-    assert {"Select", "Remove Extra Copies", "Skip"} <= duplicate_buttons
-    duplicate_dialog.close()
-
-    # Regression for Blender crash reports ending in
-    # QMessageBox::buttonClicked -> Qt6Core QByteArray::clear.  A mesh operator
-    # and the next dialog must not run while Qt is still processing the button.
-    deferred_actions = []
-    original_action = window.controller.action
-    window.controller.action = lambda action: deferred_actions.append(action) or True
-    combined_payload = {
-        "pair_id": snapshot.active_pair_id,
-        "duplicates": [], "zbrush": [], "combined": ["Combined_A"],
-        "issue_count": 1, "report": "fixture",
-    }
-    window._show_combined_check(combined_payload)
-    combined_dialog = next(
-        dialog for dialog in window._open_dialogs
-        if isinstance(dialog, qt_window.QtWidgets.QMessageBox)
-        and dialog.windowTitle() == "Combined Meshes Found"
-    )
-    separate_button = next(
-        button for button in combined_dialog.buttons() if button.text() == "Separate"
-    )
-    separate_button.click()
-    assert deferred_actions == []
-    app.processEvents()
-    assert deferred_actions == ["CHECK_SEPARATE_COMBINED"]
-    app.processEvents()
-    window.controller.action = original_action
+    window._show_mesh_check(payload)
+    sections = [window.check_tree.topLevelItem(i) for i in range(window.check_tree.topLevelItemCount())]
+    assert len(sections) == 5 and not hasattr(window, "find_zbrush_button")
+    assert sections[2].child(0).text(0) == "A, B"
+    assert sections[3].child(0).text(0) == "Combined_A"
+    assert sections[4].child(0).text(0) == "Empty_A"
+    assert sections[3].data(0, qt_window.QtCore.Qt.ItemDataRole.UserRole)[2] == "CHECK_SEPARATE_COMBINED"
     window.close()
     addon.unregister()
     print("BAKE_TOOLS_SMOKE_OK")

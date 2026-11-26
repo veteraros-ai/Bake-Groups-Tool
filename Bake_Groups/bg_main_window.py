@@ -8,17 +8,17 @@ import contextlib
 import re
 import zipfile
 import copy
+import uuid
 from datetime import datetime
 
 import maya.cmds as cmds
 import bg_core
-import bg_cage
 import bg_final_export
 import bg_localization as bg_l10n
 import bg_update
 import bg_guide
 
-from bg_worker_hp import HPGroupingWorker
+from bg_worker_hp import HPGroupingWorker, DEFAULT_BOLT_ELONGATION
 from bg_worker_lp import LPMatchingWorker
 
 try:
@@ -78,12 +78,44 @@ HELP_TARGETS = {
 }
 
 
+_MENU_HELP_TOPICS = {
+    "hp.color": ("Color HP palette", "Select Color"),
+    "groups.create": ("Add subgroup",),
+    "groups.row": ("Rename Subgroup", "Rename subgroup", "Rename Final Group",
+                   "Select subgroup meshes", "Select All Subgroups"),
+    "groups.search": ("Optimize subgroups (delete empty)", "Delete empty groups",
+                      "Group search by mesh", "Group search by mesh (Ctrl+Shift+Z)", "Find group by mesh"),
+    "groups.visibility": ("Show all groups", "Hide all groups", "Isolate active group", "Groups Vis"),
+    "hp.check": ("Skip selected meshes", "Skip check", "Restore check", "Restore skipped meshes", "Remove"),
+    "hp.check.transforms": ("Apply Transforms", "Freeze Transformations"),
+    "hp.check.duplicates": ("Remove Extra Copies",),
+    "hp.zbrush": ("Add to ZBrush Layer", "Add to ZBrush layer…"),
+    "hp.prepare.separate": ("Separate",),
+    "hp.find_similar": ("Find Sim", "Find All"),
+    "chapter.create": ("Split by materials", "Split by Material"),
+    "toc.find_lost": ("Find Lost (beta)",),
+    "toc.menu": ("Select Meshes", "Move Mesh to", "Rename Chapter", "Group into Book",
+                 "Extract from Book", "Extract from the book", "Delete Chapter"),
+    "toc": ("Rename Book", "Ungroup Book", "Select all chapters"),
+    "guide.language": ("English", "Russian", "Chinese", "Japanese"),
+    "guide.log": ("Save Support Package", "Save Debug Log", "Clear Log"),
+}
+
+
 class TOCNameDelegate(QtWidgets.QStyledItemDelegate):
     def initStyleOption(self, option, index):
         super(TOCNameDelegate, self).initStyleOption(option, index)
+        chapter_id = index.sibling(index.row(), 0).data(QtCore.Qt.UserRole)
+        if chapter_id and chapter_id != "BOOK":
+            # Model selection is also used by context menus / multi-selection.
+            # A persistent chapter background represents isolation, not selection.
+            option.state &= ~(QtWidgets.QStyle.State_Selected | QtWidgets.QStyle.State_HasFocus)
+            if index.data(TOCMixin.ISOLATED_CHAPTER_ROLE):
+                option.state |= QtWidgets.QStyle.State_Selected
+                option.state &= ~QtWidgets.QStyle.State_MouseOver
         foreground = index.data(QtCore.Qt.ForegroundRole)
-        if foreground and foreground.color() == QtGui.QColor("#ffd54f"):
-            # An excluded chapter must remain yellow even while selected.
+        if foreground:
+            # Preserve exclusion / missing-root colors on the isolated background.
             option.palette.setColor(QtGui.QPalette.HighlightedText, foreground.color())
 
     def createEditor(self, parent, option, index):
@@ -130,7 +162,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.setObjectName("BakeManagerUI")
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setMinimumSize(320, 400)
-        self.resize(640, 800)
+        self.resize(520, 800)
         self.setAcceptDrops(False)
 
         self.core = bg_core.MayaCore()
@@ -146,10 +178,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.lp_data_cache = {}
         self.is_preview_active = False
         self.is_final_view = False
-        # Session-wide Cage Vis/Hid preference: kept across chapter switches in
-        # Export Settings so the cage's shown/hidden state doesn't jump between
-        # chapters (reset to shown on each entry into Export Settings).
-        self.cage_vis_pref = True
         self.is_final_low_visible = False
         self.final_smooth_states = {}
         self.zbrush_triangle_threshold = 50
@@ -158,6 +186,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.subgroup_color_override_cache = {}
         self.subgroup_color_index_map = {}
         self.subgroup_custom_color_map = self.load_subgroup_custom_colors()
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        self.hp_palette = self.read_hp_palette(settings.value("hp_palette", "null"))
+
         self.active_material_visibility_filter = None
         self._is_closing = False
         self.update_worker = None
@@ -219,29 +250,30 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         # both of them on the right. Create inspects the LP material count and
         # either makes a single chapter or offers to split by material.
         pick_row = QtWidgets.QHBoxLayout()
-        picks_col = QtWidgets.QVBoxLayout()
+        picks_col = QtWidgets.QGridLayout()
 
-        hp_layout = QtWidgets.QHBoxLayout()
+        picks_col.setColumnStretch(0, 1)
         self.le_picked_hp = QtWidgets.QLineEdit()
         self.le_picked_hp.setReadOnly(True)
         self.le_picked_hp.setPlaceholderText("Pick HP...")
         self.le_picked_hp.setMinimumWidth(50)
         self.btn_pick_hp = QtWidgets.QPushButton("Pick HP")
         self.btn_pick_hp.clicked.connect(lambda: self.pick_node("HP"))
-        hp_layout.addWidget(self.le_picked_hp, stretch=3)
-        hp_layout.addWidget(self.btn_pick_hp, stretch=1)
-        picks_col.addLayout(hp_layout)
+        picks_col.addWidget(self.le_picked_hp, 0, 0)
+        picks_col.addWidget(self.btn_pick_hp, 0, 1)
+        self.btn_pick_hp.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
 
-        lp_layout = QtWidgets.QHBoxLayout()
+        picks_col.setRowStretch(0, 1)
+        picks_col.setRowStretch(1, 1)
         self.le_picked_lp = QtWidgets.QLineEdit()
         self.le_picked_lp.setReadOnly(True)
         self.le_picked_lp.setPlaceholderText("Pick LP...")
         self.le_picked_lp.setMinimumWidth(50)
         self.btn_pick_lp = QtWidgets.QPushButton("Pick LP")
         self.btn_pick_lp.clicked.connect(lambda: self.pick_node("LP"))
-        lp_layout.addWidget(self.le_picked_lp, stretch=3)
-        lp_layout.addWidget(self.btn_pick_lp, stretch=1)
-        picks_col.addLayout(lp_layout)
+        picks_col.addWidget(self.le_picked_lp, 1, 0)
+        picks_col.addWidget(self.btn_pick_lp, 1, 1)
+        self.btn_pick_lp.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
 
         pick_row.addLayout(picks_col, stretch=3)
 
@@ -276,21 +308,11 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.btn_separate_mesh.setStyleSheet("background-color: #8c6239;")
         configure_square_icon_button(self.btn_separate_mesh, "Separate.png", "Separate")
         self.btn_separate_mesh.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Separate", self.tool_separate))
-        self.btn_find_zbrush = QtWidgets.QPushButton("Find ZBrush")
-        self.btn_find_zbrush.setStyleSheet("background-color: #d18c15; font-weight: bold;")
-        configure_square_icon_button(self.btn_find_zbrush, "Find_ZBRUSH.png", "Find ZBrush")
-        self.btn_find_zbrush.clicked.connect(self.find_zbrush_meshes)
-        self.btn_find_zbrush.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.btn_find_zbrush.customContextMenuRequested.connect(self.show_find_zbrush_context_menu)
-
-        self.btn_check_before_analyze = QtWidgets.QPushButton("Check Before Analyze")
-        self.btn_check_before_analyze.setStyleSheet("background-color: #555555;")
-        configure_square_icon_button(self.btn_check_before_analyze, "Cheking_Icon.png", "Check Before Analyze")
-        self.btn_check_before_analyze.clicked.connect(lambda checked=False: self.run_undoable_bg_action("Check", self.run_pre_analysis_checks))
-
+        self.btn_check_before_analyze = QtWidgets.QPushButton("Mesh Check")
+        configure_square_icon_button(self.btn_check_before_analyze, "Cheking_Icon.png", "Mesh Check")
+        self.btn_check_before_analyze.clicked.connect(lambda: self.mesh_check_panel.run())
         tool_layout.addWidget(self.btn_combine_mesh)
         tool_layout.addWidget(self.btn_separate_mesh)
-        tool_layout.addWidget(self.btn_find_zbrush)
         tool_layout.addWidget(self.btn_check_before_analyze)
 
         tool_checks = QtWidgets.QVBoxLayout()
@@ -354,8 +376,17 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.subgroups_layout = QtWidgets.QVBoxLayout(self.subgroups_widget)
         self.subgroups_layout.setAlignment(QtCore.Qt.AlignTop)
         self.subgroups_scroll.setWidget(self.subgroups_widget)
-        left_layout.addWidget(self.subgroups_scroll, 1) # Параметр 1 фиксирует верстку окна
-        self.subgroups_scroll.setVisible(True)
+        from bg_mesh_check import MeshCheckPanel, MeshCheckTabs
+        self.mesh_check_tabs = MeshCheckTabs()
+        self.mesh_check_tabs.setMinimumWidth(0)
+        self.mesh_check_tabs.addTab(self.subgroups_scroll, bg_l10n.text("Groups"))
+        self.subgroups_scroll.setProperty("bg_help_id", "groups.tab")
+        self.subgroups_widget.setProperty("bg_help_id", "groups.tab")
+        self.mesh_check_panel = MeshCheckPanel(self)
+        self.mesh_check_panel.setProperty("bg_help_id", "hp.check")
+        self.mesh_check_tabs.addTab(self.mesh_check_panel, bg_l10n.text("Mesh Check"))
+        self.mesh_check_tabs.currentChanged.connect(lambda _: self.mesh_check_panel.refresh())
+        left_layout.addWidget(self.mesh_check_tabs, 1)
         self.subgroups_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.subgroups_widget.customContextMenuRequested.connect(self.show_subgroups_context_menu)
 
@@ -421,6 +452,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         top_right_layout.addWidget(self.lbl_toc)
 
         self.toc_tree = QtWidgets.QTreeWidget()
+        self.toc_tree.setObjectName("BakeGroupsTOC")
         self.toc_tree.setHeaderHidden(True)
         self.toc_tree.setColumnCount(2)
         header = self.toc_tree.header()
@@ -455,28 +487,20 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         # is not constructed, so hidden functionality adds no startup cost.
         self.right_splitter.addWidget(top_right_widget)
 
-        # Cage settings panel lives under the Table of Contents.
-        self.cage_container = QtWidgets.QWidget()
-        cage_container_layout = QtWidgets.QVBoxLayout(self.cage_container)
-        cage_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.cage_container.setVisible(False)
-        self.right_splitter.addWidget(self.cage_container)
-
-        # Export panel lives below Cage Settings; shown only in Export Settings.
+        # Export options live directly below the Table of Contents.
         self.export_container = QtWidgets.QWidget()
         export_container_layout = QtWidgets.QVBoxLayout(self.export_container)
         export_container_layout.setContentsMargins(0, 0, 0, 0)
         self.export_container.setVisible(False)
         self.right_splitter.addWidget(self.export_container)
 
-        self.right_splitter.setSizes([660, 220, 220])
+        self.right_splitter.setSizes([660, 300])
 
         session_buttons_layout = QtWidgets.QHBoxLayout()
         session_buttons_layout.setSpacing(4)
 
         self.btn_help = QtWidgets.QPushButton("Help")
         self.btn_help.setFixedHeight(30)
-        self.btn_help.setToolTip("Select a control to open its visual guide. Press Esc to cancel.")
         self.btn_help.setStyleSheet(
             "QPushButton { background-color: #3b3b3b; font-weight: bold; border: 1px solid #555; }"
             "QPushButton:hover { background-color: #4a4a4a; border: 1px solid #777; }"
@@ -517,6 +541,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.cancel_help_mode()
             return
         self._help_mode = True
+        self._help_menu_origin = "overview"
         self.btn_help.setText('?  ' + bg_l10n.text('Help'))
         self.btn_help.setStyleSheet('background-color: #298d57; font-weight: bold;')
         app = QtWidgets.QApplication.instance()
@@ -539,6 +564,56 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.btn_help.setStyleSheet(
                 'QPushButton { background-color: #3b3b3b; font-weight: bold; border: 1px solid #555; }'
                 'QPushButton:hover { background-color: #4a4a4a; border: 1px solid #777; }')
+
+    def _help_menu_event(self, menu, event):
+        owner = menu.parentWidget()
+        while owner is not None and owner is not self:
+            owner = owner.parentWidget()
+        if owner is None:
+            return False
+        event_type = event.type()
+        if event_type in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease):
+            if event.button() != QtCore.Qt.LeftButton:
+                return False
+            position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            action = menu.actionAt(position)
+        elif event_type == QtCore.QEvent.KeyPress and event.key() in (
+            QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Space
+        ):
+            action = menu.activeAction()
+        else:
+            # Mnemonics must not execute commands while Help is armed.
+            return event_type == QtCore.QEvent.KeyPress and bool(event.text().strip())
+        if action is None or action.isSeparator() or action.menu() is not None:
+            return False
+        # Consume the activation before QMenu can emit triggered().
+        if event_type == QtCore.QEvent.MouseButtonPress:
+            return True
+        label = action.text().split("\t", 1)[0].replace("&", "").strip()
+        topic = action.property("guideTopic")
+        if not topic:
+            translate = bg_l10n.text
+            topic = next((key for key, labels in _MENU_HELP_TOPICS.items()
+                          if any(label in (name, translate(name)) for name in labels)),
+                         self._help_menu_origin)
+        self._open_menu_help(menu, topic)
+        return True
+
+    def _open_menu_help(self, menu, topic):
+        root = menu
+        while isinstance(root.parentWidget(), QtWidgets.QMenu):
+            root = root.parentWidget()
+        self.cancel_help_mode()
+        root.close()
+        QtCore.QTimer.singleShot(0, lambda: self.show_guide(topic))
+
+    def _help_clicked_topic(self, widget, event):
+        if widget is self.mesh_check_tabs.tabBar():
+            position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            index = widget.tabAt(position)
+            if index >= 0:
+                return "groups.tab" if index == 0 else "hp.check"
+        return self._help_topic_for(widget)
 
     def _help_topic_for(self, widget):
         while isinstance(widget, QtWidgets.QWidget):
@@ -588,21 +663,20 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if event_type == QtCore.QEvent.KeyPress and event.key() == QtCore.Qt.Key_Escape:
             self.cancel_help_mode()
             return True
-        if event_type != QtCore.QEvent.MouseButtonPress:
+        if isinstance(watched, QtWidgets.QMenu):
+            return self._help_menu_event(watched, event)
+        if not isinstance(watched, QtWidgets.QWidget) or (
+                watched is not self and not self.isAncestorOf(watched)):
             return False
-        if event.button() != QtCore.Qt.LeftButton:
-            if event.button() == QtCore.Qt.RightButton:
-                self.cancel_help_mode()
-                return True
+        if event_type == QtCore.QEvent.ContextMenu:
+            self._help_menu_origin = self._help_topic_for(watched)
             return False
-        if not isinstance(watched, QtWidgets.QWidget):
-            return False
-        if watched is not self and not self.isAncestorOf(watched):
+        if event_type != QtCore.QEvent.MouseButtonPress or event.button() != QtCore.Qt.LeftButton:
             return False
         if watched is self.btn_help or self.btn_help.isAncestorOf(watched):
             self.cancel_help_mode()
         else:
-            topic, label, description = self._help_context_for(watched)
+            topic, label, description = self._help_clicked_topic(watched, event), "", ""
             self.cancel_help_mode()
             QtCore.QTimer.singleShot(
                 0, lambda key=topic, title=label, body=description:
@@ -897,7 +971,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         # but the worker still reads these widgets for its internal defaults.
         self.spin_bolt_elong = QtWidgets.QDoubleSpinBox()
         self.spin_bolt_elong.setRange(1.0, 10.0)
-        self.spin_bolt_elong.setValue(1.5)
+        self.spin_bolt_elong.setValue(DEFAULT_BOLT_ELONGATION)
         self.spin_bolt_elong.setSingleStep(0.1)
 
         self.spin_bolt_sym = QtWidgets.QDoubleSpinBox()
@@ -983,6 +1057,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             QTreeWidget::item { padding: 4px 2px; margin-bottom: 2px; border-radius: 3px; }
             QTreeWidget::item:hover { background-color: #3e3e3e; }
             QTreeWidget::item:selected { background-color: #3a5375; }
+            QTreeWidget#BakeGroupsTOC::item:selected { background-color: #46698c; }
             QScrollArea { border: none; background-color: transparent; }
             QSplitter::handle { background: #333333; }
             QSplitter::handle:horizontal { width: 2px; }
@@ -1063,6 +1138,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         }
 
     def restore_bg_undo_snapshot(self, snapshot):
+        self._invalidate_hp_preflight()
         self.root_pairs = copy.deepcopy(snapshot.get("root_pairs", []))
         if hasattr(self.core, 'root_pairs'):
             self.core.root_pairs = self.root_pairs
@@ -1159,7 +1235,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         focus = QtWidgets.QApplication.focusWidget()
         if not self.is_bg_undo_focus_inside_window(focus):
             return False
-        return not self.is_bg_undo_editable_focus(focus)
+        return (not self.is_bg_undo_editable_focus(focus) and
+                self.bg_undo_stack[-1].get("chunk") == cmds.undoInfo(query=True, undoName=True))
 
     def is_bg_undo_focus_inside_window(self, focus):
         if not focus:
@@ -1195,12 +1272,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         snapshot = self.capture_bg_undo_snapshot()
         self._bg_undo_running = True
         try:
-            chunk_name = "BG_{}".format(re.sub(r'[^A-Za-z0-9_]+', '_', str(action_name))[:48])
+            chunk_name = "BG_{}_{}".format(
+                re.sub(r'[^A-Za-z0-9_]+', '_', str(action_name))[:48], uuid.uuid4().hex)
             with bg_core.undo_chunk(chunk_name):
                 result = callback(*args, **kwargs)
         finally:
             self._bg_undo_running = False
-        self.bg_undo_stack.append({"action": str(action_name), "snapshot": snapshot})
+        if cmds.undoInfo(query=True, undoName=True) != chunk_name:
+            return result
+        self.bg_undo_stack.append({"action": str(action_name), "snapshot": snapshot,
+                                   "chunk": chunk_name})
         if len(self.bg_undo_stack) > 20:
             self.bg_undo_stack = self.bg_undo_stack[-20:]
         self.update_bg_undo_button()
@@ -1210,14 +1291,28 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not getattr(self, 'bg_undo_stack', []):
             self.log(bg_l10n.text("No Bake Groups action to undo."), "orange")
             return
-        entry = self.bg_undo_stack.pop()
+        entry = self.bg_undo_stack[-1]
+        chunk_name = entry.get("chunk")
+        if not chunk_name or cmds.undoInfo(query=True, undoName=True) != chunk_name:
+            self.log("Bake Groups undo is available when its action is next in Maya's Undo queue.", "orange")
+            return
         self._bg_undo_restoring = True
         try:
             try:
                 cmds.undo()
             except Exception as exc:
                 self.log(bg_l10n.text("Maya undo failed: {error}").format(error=exc), "orange")
-            self.restore_bg_undo_snapshot(entry.get("snapshot", {}))
+                return
+            if cmds.undoInfo(query=True, redoName=True) != chunk_name:
+                self.log("Maya did not confirm the Bake Groups undo.", "orange")
+                return
+            self.bg_undo_stack.pop()
+            undo_enabled = cmds.undoInfo(query=True, state=True)
+            try:
+                cmds.undoInfo(stateWithoutFlush=False)
+                self.restore_bg_undo_snapshot(entry["snapshot"])
+            finally:
+                cmds.undoInfo(stateWithoutFlush=undo_enabled)
         finally:
             self._bg_undo_restoring = False
             self.update_bg_undo_button()
@@ -1460,11 +1555,25 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         cmds.inViewMessage(amg=bg_l10n.text("Log saved"), pos='midCenter', fade=True)
 
     def setup_script_jobs(self):
+        self._color_save_callbacks = [
+            om.MSceneMessage.addCallback(om.MSceneMessage.kBeforeSave, self._suspend_color_for_save),
+            om.MSceneMessage.addCallback(om.MSceneMessage.kAfterSave, self._resume_color_after_save),
+        ]
         self.script_jobs.append(cmds.scriptJob(event=["SceneOpened", self.reload_data_from_scene]))
         # Persist our settings alongside the scene on every save. SceneSaved
         # fires AFTER the write, so the scene name is already the new one on a
         # Save As - get_json_path() then targets the new "<scene>_BakeGroups.json".
         self.script_jobs.append(cmds.scriptJob(event=["SceneSaved", self.on_scene_saved]))
+
+    def _suspend_color_for_save(self, *_):
+        self._resume_saved_colors = bool(self.subgroup_color_override_cache)
+        if self._resume_saved_colors:
+            self.restore_subgroup_colors()
+
+    def _resume_color_after_save(self, *_):
+        if getattr(self, '_resume_saved_colors', False):
+            self._resume_saved_colors = False
+            self.update_subgroup_colors()
 
     def on_scene_saved(self):
         """Mirror the current session to disk after each scene save. Because the
@@ -1495,7 +1604,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
 
     def _resolve_manual_file(self):
         """Full path to the bundled PureRef manual, or None (see bg_update)."""
-        return bg_update.resolve_manual_file()
+        # Help now uses the maintained in-app guide, not the legacy PureRef file.
+        return None
 
     def maybe_show_manual_prompt(self):
         """On launch, offer to open the folder holding the PureRef manual - unless
@@ -1603,16 +1713,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
     def on_color_by_subgroups_toggled(self, checked):
         with self._suspended_viewport_refresh():
             if checked:
-                self.ensure_subgroup_color_indices(self._subgroup_color_names_for_active_pair())
                 self.update_subgroup_colors()
             else:
-                self.restore_subgroup_colors(clean_history=True)
-                pair = next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
-                if pair:
-                    hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-                    removed = self.cleanup_subgroup_preview_color_sets([hp_main, lp_main], clean_history=True)
-                    if removed:
-                        self.log("Color HP: removed {} old preview color set(s).".format(removed), "lightblue")
+                self.restore_subgroup_colors()
         self.refresh_left_panel()
 
     def load_subgroup_custom_colors(self):
@@ -1642,6 +1745,144 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
     def save_subgroup_custom_colors(self):
         settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
         settings.setValue("subgroup_custom_colors", json.dumps(self.subgroup_custom_color_map, ensure_ascii=False, separators=(",", ":")))
+        settings.sync()
+
+    def read_hp_palette(self, raw):
+        try:
+            colors = json.loads(raw)
+            if len(colors) == len(self.DEFAULT_HP_PALETTE) and all(
+                isinstance(rgb, list) and len(rgb) == 3 and
+                all(isinstance(ch, (int, float)) and 0 <= ch <= 1 for ch in rgb)
+                for rgb in colors
+            ):
+                return colors
+        except (TypeError, ValueError):
+            pass
+        return list(self.DEFAULT_HP_PALETTE)
+
+    def edit_hp_palette(self):
+        tr = bg_l10n.text
+        settings = QtCore.QSettings("Veteraros AI", "Bake Groups Tool")
+        try:
+            presets = json.loads(settings.value("hp_palette_presets", "{}"))
+        except (ValueError, TypeError):
+            presets = {}
+        if not isinstance(presets, dict):
+            presets = {}
+        colors = list(self.hp_palette)
+        overrides = dict(self.subgroup_custom_color_map)
+        names = self._subgroup_color_names_for_active_pair()
+        self.ensure_subgroup_color_indices(names)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(tr("Color HP palette"))
+        layout = QtWidgets.QVBoxLayout(dialog)
+        selector = QtWidgets.QComboBox()
+        selector.addItems([tr("Current colors"), tr("Factory palette")] + sorted(presets))
+        layout.addWidget(selector)
+        original_colors = self.hp_palette
+        original_overrides = self.subgroup_custom_color_map
+        indices = dict(self.subgroup_color_index_map)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+
+        def apply_preview(palette, custom):
+            self.hp_palette = palette
+            self.subgroup_custom_color_map = custom
+            self.refresh_subgroup_color_preview()
+            self.refresh_left_panel()
+
+        def color_for(key):
+            if isinstance(key, int):
+                return colors[key]
+            return overrides.get(key) or self.indexed_subgroup_color(key, colors)
+
+        def redraw():
+            page = QtWidgets.QWidget()
+            grid = QtWidgets.QGridLayout(page)
+            grid.setColumnStretch(2, 1)
+            row = 0
+
+            def add_row(slot_label, key, group_label):
+                nonlocal row
+                q = QtGui.QColor.fromRgbF(*color_for(key))
+                button = QtWidgets.QPushButton(q.name().upper())
+                ink = "black" if q.lightnessF() > .55 else "white"
+                button.setStyleSheet("background-color: %s; color: %s;" % (q.name(), ink))
+                button.clicked.connect(lambda checked=False: choose(key))
+                grid.addWidget(QtWidgets.QLabel(slot_label), row, 0)
+                grid.addWidget(button, row, 1)
+                label = QtWidgets.QLabel(group_label)
+                label.setWordWrap(True)
+                grid.addWidget(label, row, 2)
+                row += 1
+
+            for slot in range(len(colors)):
+                assigned = sorted(name for name in names if indices[name] % len(colors) == slot)
+                direct = [name for name in assigned if name not in overrides and indices[name] < len(colors)]
+                add_row(str(slot + 1), slot, ", ".join(direct))
+                for name in assigned:
+                    if name not in direct:
+                        add_row("", name, name)
+            grid.setRowStretch(row, 1)
+            position = scroll.verticalScrollBar().value()
+            previous = scroll.takeWidget()
+            if previous:
+                previous.deleteLater()
+            scroll.setWidget(page)
+            scroll.verticalScrollBar().setValue(position)
+
+        def choose(key):
+            selected = QtWidgets.QColorDialog.getColor(QtGui.QColor.fromRgbF(*color_for(key)), dialog)
+            if selected.isValid():
+                target = colors if isinstance(key, int) else overrides
+                target[key] = [selected.redF(), selected.greenF(), selected.blueF()]
+                apply_preview(colors, overrides)
+                redraw()
+
+        def load(index):
+            if index < 2:
+                colors[:] = original_colors if index == 0 else self.DEFAULT_HP_PALETTE
+                overrides.clear()
+                if index == 0:
+                    overrides.update(original_overrides)
+            else:
+                preset = presets[selector.currentText()]
+                colors[:] = self.read_hp_palette(json.dumps(preset["colors"]))
+                overrides.clear()
+                overrides.update(preset["overrides"])
+            apply_preview(colors, overrides)
+            redraw()
+
+        selector.currentIndexChanged.connect(load)
+        preset_name = QtWidgets.QLineEdit()
+        preset_name.setPlaceholderText(tr("New preset name (optional)"))
+        layout.addWidget(preset_name)
+        default = QtWidgets.QCheckBox(tr("Use as default on next launch"))
+        layout.addWidget(default)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        def accept():
+            name = preset_name.text().strip()
+            if name and selector.findText(name) >= 0:
+                QtWidgets.QMessageBox.warning(dialog, dialog.windowTitle(), tr("Choose a unique preset name"))
+                return
+            dialog.accept()
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        redraw()
+        dialog.resize(400, 500)
+        if not dialog.exec_():
+            if self.hp_palette is colors:
+                apply_preview(original_colors, original_overrides)
+            return
+        name = preset_name.text().strip()
+        if name:
+            presets[name] = {"colors": colors, "overrides": overrides}
+            settings.setValue("hp_palette_presets", json.dumps(presets))
+        if default.isChecked():
+            settings.setValue("hp_palette", json.dumps(colors))
+            self.save_subgroup_custom_colors()
         settings.sync()
 
     def choose_subgroup_color(self, subgroup_name):
@@ -1680,8 +1921,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         else:
             menu.exec(global_pos)
 
-    def subgroup_color_for_name(self, name):
-        palette = [
+    DEFAULT_HP_PALETTE = (
             (0.953, 0.071, 0.027),
             (0.988, 0.424, 0.012),
             (0.953, 0.851, 0.443),
@@ -1701,10 +1941,16 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             (0.278, 0.204, 0.129),
             (0.518, 0.459, 0.404),
             (1.000, 0.945, 0.145),
-        ]
+    )
+
+    def subgroup_color_for_name(self, name):
+        palette = getattr(self, "hp_palette", self.DEFAULT_HP_PALETTE)
         custom_color = (getattr(self, 'subgroup_custom_color_map', {}) or {}).get(str(name))
         if custom_color and len(custom_color) >= 3:
             return tuple(max(0.0, min(1.0, float(channel))) for channel in custom_color[:3])
+        return self.indexed_subgroup_color(name, palette)
+
+    def indexed_subgroup_color(self, name, palette):
         index_map = getattr(self, 'subgroup_color_index_map', {}) or {}
         if name in index_map:
             index = index_map[name]
@@ -1872,188 +2118,100 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not transform or not cmds.objExists(transform):
             return []
         if cmds.nodeType(transform) == "mesh":
-            if not cmds.getAttr(transform + ".intermediateObject"):
-                return [transform]
-            return []
-        transforms = [transform]
-        transforms.extend(cmds.listRelatives(transform, allDescendents=True, type='transform', fullPath=True) or [])
-        nodes = []
-        seen = set()
-        for item in transforms:
-            if not item or not cmds.objExists(item):
-                continue
-            shapes = cmds.listRelatives(item, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
-            for shape in shapes:
-                if shape in seen:
-                    continue
-                if cmds.objExists(shape) and cmds.attributeQuery("overrideEnabled", node=shape, exists=True):
-                    seen.add(shape)
-                    nodes.append(shape)
-        return nodes
+            return [] if cmds.getAttr(transform + ".intermediateObject") else [transform]
+        return cmds.listRelatives(transform, allDescendents=True, type='mesh',
+                                  noIntermediate=True, fullPath=True) or []
 
-    def store_override_state(self, node):
-        if node in self.subgroup_color_override_cache:
-            return
-        attrs = {}
-        try:
-            node_uuid = cmds.ls(node, uuid=True) or []
-            if node_uuid:
-                attrs["__uuid"] = node_uuid[0]
-        except Exception:
-            pass
-        for attr in ("overrideEnabled", "overrideRGBColors", "overrideColor"):
-            plug = "{}.{}".format(node, attr)
-            if cmds.objExists(plug):
-                try:
-                    attrs[attr] = cmds.getAttr(plug)
-                except Exception:
-                    pass
-        plug = "{}.overrideColorRGB".format(node)
-        if cmds.objExists(plug):
-            try:
-                value = cmds.getAttr(plug)
-                attrs["overrideColorRGB"] = value[0] if isinstance(value, list) else value
-            except Exception:
-                pass
-        for attr in ("displayColors", "displayColorChannel"):
-            plug = "{}.{}".format(node, attr)
-            if cmds.objExists(plug):
-                try:
-                    attrs[attr] = cmds.getAttr(plug)
-                except Exception:
-                    pass
-        target = self.color_target_for_shape(node)
-        if target:
-            try:
-                color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-                attrs["__had_color_set"] = "BG_Subgroup_Color" in color_sets
-                current = cmds.polyColorSet(target, query=True, currentColorSet=True) or []
-                if current:
-                    attrs["__current_color_set"] = current[0]
-            except Exception:
-                pass
-        self.subgroup_color_override_cache[node] = attrs
-
-    def remove_subgroup_preview_color_set(self, target, clean_history=False):
-        if not target or not cmds.objExists(target):
-            return False
-        try:
-            color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-            if "BG_Subgroup_Color" in color_sets:
-                cmds.polyColorSet(target, delete=True, colorSet="BG_Subgroup_Color")
-                if clean_history:
-                    try:
-                        cmds.delete(target, constructionHistory=True)
-                    except Exception:
-                        pass
-                return True
-        except Exception:
-            pass
-        return False
-
-    def cleanup_subgroup_preview_color_sets(self, roots=None, clean_history=False):
-        roots = roots or []
-        targets = set()
-        for root in roots:
-            if not root or not cmds.objExists(root):
-                continue
-            mesh_shapes = cmds.listRelatives(root, allDescendents=True, fullPath=True, type='mesh', noIntermediate=True) or []
-            for shape in mesh_shapes:
-                parent = cmds.listRelatives(shape, parent=True, fullPath=True) or []
-                if parent:
-                    targets.add(parent[0])
-        removed = 0
-        for target in targets:
-            try:
-                color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-                if "BG_Subgroup_Color" in color_sets:
-                    if self.remove_subgroup_preview_color_set(target, clean_history=clean_history):
-                        removed += 1
-            except Exception:
-                pass
-        return removed
-
-    def color_target_for_shape(self, node):
-        if not node or not cmds.objExists(node):
-            return None
-        if cmds.nodeType(node) == "mesh":
-            parent = cmds.listRelatives(node, parent=True, fullPath=True) or []
-            return parent[0] if parent else None
-        shapes = cmds.listRelatives(node, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
-        return node if shapes else None
-
-    def mesh_shape_for_color_node(self, node):
-        if not node or not cmds.objExists(node):
-            return None
-        if cmds.nodeType(node) == "mesh":
-            return node
-        shapes = cmds.listRelatives(node, shapes=True, type='mesh', noIntermediate=True, fullPath=True) or []
-        return shapes[0] if shapes else None
-
-    def ensure_subgroup_color_set(self, target):
-        color_set = "BG_Subgroup_Color"
-        color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-        if color_set not in color_sets:
-            cmds.polyColorSet(target, create=True, colorSet=color_set)
-        cmds.polyColorSet(target, currentColorSet=True, colorSet=color_set)
-        return color_set
-
-    def apply_override_color(self, node, color):
-        if not node or not cmds.objExists(node):
-            return
-        self.store_override_state(node)
-        target = self.color_target_for_shape(node)
-        shape = self.mesh_shape_for_color_node(node)
-        if not target or not shape:
-            return
-        try:
-            self.ensure_subgroup_color_set(target)
-            cmds.polyColorPerVertex(target, rgb=self.viewport_subgroup_color(color), colorDisplayOption=True, notUndoable=True)
-            if shape and cmds.objExists("{}.displayColors".format(shape)):
-                cmds.setAttr("{}.displayColors".format(shape), True)
-            if shape and cmds.objExists("{}.displayColorChannel".format(shape)):
-                try:
-                    cmds.setAttr("{}.displayColorChannel".format(shape), "color", type="string")
-                except Exception:
-                    pass
-            try:
-                cmds.polyOptions(target, colorShadedDisplay=True, colorMaterialChannel="ambientDiffuse")
-            except Exception:
-                pass
+    def _apply_subgroup_color(self, shape, color, seen):
+        selection = om.MSelectionList()
+        selection.add(shape)
+        dag = selection.getDagPath(0)
+        mesh = om.MFnMesh(dag)
+        key = mesh.uuid().asString()
+        seen.add(key)
+        state = self.subgroup_color_override_cache.get(key)
+        if (state and state["color"] == color and mesh.displayColors and
+                state["preview"] == mesh.currentColorSetName()):
             return True
-        except Exception:
+        if state and state["history"]:
+            self._restore_subgroup_color(key)
+            state = self.subgroup_color_override_cache.get(key)
+            if state:
+                return False
+
+        if state is None:
+            sets = mesh.getColorSetNames()
+            state = {"original": mesh.currentColorSetName() if sets else None,
+                     "display": mesh.displayColors,
+                     "channel": cmds.getAttr(shape + ".displayColorChannel"),
+                     "handle": om.MObjectHandle(dag.node()), "preview": None, "color": None,
+                     "history": bool(cmds.connectionInfo(shape + ".inMesh", isDestination=True)),
+                     "owned": []}
+            self.subgroup_color_override_cache[key] = state
+        try:
+            preview = state["preview"]
+            if preview not in mesh.getColorSetNames():
+                preview = mesh.createColorSet("BG_Subgroup_Color", False)
+                state["preview"] = preview
+                if state["history"]:
+                    self._remember_color_history_node(shape, state, "createColorSet")
+                mesh.setCurrentColorSetName(preview)
+                fresh = True
+            else:
+                fresh = False
+                if mesh.currentColorSetName() != preview:
+                    mesh.setCurrentColorSetName(preview)
+            rgb = self.viewport_subgroup_color(color)
+            if state["history"]:
+                # A DG operation keeps color live when upstream geometry evaluates.
+                cmds.polyColorPerVertex(shape, rgb=rgb, colorDisplayOption=True, notUndoable=True)
+                self._remember_color_history_node(shape, state, "polyColorPerVertex")
+            else:
+                mesh.setColors([om.MColor((*rgb, 1.0))], preview)
+                if fresh:
+                    mesh.assignColors(om.MIntArray(mesh.numFaceVertices, 0), preview)
+            if fresh or not mesh.displayColors:
+                cmds.polyOptions(shape, colorShadedDisplay=True, colorMaterialChannel="ambientDiffuse")
+            state["color"] = color
+            return True
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._restore_subgroup_color(key)
+            cmds.warning("Color HP: {}: {}".format(shape, exc))
             return False
 
-    def delete_preview_materials(self):
-        initial_sg = "initialShadingGroup"
-        for sg in cmds.ls("BG_ColorPreview_SG_*") or []:
-            if initial_sg and cmds.objExists(initial_sg):
-                try:
-                    members = cmds.sets(sg, query=True) or []
-                except Exception:
-                    members = []
-                for member in members:
-                    try:
-                        cmds.sets(member, edit=True, forceElement=initial_sg)
-                    except Exception:
-                        pass
+    @staticmethod
+    def _remember_color_history_node(shape, state, node_type):
+        nodes = cmds.listConnections(shape + ".inMesh", source=True, destination=False) or []
+        if nodes and cmds.nodeType(nodes[0]) == node_type:
+            state["owned"].append(cmds.ls(nodes[0], uuid=True)[0])
+
+    def _restore_subgroup_color(self, key):
+        state = self.subgroup_color_override_cache[key]
+        handle = state["handle"]
+        if handle.isValid() and handle.isAlive():
             try:
-                cmds.delete(sg)
-            except Exception:
-                pass
-        for node in cmds.ls("BG_ColorPreview_MAT_*") or []:
-            try:
-                cmds.delete(node)
-            except Exception:
-                pass
+                dag = om.MDagPath.getAPathTo(handle.object())
+                mesh = om.MFnMesh(dag)
+                for uid in reversed(state["owned"]):
+                    nodes = cmds.ls(uid, long=True) or []
+                    if nodes:
+                        cmds.delete(nodes)
+                preview = state["preview"]
+                if preview in mesh.getColorSetNames():
+                    mesh.deleteColorSet(preview)
+                original = state["original"]
+                if original and original in mesh.getColorSetNames() and mesh.currentColorSetName() != original:
+                    mesh.setCurrentColorSetName(original)
+                cmds.setAttr(dag.fullPathName() + ".displayColorChannel", state["channel"], type="string")
+                mesh.displayColors = state["display"]
+            except (RuntimeError, TypeError, ValueError) as exc:
+                cmds.warning("Color HP: could not restore shape: {}".format(exc))
+                return
+        self.subgroup_color_override_cache.pop(key, None)
 
     @contextlib.contextmanager
     def _suspended_viewport_refresh(self):
-        # Reentrant: update_subgroup_colors calls restore_subgroup_colors
-        # internally, so only the outermost call actually toggles Maya's
-        # refresh state. Batch mesh-color edits (polyColorPerVertex,
-        # polyColorSet, construction-history deletes) can otherwise race
-        # with an active Smooth Mesh Preview redraw and crash Maya.
+        # Defer redraw until the outermost batch of color edits has finished.
         depth = getattr(self, '_viewport_refresh_suspend_depth', 0)
         if depth == 0:
             cmds.refresh(suspend=True)
@@ -2075,51 +2233,10 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 # Даём Maya 100 мс на укладку памяти перед отрисовкой.
                 QtCore.QTimer.singleShot(100, safe_refresh)
 
-    def restore_subgroup_colors(self, clean_history=False):
-        cache = getattr(self, 'subgroup_color_override_cache', {})
+    def restore_subgroup_colors(self):
         with self._suspended_viewport_refresh():
-            for node, attrs in list(cache.items()):
-                if not cmds.objExists(node):
-                    node_uuid = attrs.get("__uuid")
-                    matches = cmds.ls(node_uuid, long=True) if node_uuid else []
-                    if matches:
-                        node = matches[0]
-                    else:
-                        continue
-                try:
-                    if "overrideRGBColors" in attrs:
-                        cmds.setAttr("{}.overrideRGBColors".format(node), attrs["overrideRGBColors"])
-                    if "overrideColorRGB" in attrs:
-                        rgb = attrs["overrideColorRGB"]
-                        cmds.setAttr("{}.overrideColorRGB".format(node), rgb[0], rgb[1], rgb[2])
-                    if "overrideColor" in attrs:
-                        cmds.setAttr("{}.overrideColor".format(node), attrs["overrideColor"])
-                    if "overrideEnabled" in attrs:
-                        cmds.setAttr("{}.overrideEnabled".format(node), attrs["overrideEnabled"])
-                    target = self.color_target_for_shape(node)
-                    has_external_color_set = False
-                    if target:
-                        try:
-                            color_sets = cmds.polyColorSet(target, query=True, allColorSets=True) or []
-                            if "BG_Subgroup_Color" in color_sets:
-                                self.remove_subgroup_preview_color_set(target, clean_history=clean_history)
-                                color_sets = [name for name in color_sets if name != "BG_Subgroup_Color"]
-                            has_external_color_set = bool(color_sets)
-                        except Exception:
-                            pass
-                        if attrs.get("__current_color_set"):
-                            try:
-                                cmds.polyColorSet(target, currentColorSet=True, colorSet=attrs["__current_color_set"])
-                            except Exception:
-                                pass
-                    if "displayColorChannel" in attrs and cmds.objExists("{}.displayColorChannel".format(node)):
-                        cmds.setAttr("{}.displayColorChannel".format(node), attrs["displayColorChannel"], type="string")
-                    if "displayColors" in attrs and cmds.objExists("{}.displayColors".format(node)):
-                        cmds.setAttr("{}.displayColors".format(node), False if has_external_color_set else attrs["displayColors"])
-                except Exception:
-                    pass
-            self.subgroup_color_override_cache = {}
-            self.delete_preview_materials()
+            for key in list(self.subgroup_color_override_cache):
+                self._restore_subgroup_color(key)
 
     @contextlib.contextmanager
     def suspend_subgroup_color_preview(self):
@@ -2133,12 +2250,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 self.update_subgroup_colors()
 
     def refresh_subgroup_color_preview(self, reset_indices=False):
-        self.ensure_subgroup_color_indices(self._subgroup_color_names_for_active_pair())
-        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
-            return
-        if not self.active_chapter_has_subgroups():
-            return
-        self.update_subgroup_colors()
+        if hasattr(self, 'cb_color_subgroups') and self.cb_color_subgroups.isChecked():
+            self.update_subgroup_colors()
 
     def active_chapter_has_subgroups(self, pair=None):
         pair = pair or next((p for p in self.root_pairs if p.get('id') == self.active_root_id), None)
@@ -2156,73 +2269,41 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         return False
 
     def update_subgroup_colors(self):
-        if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
+        if not self.cb_color_subgroups.isChecked():
             return
-        if not self.active_root_id:
-            return
+        targets = []
         if getattr(self, 'is_final_view', False):
-            colored_count = 0
-            with self._suspended_viewport_refresh():
-                self.ensure_subgroup_color_indices([w.get('subgroup_name') for w in getattr(self, 'final_mesh_widgets', []) if w.get('subgroup_name')])
-                for widget_data in getattr(self, 'final_mesh_widgets', []):
-                    name = widget_data.get('subgroup_name')
-                    color = self.subgroup_color_for_name(name)
-                    for node in widget_data.get('hp_nodes', []):
-                        for color_node in self.iter_colorable_nodes(node):
-                            if self.apply_override_color(color_node, color):
-                                colored_count += 1
-            self.log("Color HP: colored {} mesh shapes.".format(colored_count), "lightblue")
-            return
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not pair:
-            return
-        if not self.active_chapter_has_subgroups(pair):
-            return
-        colored_count = 0
-        with self._suspended_viewport_refresh():
-            self.restore_subgroup_colors(clean_history=True)
-            hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-            self.cleanup_subgroup_preview_color_sets([hp_main])
-            group_names = []
-            for root in (hp_main,):
-                if not root or not cmds.objExists(root):
+            for widget in getattr(self, 'final_mesh_widgets', []):
+                targets.extend((widget['subgroup_name'], node) for node in widget.get('hp_nodes', [])
+                               if widget.get('subgroup_name'))
+        else:
+            pair = self._active_color_pair()
+            hp_main = self.core.resolve_main_nodes(pair)[0] if pair else None
+            children = cmds.listRelatives(hp_main, children=True, type='transform', fullPath=True) if hp_main else []
+            for child in children or []:
+                if cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
                     continue
-                for child in cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []:
-                    if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
-                        continue
-                    short_name = child.split('|')[-1]
-                    ui_name = short_name
-                    for suffix in (bg_core.BakeConfig.SUFFIX_HP, bg_core.BakeConfig.SUFFIX_LP):
-                        if ui_name.endswith(suffix):
-                            ui_name = ui_name[:-len(suffix)]
-                            break
-                    if ui_name not in group_names:
-                        group_names.append(ui_name)
-            self.ensure_subgroup_color_indices(sorted(group_names))
-            for root, suffix in ((hp_main, bg_core.BakeConfig.SUFFIX_HP),):
-                if not root or not cmds.objExists(root):
-                    continue
-                children = cmds.listRelatives(root, children=True, type='transform', fullPath=True) or []
-                for child in children:
-                    if not cmds.objExists(child) or cmds.listRelatives(child, shapes=True, type='mesh', noIntermediate=True):
-                        continue
-                    short_name = child.split('|')[-1]
-                    if not self.cb_keep_hp_structure.isChecked():
-                        attr = "{}.{}".format(child, bg_core.BakeConfig.ATTR_BAKE_GROUP)
-                        if cmds.objExists(attr):
-                            group_type = cmds.getAttr(attr)
-                            if suffix == bg_core.BakeConfig.SUFFIX_HP and group_type != "HP":
-                                continue
-                        elif not short_name.endswith(suffix):
+                name = child.rsplit('|', 1)[-1]
+                if not self.cb_keep_hp_structure.isChecked():
+                    attr = child + "." + bg_core.BakeConfig.ATTR_BAKE_GROUP
+                    if cmds.objExists(attr):
+                        if cmds.getAttr(attr) != "HP":
                             continue
-                    ui_name = short_name
-                    if short_name.endswith(suffix):
-                        ui_name = short_name[:-len(suffix)]
-                    color = self.subgroup_color_for_name(ui_name)
-                    for color_node in self.iter_colorable_nodes(child):
-                        if self.apply_override_color(color_node, color):
-                            colored_count += 1
-        self.log("Color HP: colored {} mesh shapes.".format(colored_count), "lightblue")
+                    elif not name.endswith(bg_core.BakeConfig.SUFFIX_HP):
+                        continue
+                if name.endswith(bg_core.BakeConfig.SUFFIX_HP):
+                    name = name[:-len(bg_core.BakeConfig.SUFFIX_HP)]
+                targets.append((name, child))
+        self.ensure_subgroup_color_indices([name for name, _ in targets])
+        seen = set()
+        with self._suspended_viewport_refresh():
+            for name, node in targets:
+                color = self.subgroup_color_for_name(name)
+                for shape in self.iter_colorable_nodes(node):
+                    self._apply_subgroup_color(shape, color, seen)
+            for key in self.subgroup_color_override_cache.keys() - seen:
+                self._restore_subgroup_color(key)
+        self.log("Color HP: {} mesh shapes in preview.".format(len(seen)), "lightblue")
 
     def recolor_moved_subgroup_nodes(self, nodes, subgroup_name):
         if not hasattr(self, 'cb_color_subgroups') or not self.cb_color_subgroups.isChecked():
@@ -2242,7 +2323,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             if not self.core.is_descendant_of(node, hp_main):
                 continue
             for color_node in self.iter_colorable_nodes(node):
-                if self.apply_override_color(color_node, color):
+                if self._apply_subgroup_color(color_node, color, set()):
                     colored_count += 1
         if colored_count:
             self.log("Color HP: recolored {} moved mesh shapes.".format(colored_count), "lightblue")
@@ -2356,9 +2437,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         if not self._stop_update_worker_for_close():
             self._is_closing = False
             return False
-        finish_cage = getattr(self, '_cage_finish_edits', None)
-        if finish_cage:
-            finish_cage()
+        preflight_cache = getattr(self, '_hp_preflight_cache', None)
+        if preflight_cache is not None:
+            preflight_cache.close()
         self.cancel_help_mode()
         guide = getattr(self, '_guide_window', None)
         if guide is not None:
@@ -2381,6 +2462,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.restore_subgroup_colors()
         except Exception:
             pass
+        for callback in getattr(self, '_color_save_callbacks', []):
+            om.MMessage.removeCallback(callback)
+        self._color_save_callbacks = []
         for job_id in self.script_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):
@@ -2406,6 +2490,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             self.objectName()
         except RuntimeError:
             return
+        self._invalidate_hp_preflight()
         self.core._node_cache.clear()
         self._clear_analysis_runtime_caches(clear_geometry=True)
         self.root_pairs = bg_core.BakeSessionModel.load()
@@ -2417,12 +2502,14 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
 
     def refresh_localized_ui(self):
         bg_l10n.localize_widget_tree(self)
+        if hasattr(self, "mesh_check_panel"):
+            self.mesh_check_tabs.setTabText(0, bg_l10n.text("Groups"))
+            self.mesh_check_tabs.setTabText(1, bg_l10n.text("Mesh Check"))
+            self.mesh_check_panel.retranslate()
         self.refresh_right_panel()
         self.refresh_left_panel()
-        # Rebuild the cage panel in the new language (its labels/combo are built
-        # from bg_l10n at construction, so re-localizing the old tree is unsafe).
-        if getattr(self, 'is_cage_config', False):
-            self.enter_cage_config()
+        if getattr(self, 'is_final_view', False):
+            self.show_export_settings_panel()
 
     def set_localized_button_state(self, button, key):
         if not button:
@@ -2485,6 +2572,8 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         return res == QtWidgets.QMessageBox.Yes
 
     def refresh_left_panel(self):
+        if hasattr(self, "mesh_check_panel"):
+            self.mesh_check_panel.refresh()
         import re  # Гарантированная защита от NameError в среде Maya
         
         for i in reversed(range(self.subgroups_layout.count())):
@@ -2651,44 +2740,24 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
                 widget.setStatusTip("")
                 widget.setProperty("bg_status_tip", "")
 
-    def _deselect_cage_meshes(self):
-        """Remove any cage nodes/components from the current selection (cage
-        meshes live under |Cage_BG| and end with the cage suffix). Leaves the
-        rest of the selection untouched."""
-        try:
-            sel = cmds.ls(selection=True, long=True) or []
-        except Exception:
-            return
-        root_tag = "|{}|".format(bg_cage.CAGE_ROOT)
-        cage_sel = [n for n in sel if root_tag in n or bg_cage.SUFFIX_CAGE in n]
-        if cage_sel:
-            try:
-                cmds.select(cage_sel, deselect=True)
-            except Exception:
-                pass
 
     def activate_root(self, pair):
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
         if not hp_node or not lp_node:
             self.active_root_id = pair['id']
-            return cmds.warning("Original groups were deleted.")
+            missing = " and ".join(label for label, node in (("HP", hp_node), ("LP", lp_node)) if not node)
+            return cmds.warning("Chapter '{}' is missing its linked {} root.".format(pair.get('base', ''), missing))
 
         is_switch = self.active_root_id != pair['id']
         if not is_switch:
             self.is_isolated = not self.is_isolated
         else:
             self._clear_analysis_runtime_caches(clear_geometry=True)
-            # Switching chapters drops the previous chapter's cage from the
-            # viewport selection so it can't linger as the Expansion scope.
-            self._deselect_cage_meshes()
             self.active_root_id = pair['id']
             self.active_subgroup_name = None
             self.is_isolated = True
             self.subgroup_color_index_map = dict(pair.get('subgroup_color_indices') or {})
 
-        # Outside Export Settings the whole Cage_BG hierarchy must stay hidden;
-        # hide its root if it somehow ended up visible.
-        self._hide_cage_root_if_not_export()
         # Clicking a chapter that was hidden via its Eye flag reveals it (you
         # clicked it to work on it). Export Settings runs its own HP-visible /
         # LP-hidden setup below, so only do this in normal mode.
@@ -2702,22 +2771,17 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             cmds.isolateSelect(panel, state=self.is_isolated)
             if self.is_isolated:
                 iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
-                # The chapter cage is isolated together with its HP/LP so it
-                # doesn't linger visible (or vanish) out of sync with the chapter.
-                cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(pair.get('base', ''))
-                if not cmds.objExists(cage_grp):
-                    cage_grp = None
                 if iso_set:
                     set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
                     if cmds.objExists(set_name):
                         cmds.sets(clear=set_name)
-                # In Export Settings the LP root is hidden and only HP (+cage) is
+                # In Export Settings the LP root is hidden and only HP is
                 # previewed, so keep LP OUT of the isolate set there - otherwise a
                 # chapter switch re-adds and shows the new chapter's LP.
                 if getattr(self, 'is_final_view', False):
-                    nodes_to_add = [hp_node, cage_grp]
+                    nodes_to_add = [hp_node]
                 else:
-                    nodes_to_add = [hp_node, lp_node, cage_grp]
+                    nodes_to_add = [hp_node, lp_node]
                 for node in [n for n in nodes_to_add if n and cmds.objExists(n)]:
                     cmds.isolateSelect(panel, addDagObject=node)
             cmds.isolateSelect(panel, update=True)
@@ -2735,10 +2799,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         elif color_groups_enabled:
             self.update_subgroup_colors()
 
-        # Switching chapters in Export Settings rebuilds the Cage panel so the
-        # Expansion slider (and every other cage control) targets the NEW
-        # chapter. Without this the panel keeps the previous chapter's closures
-        # and Expansion would inflate the OLD chapter's cage.
+        # Refresh export options for the newly active chapter.
         if is_switch and getattr(self, 'is_final_view', False):
             # Re-apply the Export Settings scene look to the NEW chapter: HP root
             # visible, LP root hidden (LP is never previewed in Export Settings).
@@ -2750,10 +2811,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             if lp_node and cmds.objExists(lp_node):
                 self._saved_lp_root_vis = cmds.getAttr(lp_node + ".visibility")
                 cmds.setAttr(lp_node + ".visibility", False)
-            self.enter_cage_config()
-            # enter_cage_config -> _ensure_cage_visible pins the cage group to the
-            # session-wide Cage Vis/Hid preference; re-sync the buttons to the
-            # final HP / LP-or-cage state.
+            self.show_export_settings_panel()
             self.sync_toggle_buttons(hp_node, lp_node)
 
     def select_meshes_in_group(self, hp_grp, lp_grp):
@@ -2779,18 +2837,9 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         self.set_localized_button_state(self.btn_toggle_hp, "HP Visible" if hp_vis else "HP Hidden")
         self.btn_toggle_hp.setStyleSheet("background-color: #4a5d4a;" if hp_vis else "background-color: #8c4242;")
 
-        # In Export Settings with a cage, this button reflects/controls the cage
-        # group visibility instead of LP.
-        cage_grp = self._cage_toggle_node()
-        if cage_grp:
-            cage_vis = bool(cmds.getAttr("{}.visibility".format(cage_grp)))
-            self.btn_toggle_lp.setChecked(cage_vis)
-            self.set_localized_button_state(self.btn_toggle_lp, "Cage Vis" if cage_vis else "Cage Hid")
-            self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if cage_vis else "background-color: #8c4242;")
-        else:
-            self.btn_toggle_lp.setChecked(lp_vis)
-            self.set_localized_button_state(self.btn_toggle_lp, "LP Visible" if lp_vis else "LP Hidden")
-            self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
+        self.btn_toggle_lp.setChecked(lp_vis)
+        self.set_localized_button_state(self.btn_toggle_lp, "LP Visible" if lp_vis else "LP Hidden")
+        self.btn_toggle_lp.setStyleSheet("background-color: #4a5d4a;" if lp_vis else "background-color: #8c4242;")
 
         material_filter = getattr(self, 'active_material_visibility_filter', None)
         group_state = self.get_active_subgroups_visibility_state(hp_node, lp_node, hp_vis, lp_vis)
@@ -3098,20 +3147,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             return "none"
         return "partial"
 
-    def _cage_toggle_node(self):
-        """In Export Settings, when the active chapter has a cage, the LP Visible
-        button controls the cage group instead of the LP root. Returns the cage
-        group node in that case, else None (normal LP behaviour)."""
-        if not getattr(self, 'is_final_view', False):
-            return None
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        if not pair:
-            return None
-        base_name = pair.get('base', '')
-        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if cage_grp and cmds.objExists(cage_grp) and bg_cage.CageProcessor.get_chapter_cage_meshes(base_name):
-            return cage_grp
-        return None
 
     def toggle_root_vis(self, type_str, state):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -3121,23 +3156,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         hp_node, lp_node, _ = self.core.resolve_main_nodes(pair)
         btn = self.btn_toggle_hp if type_str == "HP" else self.btn_toggle_lp
 
-        # Cage_BG must not linger visible outside Export Settings - hide it here
-        # too (no-op in Export Settings / when already hidden).
-        self._hide_cage_root_if_not_export()
-
-        # Export Settings + a cage present: the "LP" button toggles the cage
-        # group (labelled Cage Vis/Cage Hid) instead of the LP root.
-        if type_str == "LP":
-            cage_grp = self._cage_toggle_node()
-            if cage_grp:
-                # Remember the choice session-wide so it carries to other
-                # chapters (see activate_root).
-                self.cage_vis_pref = bool(state)
-                self.set_localized_button_state(btn, "Cage Vis" if state else "Cage Hid")
-                btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
-                cmds.setAttr("{}.visibility".format(cage_grp), state)
-                return
-
         parent_node = hp_node if type_str == "HP" else lp_node
         self.set_localized_button_state(btn, "{} Visible".format(type_str) if state else "{} Hidden".format(type_str))
         btn.setStyleSheet("background-color: #4a5d4a;" if state else "background-color: #8c4242;")
@@ -3146,19 +3164,6 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
             # subgroup eyes or individually hidden mesh transforms.
             cmds.setAttr("{}.visibility".format(parent_node), state)
 
-    def _hide_cage_root_if_not_export(self):
-        """The whole Cage_BG hierarchy is only meant to be seen inside Export
-        Settings. When NOT in Export Settings, hide its root if it is visible -
-        a cheap safety net run on chapter switch and on HP/LP Visible."""
-        if getattr(self, 'is_final_view', False):
-            return
-        cage_root = "|{}".format(bg_cage.CAGE_ROOT)
-        if cmds.objExists(cage_root):
-            try:
-                if cmds.getAttr(cage_root + ".visibility"):
-                    cmds.setAttr(cage_root + ".visibility", False)
-            except Exception:
-                pass
 
     def _ensure_chapter_visible(self, hp_node, lp_node):
         """Make a chapter's HP/LP roots (and their direct subgroups) visible if
@@ -3272,6 +3277,7 @@ class BakeManagerUI(MayaQWidgetDockableMixin, QtWidgets.QMainWindow, _Cooperativ
         action_optimize.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Optimize Groups", self.optimize_subgroups))
         action_select_by_mesh = menu.addAction("Group search by mesh (Ctrl+Shift+Z)")
         action_select_by_mesh.triggered.connect(self.select_subgroup_by_selected_mesh)
+        menu.addAction(bg_l10n.text("Color HP palette")).triggered.connect(self.edit_hp_palette)
         bg_l10n.localize_menu(menu)
         menu.exec_(self.subgroups_widget.mapToGlobal(pos))
 

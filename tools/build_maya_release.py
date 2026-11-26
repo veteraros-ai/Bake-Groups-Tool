@@ -26,9 +26,8 @@ def build(version, output):
     inventory = subprocess.check_output(
         ["git", "ls-files", "-z", "--", "Bake_Groups"], cwd=str(root)).decode("utf-8")
     names = sorted(name for name in inventory.split("\0") if name)
-    required = {"Bake_Groups/bg_cage_undo.py", "Bake_Groups/bg_guide_translations.py",
-                "Bake_Groups/bin/bg_obj_subdivider.exe",
-                "Bake_Groups/toolbag_plugin/Bake Groups Bridge/__main__.py"}
+    required = {"Bake_Groups/bg_guide_translations.py", "Bake_Groups/bg_mesh_check.py",
+                "Bake_Groups/bin/bg_obj_subdivider.exe", "Bake_Groups/Bake_Group.ico"}
     required.update("Bake_Groups/bin/{}/bg_math_core.pyd".format(year)
                     for year in range(2022, 2028))
     if not required.issubset(names):
@@ -67,9 +66,40 @@ def build(version, output):
                       "bytes": output.stat().st_size, "sha256": digest}, indent=2))
 
 
+def build_installer(version, runtime_zip, output):
+    """Package the drag installer and four-language instructions beside the runtime."""
+    root = Path(__file__).resolve().parents[1]
+    prefix = "Bake_Groups_Maya_{}".format(version)
+    with zipfile.ZipFile(runtime_zip) as runtime, zipfile.ZipFile(
+            output, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as setup:
+        for folder in (prefix, prefix + "/Bake_Groups"):
+            info = zipfile.ZipInfo(folder + "/")
+            info.create_system = 0
+            info.external_attr = 0x11  # Directory + read-only, enables desktop.ini icons.
+            setup.writestr(info, b"")
+        for folder, icon in ((prefix, "Bake_Groups\\Bake_Group.ico"),
+                             (prefix + "/Bake_Groups", "Bake_Group.ico")):
+            info = zipfile.ZipInfo(folder + "/desktop.ini")
+            info.create_system = 0
+            info.external_attr = 0x06  # System + hidden.
+            setup.writestr(info, ("[.ShellClassInfo]\r\nIconResource={},0\r\n".format(icon)).encode("utf-8-sig"))
+        for name in ("Install_Bake_Groups.py", "Instal.txt"):
+            setup.write(root / name, prefix + "/" + name)
+        for name in runtime.namelist():
+            setup.writestr(prefix + "/" + name, runtime.read(name))
+    with zipfile.ZipFile(output) as setup:
+        if setup.testzip() is not None or not {
+                prefix + "/Install_Bake_Groups.py", prefix + "/Instal.txt",
+                prefix + "/Bake_Groups/Bake_Group.ico"} <= set(setup.namelist()):
+            raise ValueError("Maya installation archive verification failed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--installer-output")
     args = parser.parse_args()
     build(args.version, args.output)
+    if args.installer_output:
+        build_installer(args.version, args.output, args.installer_output)

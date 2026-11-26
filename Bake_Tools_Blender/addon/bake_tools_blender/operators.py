@@ -378,6 +378,9 @@ class BAKE_TOOLS_OT_create_pairs_by_material(bpy.types.Operator):
         existing = {pair.name for pair in state.pairs}
         book = next_book_name(state)
         first_index = len(state.pairs)
+        created_regions = []
+        from .material_distribution import create_lp_material_region
+
         try:
             with progress_scope("Creating chapters by LP materials", "Scanning LP materials") as progress:
                 progress.update(5, "Scanning LP materials")
@@ -389,9 +392,9 @@ class BAKE_TOOLS_OT_create_pairs_by_material(bpy.types.Operator):
                     self.report({"WARNING"}, "No LP meshes found under the picked root")
                     log(state, "Create by material: no LP meshes found")
                     return {"CANCELLED"}
-                progress.update(82, "Creating material chapters")
+                progress.update(92, "Creating material chapters")
                 for bucket_index, bucket in enumerate(buckets):
-                    progress.update(82 + int(bucket_index * 17 / max(1, len(buckets))), "Creating chapter: {}".format(bucket.label))
+                    progress.update(92 + int(bucket_index * 7 / max(1, len(buckets))), "Creating chapter: {}".format(bucket.label))
                     pair = state.pairs.add()
                     pair.item_id = uuid4().hex
                     pair.name = _unique_name(existing, bucket.label, "Material")
@@ -400,20 +403,41 @@ class BAKE_TOOLS_OT_create_pairs_by_material(bpy.types.Operator):
                     pair.scope_by_members = True
                     _assign_pair_roots(pair, hp_kind, hp_root, lp_kind, lp_root)
                     add_object_refs(pair.hp_scope_members, bucket.hp_objects)
-                    add_object_refs(pair.lp_scope_members, bucket.lp_objects)
+                    regions = []
+                    for source, material in bucket.lp_regions:
+                        progress.check_cancelled()
+                        piece = create_lp_material_region(context, source, material)
+                        regions.append(piece)
+                        created_regions.append(piece)
+                    add_object_refs(pair.lp_scope_members, (*bucket.lp_objects, *regions))
                 progress.update(100, "Material chapters created")
         except ProgressCancelled:
             while len(state.pairs) > first_index:
                 state.pairs.remove(len(state.pairs) - 1)
+            for piece in created_regions:
+                mesh = piece.data
+                bpy.data.objects.remove(piece, do_unlink=True)
+                if not mesh.users:
+                    bpy.data.meshes.remove(mesh)
             log(state, "Create by material canceled")
             self.report({"WARNING"}, "Create by material canceled")
             return {"CANCELLED"}
         except Exception:
             while len(state.pairs) > first_index:
                 state.pairs.remove(len(state.pairs) - 1)
+            for piece in created_regions:
+                mesh = piece.data
+                bpy.data.objects.remove(piece, do_unlink=True)
+                if not mesh.users:
+                    bpy.data.meshes.remove(mesh)
             raise
 
         first_pair = state.pairs[first_index]
+        # Source LP objects stay available for editing, while the scoped pieces
+        # provide the chapter geometry without overlapping the originals.
+        for source in {obj for bucket in buckets for obj, _material in bucket.lp_regions}:
+            if source.name in context.view_layer.objects:
+                source.hide_set(True, view_layer=context.view_layer)
         _set_active_pair(state, first_index, first_pair)
         material_count = inspect_root_materials(lp_root).count
         message = "Create by material: {} chapter(s) in {} from {} LP material(s)".format(
@@ -470,7 +494,7 @@ class BAKE_TOOLS_OT_about(bpy.types.Operator):
 
         layout = self.layout
         layout.label(text="Bake Group Manager Pro", icon="MODIFIER")
-        layout.label(text="Blender 1.0.1")
+        layout.label(text="Blender 1.0.2")
         layout.label(text="Math: {}".format(native_core.backend_name()))
         layout.separator()
         layout.label(text="Original PySide6 UI edition")
@@ -1025,6 +1049,8 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                 ("CHECK_REMOVE_DUPLICATES", "Remove Extra Copies"),
                 ("CHECK_SELECT_ZBRUSH", "Select Possible ZBrush Meshes"),
                 ("CHECK_ADD_ZBRUSH", "Add to ZBrush Layer"),
+                ("CHECK_SELECT_EMPTY", "Select Empty Mesh Objects"),
+                ("CHECK_REMOVE_EMPTY", "Remove Empty Mesh Objects"),
                 ("CHECK_SELECT_COMBINED", "Select Combined Meshes"),
                 ("CHECK_SEPARATE_COMBINED", "Separate Combined Meshes"),
                 ("ZBRUSH_ADD_SELECTED", "Add Selected to ZBrush Layer"),
@@ -1129,6 +1155,7 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
             "CHECK_SELECT_DUPLICATES", "CHECK_REMOVE_DUPLICATES",
             "CHECK_SELECT_ZBRUSH", "CHECK_ADD_ZBRUSH",
             "CHECK_SELECT_COMBINED", "CHECK_SEPARATE_COMBINED",
+            "CHECK_SELECT_EMPTY", "CHECK_REMOVE_EMPTY",
             "ZBRUSH_ADD_SELECTED", "ZBRUSH_SELECT_LAYER",
         }:
             from .mesh_tools import (
@@ -1224,6 +1251,10 @@ class BAKE_TOOLS_OT_action(bpy.types.Operator):
                         message = "ZBrush layer: {} candidate(s), {} newly added".format(
                             len(candidates), len(added)
                         )
+                    elif self.action == "CHECK_REMOVE_EMPTY":
+                        from .mesh_tools import remove_check_empty_objects
+                        removed = remove_check_empty_objects(context, state, pair)
+                        message = "Mesh Check: removed {} empty mesh object(s)".format(removed)
                     elif self.action == "CHECK_SEPARATE_COMBINED":
                         with progress_scope("Separate", "Reading loose mesh parts", cancellable=False) as progress:
                             parts, source_count = separate_check_candidates(

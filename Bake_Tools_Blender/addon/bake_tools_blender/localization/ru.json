@@ -1,6 +1,16 @@
 {
     "language":  "ru",
     "texts":  {
+                  "Mesh Check": "Проверка мешей",
+                  "Disconnected geometry": "Несвязанная геометрия",
+                  "Empty mesh objects": "Пустые меш-объекты",
+                  "ZBrush triangle threshold": "Порог треугольников ZBrush",
+                  "Color HP palette": "Палитра Color HP",
+                  "Current colors": "Текущие цвета",
+                  "Factory palette": "Заводская палитра",
+                  "New preset name (optional)": "Имя нового пресета (по желанию)",
+                  "Use as default on next launch": "Использовать по умолчанию при следующем запуске",
+                  "Choose a unique preset name": "Введите другое имя пресета",
                   "Manual HPs:":  "Ручные HP:",
                   "Empty manual cluster. Use Link later to replace it with selected HP meshes.":  "Пустой ручной кластер. Позже нажмите Link, чтобы заменить его выбранными HP-мешами.",
                   "Export preflight":  "Проверка перед экспортом",

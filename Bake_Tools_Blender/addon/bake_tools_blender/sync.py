@@ -30,10 +30,31 @@ def _notify_after_scene_change(*_args):
         return
 
 
+@persistent
+def _before_save(*_args):
+    from .color_preview import restore_color_preview
+
+    restore_color_preview()
+
+
+@persistent
+def _after_save(*_args):
+    from .color_preview import refresh_color_preview
+
+    scene = bpy.context.scene
+    state = getattr(scene, "bake_tools_settings", None)
+    if state and state.color_subgroups:
+        pair = next((item for item in state.pairs if item.item_id == state.active_pair_id), None)
+        refresh_color_preview(state, pair)
+
+
 _HANDLER_LISTS = (
-    bpy.app.handlers.load_post,
-    bpy.app.handlers.undo_post,
-    bpy.app.handlers.redo_post,
+    (bpy.app.handlers.load_post, _notify_after_scene_change),
+    (bpy.app.handlers.undo_post, _notify_after_scene_change),
+    (bpy.app.handlers.redo_post, _notify_after_scene_change),
+    (bpy.app.handlers.save_pre, _before_save),
+    (bpy.app.handlers.save_post, _after_save),
+    (getattr(bpy.app.handlers, "save_post_fail", None), _after_save),
 )
 
 
@@ -45,17 +66,17 @@ def _poll_native_context():
 
 
 def register_sync_handlers():
-    for handlers in _HANDLER_LISTS:
-        if _notify_after_scene_change not in handlers:
-            handlers.append(_notify_after_scene_change)
+    for handlers, callback in _HANDLER_LISTS:
+        if handlers is not None and callback not in handlers:
+            handlers.append(callback)
     if not bpy.app.timers.is_registered(_poll_native_context):
         bpy.app.timers.register(_poll_native_context, first_interval=0.05, persistent=True)
 
 
 def unregister_sync_handlers():
-    for handlers in _HANDLER_LISTS:
-        if _notify_after_scene_change in handlers:
-            handlers.remove(_notify_after_scene_change)
+    for handlers, callback in _HANDLER_LISTS:
+        if handlers is not None and callback in handlers:
+            handlers.remove(callback)
     if bpy.app.timers.is_registered(_poll_native_context):
         bpy.app.timers.unregister(_poll_native_context)
     reset_context()

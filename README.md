@@ -40,10 +40,10 @@ The package includes `bg_math_core.pyd` builds for:
 - Maya 2026
 - Maya 2027
 
-## Blender 1.0.1
+## Blender 1.0.2
 
 The Blender build supports Blender 4.2+ on Windows x64. Install the
-published `Bake_Tools_Blender-1.0.1-win64.zip` from Blender Preferences without
+published `Bake_Tools_Blender-1.0.2-win64.zip` from Blender Preferences without
 unpacking it. The release archive bundles the matching PySide6 Essentials and
 shiboken6 runtime; the large binary runtime is intentionally not committed to Git.
 The built-in Bake Guide opens from Help. The original artist-authored PureRef
@@ -53,16 +53,17 @@ Blender telemetry is disabled until the artist explicitly opts in. It sends one
 pseudonymous installation/update event per version and never sends scene data,
 object names or file paths. See `Bake_Tools_Blender/PRIVACY.md`.
 
-## Maya 1.4.7
+## Maya 1.5.0
 
-The Maya release adds context-help instructions, default-on LP normal preservation
-before triangulation, safer Cage editing/export, chapter export exclusions, and
-Marmoset HP/LP synchronization fixes. HP is exported to Toolbag without baking
-Maya Smooth Preview before subdivision. See
-[Maya 1.4.7 release notes](docs/RELEASE_NOTES_MAYA_1.4.7.md).
+This release introduces the Mesh Check tab, material-aware HP chapter assignment,
+Color HP palettes and presets, and expanded context help. FBX export preserves
+placement and face orientation for mirrored LP meshes.
 
-Download `Bake_Groups_1.4.7.zip` from the GitHub release or use the plugin's updater.
-The archive includes native Maya 2022–2027 modules and the external HP subdivider.
+For a first installation, extract `Bake_Groups_Maya_1.5.0_Installer.zip` and
+drag `Install_Bake_Groups.py` into the Maya viewport. The installer copies
+the plugin to Maya's user scripts, adds or updates its Shelf button, and saves
+the Shelf. See `Instal.txt` for English, Russian, Japanese and Simplified Chinese
+instructions. Existing installations can use the built-in updater.
 
 ## Installation
 

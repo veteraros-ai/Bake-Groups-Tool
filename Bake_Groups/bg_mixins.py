@@ -8,8 +8,6 @@ import bg_worker_lp
 import maya.api.OpenMaya as om
 from bg_worker_lp import LPMatchingWorker
 import bg_final_export
-import bg_marmoset_bridge
-import bg_cage
 import bg_localization as bg_l10n
 
 try:
@@ -35,10 +33,15 @@ import maya.cmds as cmds
 import maya.api.OpenMaya as om
 import maya.mel as mel
 import uuid
+import json
 import re
 import math
 import os
 import contextlib
+import time
+from collections import OrderedDict
+from bisect import bisect_left, bisect_right
+from heapq import nlargest
 from bg_ui_widgets import SubgroupButton, get_icon, configure_square_icon_button
 
 
@@ -48,6 +51,53 @@ def _create_identity_child_group(parent, name):
         raise RuntimeError("Cannot create subgroup: parent does not exist: {}".format(parent))
     group = cmds.group(empty=True, name=name, parent=parent)
     return (cmds.ls(group, long=True) or [group])[0]
+
+
+def _parent_preserving_equal_frame(nodes, parent):
+    """Avoid decomposing authored local pivots/axes between identical frames.
+
+    Compare evaluated inclusive matrices exactly, including inherited transforms
+    and offsetParentMatrix. A real frame difference must retain Maya's absolute
+    world-preserving parenting, not be rounded away as a frozen transform.
+    """
+    target = (cmds.ls(parent, long=True) or [parent])[0]
+    paths = cmds.ls(nodes if isinstance(nodes, (list, tuple)) else [nodes], long=True) or []
+
+    def frame(path):
+        if not path:
+            return tuple(om.MMatrix())
+        selection = om.MSelectionList()
+        selection.add(path)
+        return tuple(selection.getDagPath(0).inclusiveMatrix())
+
+    target_frame = frame(target)
+    relative_nodes, absolute_nodes, result = [], [], []
+    source_set = set(paths)
+    nested = any(any(node.startswith(other + "|") for other in source_set if other != node)
+                 for node in paths)
+    for node in sorted(paths, key=lambda path: path.count('|'), reverse=True):
+        current = cmds.listRelatives(node, parent=True, fullPath=True) or []
+        current = current[0] if current else None
+        if current == target:
+            result.append(node)
+            continue
+        try:
+            equal_frame = frame(current) == target_frame
+        except Exception:
+            equal_frame = False
+        if nested:
+            # Move nested sources deepest-first before their paths can change.
+            result.extend(cmds.parent(node, target, relative=True) if equal_frame
+                          else cmds.parent(node, target, absolute=True))
+        elif equal_frame:
+            relative_nodes.append(node)
+        else:
+            absolute_nodes.append(node)
+    if relative_nodes:
+        result.extend(cmds.parent(relative_nodes, target, relative=True) or [])
+    if absolute_nodes:
+        result.extend(cmds.parent(absolute_nodes, target, absolute=True) or [])
+    return cmds.ls(result, long=True) or []
 
 
 # ============================================================================
@@ -80,22 +130,8 @@ class HPAnalysisMixin:
         }
 
     def _is_in_zbrush_display_layer(self, mesh_transform):
-        if not mesh_transform or not cmds.objExists(mesh_transform):
-            return False
-
-        nodes_to_check = [mesh_transform]
-        nodes_to_check.extend(cmds.listRelatives(mesh_transform, shapes=True, fullPath=True, type='mesh') or [])
-
-        parent = cmds.listRelatives(mesh_transform, parent=True, fullPath=True)
-        while parent:
-            nodes_to_check.append(parent[0])
-            parent = cmds.listRelatives(parent[0], parent=True, fullPath=True)
-
-        for node in nodes_to_check:
-            for layer in (cmds.listConnections(node, type="displayLayer") or []):
-                if layer and "zbrush" in layer.lower():
-                    return True
-        return False
+        from bg_mesh_check import is_in_zbrush_layer
+        return is_in_zbrush_layer(mesh_transform)
 
     def _find_zbrush_candidates_outside_layer(self, hp_main):
         shapes = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='mesh') or []
@@ -113,6 +149,7 @@ class HPAnalysisMixin:
     def _confirm_zbrush_candidates_before_hp_analysis(self, hp_main):
         candidates = self._find_zbrush_candidates_outside_layer(hp_main)
         if not candidates:
+            self._set_hp_check_stage('zbrush', 'passed')
             return True
 
         threshold_pct = int(getattr(self, 'zbrush_triangle_threshold', 50))
@@ -144,9 +181,14 @@ class HPAnalysisMixin:
             if meshes:
                 cmds.select(meshes, replace=True)
                 self.log("Analyze HP paused: selected {} possible ZBrush mesh(es).".format(len(meshes)), "orange")
+            self._set_hp_check_stage('zbrush', 'found', count=len(candidates))
             return False
 
-        return box.clickedButton() == skip_btn
+        if box.clickedButton() == skip_btn:
+            self._set_hp_check_stage('zbrush', 'skipped', count=len(candidates))
+            return True
+        self._set_hp_check_stage('zbrush', 'cancelled')
+        return False
 
     def _duplicate_check_shape(self, mesh_transform):
         shapes = cmds.listRelatives(mesh_transform, shapes=True, fullPath=True, type='mesh') or []
@@ -166,8 +208,8 @@ class HPAnalysisMixin:
         except Exception:
             return None
 
-    def _combined_check_mesh_shells(self, mesh_transform):
-        shape = self._duplicate_check_shape(mesh_transform)
+    def _combined_check_mesh_shells(self, mesh_transform, shape=None):
+        shape = shape or self._duplicate_check_shape(mesh_transform)
         if not shape:
             return None
         dag_path = self._duplicate_check_dag_path(shape)
@@ -395,8 +437,8 @@ class HPAnalysisMixin:
             try:
                 info, cache_status = self._combined_check_mesh_shells_cached(mesh_transform)
                 stats[cache_status] = stats.get(cache_status, 0) + 1
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError("{}: {}".format(mesh_transform, exc))
             if not info:
                 continue
             if info.get("meaningful_shell_count", 0) < 2:
@@ -418,6 +460,7 @@ class HPAnalysisMixin:
             self._combined_check_skipped_chapters = skipped_chapters
         if chapter_id and chapter_id in skipped_chapters:
             self.log(bg_l10n.text("Combined mesh check skipped for this chapter."), "lightblue")
+            self._set_hp_check_stage('combined', 'skipped', reason='chapter preference')
             return True
 
         def _make_progress(total):
@@ -470,6 +513,7 @@ class HPAnalysisMixin:
                 if result is None or result[0] is None:
                     _close_progress()
                     self.log(bg_l10n.text("Combined mesh check canceled."), "orange")
+                    self._set_hp_check_stage('combined', 'cancelled')
                     return False
                 candidates, cache_stats = result
                 for key, value in (cache_stats or {}).items():
@@ -481,7 +525,8 @@ class HPAnalysisMixin:
             message = bg_l10n.text("Combined mesh check failed: {error}").format(error=exc)
             cmds.warning(message)
             self.log(message, "orange")
-            return True
+            self._set_hp_check_stage('combined', 'failed', error=str(exc))
+            return False
         finally:
             _close_progress()
 
@@ -499,6 +544,7 @@ class HPAnalysisMixin:
             )
 
         if not single_roots and not combined:
+            self._set_hp_check_stage('combined', 'passed')
             return True
 
         problem_nodes = []
@@ -579,6 +625,7 @@ class HPAnalysisMixin:
                     "Combined mesh check failed",
                     "Analyze HP | candidates={}".format(len(problem_nodes))
                 )
+            self._set_hp_check_stage('combined', 'found', count=len(problem_nodes))
             return False
 
         if separate_btn is not None and box.clickedButton() == separate_btn:
@@ -592,7 +639,8 @@ class HPAnalysisMixin:
                 message = bg_l10n.text("Combined mesh separation failed: {error}").format(error=exc)
                 cmds.warning(message)
                 self.log(message, "red")
-                return True
+                self._set_hp_check_stage('combined', 'failed', error=str(exc))
+                return False
             if separated:
                 message = bg_l10n.text("Combined mesh cleanup: separated {count} mesh part(s).").format(
                     count=len(separated)
@@ -606,7 +654,24 @@ class HPAnalysisMixin:
                     )
             else:
                 self.log(bg_l10n.text("Combined mesh cleanup: nothing was separated."), "orange")
-            return True
+            remaining = []
+            try:
+                for _label, root in roots:
+                    candidates, _stats = self._find_combined_mesh_candidates_under_root(root)
+                    if candidates is None:
+                        self._set_hp_check_stage('combined', 'cancelled')
+                        return False
+                    remaining.extend(node for node, _info in candidates)
+                    mesh_transforms = self._mesh_transforms_under_root(root)
+                    if len(mesh_transforms) == 1:
+                        remaining.extend(mesh_transforms)
+            except Exception as exc:
+                self._set_hp_check_stage('combined', 'failed', error=str(exc))
+                self.log(bg_l10n.text("Combined mesh check failed: {error}").format(error=exc), "red")
+                return False
+            self._set_hp_check_stage('combined', 'found' if remaining else 'fixed',
+                                     remaining=remaining, separated=len(separated or []))
+            return not remaining
 
         if box.clickedButton() == skip_chapter_btn:
             if chapter_id:
@@ -614,252 +679,32 @@ class HPAnalysisMixin:
             self.log(bg_l10n.text("Combined mesh check skipped for this chapter."), "lightblue")
             if hasattr(self, 'record_user_action'):
                 self.record_user_action("Skip Combined Mesh Check", "chapter={}".format(chapter_id or "unknown"))
+            self._set_hp_check_stage('combined', 'skipped', count=len(problem_nodes))
             return True
 
-        return box.clickedButton() == skip_btn
-
-    def _duplicate_check_bbox_key(self, mesh_transform, tolerance):
-        try:
-            values = cmds.exactWorldBoundingBox(mesh_transform)
-        except Exception:
-            values = cmds.xform(mesh_transform, query=True, boundingBox=True, worldSpace=True) or []
-        if not values:
-            return None
-        scale = 1.0 / max(float(tolerance), 0.000001)
-        return tuple(int(round(float(value) * scale)) for value in values)
-
-    def _duplicate_check_meshes_identical(self, data_a, data_b, tolerance):
-        points_a = data_a.get('points')
-        points_b = data_b.get('points')
-        if points_a is None or points_b is None or len(points_a) != len(points_b):
-            return False
-        for point_a, point_b in zip(points_a, points_b):
-            if (abs(point_a.x - point_b.x) > tolerance or
-                    abs(point_a.y - point_b.y) > tolerance or
-                    abs(point_a.z - point_b.z) > tolerance):
-                return False
-        return True
-
-    def _duplicate_check_connected_components(self, adjacency):
-        visited = set()
-        components = []
-        for node in adjacency.keys():
-            if node in visited:
-                continue
-            stack = [node]
-            component = []
-            while stack:
-                current = stack.pop()
-                if current in visited:
-                    continue
-                visited.add(current)
-                component.append(current)
-                for neighbor in adjacency.get(current, []):
-                    if neighbor not in visited:
-                        stack.append(neighbor)
-            components.append(component)
-        return components
+        if box.clickedButton() == skip_btn:
+            self._set_hp_check_stage('combined', 'skipped', count=len(problem_nodes))
+            return True
+        self._set_hp_check_stage('combined', 'cancelled')
+        return False
 
     def _find_duplicate_mesh_groups_under_root(self, root_node, tolerance=0.001):
-        if not root_node or not cmds.objExists(root_node):
-            return []
-
-        mesh_transforms = self._mesh_transforms_under_root(root_node)
-        buckets = {}
-        mesh_data = {}
-        for mesh_transform in mesh_transforms:
-            shape = self._duplicate_check_shape(mesh_transform)
-            if not shape:
-                continue
-            dag_path = self._duplicate_check_dag_path(shape)
-            if not dag_path:
-                continue
-            try:
-                mesh_fn = om.MFnMesh(dag_path)
-                vertex_count = mesh_fn.numVertices
-                polygon_count = mesh_fn.numPolygons
-                if vertex_count <= 0:
-                    continue
-                bbox_key = self._duplicate_check_bbox_key(mesh_transform, tolerance)
-                if bbox_key is None:
-                    continue
-                long_node = (cmds.ls(mesh_transform, long=True) or [mesh_transform])[0]
-                mesh_data[long_node] = {
-                    'points': mesh_fn.getPoints(om.MSpace.kWorld)
-                }
-                buckets.setdefault((vertex_count, polygon_count, bbox_key), []).append(long_node)
-            except Exception:
-                continue
-
-        duplicate_groups = []
-        for bucket in buckets.values():
-            if len(bucket) < 2:
-                continue
-            adjacency = dict((node, []) for node in bucket)
-            for index_a in range(len(bucket)):
-                node_a = bucket[index_a]
-                for index_b in range(index_a + 1, len(bucket)):
-                    node_b = bucket[index_b]
-                    if self._duplicate_check_meshes_identical(mesh_data[node_a], mesh_data[node_b], tolerance):
-                        adjacency[node_a].append(node_b)
-                        adjacency[node_b].append(node_a)
-            for component in self._duplicate_check_connected_components(adjacency):
-                if len(component) > 1:
-                    duplicate_groups.append(component)
-        return duplicate_groups
+        import bg_duplicates
+        report = bg_duplicates.scan(root_node, tolerance=tolerance)
+        self._last_duplicate_scan = report
+        if report['status'] in ('failed', 'cancelled'):
+            raise RuntimeError("; ".join(report.get('errors', [])) or
+                               "Duplicate mesh check " + report['status'])
+        return report['groups']
 
     def _remove_duplicate_mesh_copies(self, found):
-        to_delete = []
-        skipped = []
-        kept = []
-        seen_delete = set()
-        for _label, groups in found:
-            for group in groups:
-                existing = [node for node in group if node and cmds.objExists(node)]
-                if len(existing) < 2:
-                    continue
-                existing = sorted(existing, key=lambda node: (len(node), node.lower()))
-                keep_node = existing[0]
-                kept.append(keep_node)
-                for node in existing[1:]:
-                    if node in seen_delete:
-                        continue
-                    child_transforms = cmds.listRelatives(node, children=True, fullPath=True, type='transform') or []
-                    if child_transforms:
-                        skipped.append(node)
-                        continue
-                    seen_delete.add(node)
-                    to_delete.append(node)
-
-        removed = 0
-        if to_delete:
-            with bg_core.undo_chunk("RemoveDuplicateMeshes"):
-                for node in to_delete:
-                    if not cmds.objExists(node):
-                        continue
-                    try:
-                        cmds.delete(node)
-                        removed += 1
-                    except Exception:
-                        skipped.append(node)
-        return removed, kept, skipped
+        import bg_duplicate_ui
+        return bg_duplicate_ui.remove(self, found)
 
     def _confirm_duplicate_meshes_before_hp_analysis(self, hp_main, lp_main=None):
-        try:
-            roots = [("HP", hp_main)]
-            if lp_main and cmds.objExists(lp_main):
-                roots.append(("LP", lp_main))
+        import bg_duplicate_ui
+        return bg_duplicate_ui.confirm(self, hp_main, lp_main)
 
-            found = []
-            for label, root_node in roots:
-                groups = self._find_duplicate_mesh_groups_under_root(root_node)
-                if groups:
-                    found.append((label, groups))
-        except Exception as exc:
-            message = bg_l10n.text("Duplicate mesh check failed: {error}").format(error=exc)
-            cmds.warning(message)
-            self.log(message, "orange")
-            return True
-
-        if not found:
-            return True
-
-        duplicate_meshes = []
-        seen = set()
-        preview_lines = []
-        for label, groups in found:
-            mesh_count = sum(len(group) for group in groups)
-            preview_lines.append(
-                bg_l10n.text("{label}: {groups} duplicate group(s), {meshes} mesh(es)").format(
-                    label=label,
-                    groups=len(groups),
-                    meshes=mesh_count
-                )
-            )
-            for group_index, group in enumerate(groups[:4], 1):
-                names = [node.split('|')[-1] for node in group[:5]]
-                if len(group) > 5:
-                    names.append("... +{} more".format(len(group) - 5))
-                preview_lines.append("  {} {}: {}".format(bg_l10n.text("Group"), group_index, ", ".join(names)))
-            if len(groups) > 4:
-                preview_lines.append("  ... +{} more".format(len(groups) - 4))
-            for group in groups:
-                for node in group:
-                    if node not in seen and cmds.objExists(node):
-                        duplicate_meshes.append(node)
-                        seen.add(node)
-
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(bg_l10n.text("Duplicate Meshes Found"))
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setText(bg_l10n.text("Duplicate meshes were found before Analyze HP."))
-        box.setInformativeText(
-            "{}\n\n{}".format(
-                bg_l10n.text("Resolve duplicates before running Analyze HP. Select the found meshes, remove extra copies, or skip this warning and continue."),
-                "\n".join(preview_lines)
-            )
-        )
-        select_btn = box.addButton(bg_l10n.text("Select"), QtWidgets.QMessageBox.ActionRole)
-        destructive_role = getattr(QtWidgets.QMessageBox, "DestructiveRole", QtWidgets.QMessageBox.ActionRole)
-        remove_btn = box.addButton(bg_l10n.text("Remove Extra Copies"), destructive_role)
-        skip_btn = box.addButton(bg_l10n.text("Skip"), QtWidgets.QMessageBox.AcceptRole)
-        bg_l10n.localize_widget_tree(box)
-        box.setDefaultButton(select_btn)
-        box.exec_()
-
-        if box.clickedButton() == select_btn:
-            if duplicate_meshes:
-                cmds.select(duplicate_meshes, replace=True)
-                message = bg_l10n.text("Analyze HP paused: selected {count} duplicate mesh(es).").format(
-                    count=len(duplicate_meshes)
-                )
-                self.log(message, "orange")
-                cmds.warning(message)
-            if hasattr(self, 'record_user_action'):
-                self.record_user_action(
-                    "Duplicate mesh check failed",
-                    "Analyze HP | duplicates={}".format(len(duplicate_meshes))
-                )
-            return False
-
-        if box.clickedButton() == remove_btn:
-            # Corrected in-dialog (not "Select"/manual, not "Skip") - the
-            # check must keep going to ZBrush/combined afterward, so any
-            # failure here is logged, never allowed to raise and silently
-            # kill the rest of run_pre_analysis_checks.
-            try:
-                removed, kept, skipped = self._remove_duplicate_mesh_copies(found)
-            except Exception as exc:
-                message = bg_l10n.text("Duplicate mesh cleanup failed: {error}").format(error=exc)
-                cmds.warning(message)
-                self.log(message, "red")
-                return True
-            if removed:
-                message = bg_l10n.text("Duplicate mesh cleanup: removed {removed} extra copy/copies, kept {kept}.").format(
-                    removed=removed,
-                    kept=len([node for node in kept if node and cmds.objExists(node)])
-                )
-                self.log(message, "lightgreen")
-                cmds.warning(message)
-                if hasattr(self, 'record_user_action'):
-                    self.record_user_action(
-                        "Remove Duplicate Meshes",
-                        "removed={} | skipped={}".format(removed, len(skipped))
-                    )
-            else:
-                self.log(bg_l10n.text("Duplicate mesh cleanup: nothing was removed."), "orange")
-            if skipped:
-                names = [node.split('|')[-1] for node in skipped[:8]]
-                self.log(
-                    bg_l10n.text("Duplicate mesh cleanup skipped {count} mesh(es): {names}").format(
-                        count=len(skipped),
-                        names=", ".join(names)
-                    ),
-                    "orange"
-                )
-            return True
-
-        return box.clickedButton() == skip_btn
 
     def _reset_prep_undo_tracking(self, key):
         setattr(self, '_prep_undo_depth_' + key, 0)
@@ -1014,14 +859,110 @@ class HPAnalysisMixin:
 
     def _mark_chapter_pre_checked(self, pair_id):
         checked = getattr(self, '_hp_structure_checked_chapters', None)
-        if checked is None:
-            checked = set()
+        if not isinstance(checked, dict):
+            checked = {}
             self._hp_structure_checked_chapters = checked
-        checked.add(pair_id)
+        pair = next((p for p in getattr(self, 'root_pairs', []) if p.get('id') == pair_id), None)
+        if not pair:
+            return
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        roots = [root for root in (hp_main, lp_main) if root and cmds.objExists(root)]
+        settings = self._hp_preflight_settings(pair)
+        cache = self._get_hp_preflight_cache()
+        revision = cache.put(roots, settings, {'transform_passed': True, 'structure_checked': True})
+        if revision is not None:
+            checked[pair_id] = (tuple(sorted(roots)), settings, revision)
 
     def _chapter_is_pre_checked(self, pair_id):
         checked = getattr(self, '_hp_structure_checked_chapters', None)
-        return bool(checked and pair_id in checked)
+        record = checked.get(pair_id) if isinstance(checked, dict) else None
+        if not record:
+            return False
+        pair = next((p for p in getattr(self, 'root_pairs', []) if p.get('id') == pair_id), None)
+        if not pair:
+            return False
+        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
+        roots = [root for root in (hp_main, lp_main) if root and cmds.objExists(root)]
+        saved_roots, settings, revision = record
+        current_settings = self._hp_preflight_settings(pair)
+        return (tuple(sorted(roots)) == saved_roots and settings == current_settings and
+                self._get_hp_preflight_cache().is_current(roots, current_settings, revision))
+
+    def _get_hp_preflight_cache(self):
+        from bg_preflight import PreflightCache
+        cache = getattr(self, '_hp_preflight_cache', None)
+        if cache is None or not cache.enabled:
+            cache = PreflightCache()
+            self._hp_preflight_cache = cache
+        return cache
+
+    def _hp_preflight_settings(self, pair):
+        def _stable(value):
+            if isinstance(value, dict):
+                return tuple((str(key), _stable(value[key]))
+                             for key in sorted(value, key=lambda item: str(item)))
+            if isinstance(value, (list, tuple)):
+                return tuple(_stable(item) for item in value)
+            if isinstance(value, set):
+                return tuple(sorted((_stable(item) for item in value), key=repr))
+            try:
+                hash(value)
+                return value
+            except Exception:
+                return repr(value)
+
+        return (
+            str(pair.get('id')),
+            bool(pair.get('material_slots', False)),
+            int(getattr(self, 'zbrush_triangle_threshold', 50)),
+            float(getattr(self, 'duplicate_mesh_tolerance', 0.001)),
+            _stable(pair.get('locked', [])),
+            _stable(pair.get('custom_grouping', {})),
+        )
+
+    def _invalidate_hp_preflight(self):
+        cache = getattr(self, '_hp_preflight_cache', None)
+        if cache is not None:
+            cache.invalidate()
+        checked = getattr(self, '_hp_structure_checked_chapters', None)
+        if isinstance(checked, dict):
+            checked.clear()
+
+    def _ensure_hp_preflight_transforms(self, pair, hp_main, lp_main, action_name):
+        roots = [root for root in (hp_main, lp_main) if root and cmds.objExists(root)]
+        if not roots:
+            self._set_hp_check_stage('transforms', 'failed', reason='missing roots')
+            return False
+        settings = self._hp_preflight_settings(pair)
+        cache = self._get_hp_preflight_cache()
+        if cache.get(roots, settings):
+            self._set_hp_check_stage('transforms', 'passed', reused=True)
+            return True
+        # Snapshot the current subtree before validation so edits that happen
+        # during a freeze are observed by the same cache generation.
+        cache.watch(roots)
+        if not self.validate_frozen_transforms(roots, roots, bg_l10n.text(action_name)):
+            self._set_hp_check_stage('transforms', 'failed', reason='mandatory transforms remain unresolved')
+            return False
+        # A freeze can itself dirty watched nodes; store only after it completed.
+        revision = cache.put(roots, settings, {'transform_passed': True})
+        self._hp_preflight_context_revision = revision
+        self._set_hp_check_stage('transforms', 'passed', reused=False)
+        return True
+
+    def _set_hp_check_stage(self, stage, status, **details):
+        """Record a stage result for the complete Check pipeline.
+
+        ``skipped`` is an explicit override for this stage only; ``found``
+        remains unresolved unless its details say ``explicit_skip=True``.
+        ``failed`` is an error/safety failure, while ``cancelled`` is reserved
+        for an explicit user cancellation that stops the remaining stages.
+        """
+        report = getattr(self, '_hp_preflight_report', None)
+        if not isinstance(report, dict):
+            report = {'stages': {}}
+            self._hp_preflight_report = report
+        report.setdefault('stages', {})[stage] = dict(status=status, **details)
 
     def _remove_empty_transform_groups(self, roots):
         """Delete stray empty transform nodes (no shapes, no descendants) under the
@@ -1051,6 +992,7 @@ class HPAnalysisMixin:
         return removed
 
     def run_pre_analysis_checks(self):
+        self._hp_preflight_report = {'stages': {}}
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
         if not pair:
             cmds.warning("No active chapter selected.")
@@ -1072,40 +1014,110 @@ class HPAnalysisMixin:
             self.log(bg_l10n.text("Check: removed {count} empty transform group(s): {names}").format(
                 count=len(removed_empties), names=preview), "lightgreen")
 
-        # Frozen-transform gate (same as Create / Analyze HP / Assign LP): the
-        # standalone Check did not run it before, so non-zero transforms on the
-        # HP/LP roots or their meshes slipped past this button. Offer to freeze.
-        if not self.validate_frozen_transforms(roots, roots, bg_l10n.text("Check Before Analyze")):
-            return False
-
-        # Each _confirm_* function returns False only for "Select" (user wants
-        # to inspect/fix meshes manually - genuinely stop here) or an
-        # explicit cancel. "Skip"/"Skip This Chapter" and in-dialog fixes
-        # (Remove Extra Copies/Separate) return True so the remaining checks
-        # still run - a fix in one category should not hide problems in the
-        # others. An unexpected exception must not look identical to "all
-        # clear", so it is caught here and reported instead of vanishing.
+        # Attempt the mandatory transform gate up front, but do not let a
+        # declined/failed freeze hide the read-only structural checks below.
         try:
-            if not self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main):
-                return False
-            self.log("Check: duplicate mesh check done, continuing...", "lightblue")
-
-            if not self._confirm_zbrush_candidates_before_hp_analysis(hp_main):
-                return False
-            self.log("Check: ZBrush candidate check done, continuing...", "lightblue")
-
-            if not self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main):
-                return False
+            initial_transforms_passed = self._ensure_hp_preflight_transforms(
+                pair, hp_main, lp_main, "Check Before Analyze")
         except Exception as exc:
-            message = "Check failed unexpectedly: {}".format(exc)
-            cmds.warning(message)
-            self.log(message, "red")
+            initial_transforms_passed = False
+            self._set_hp_check_stage('transforms', 'failed', error=str(exc))
+            self.log(bg_l10n.text("Check transform gate failed: {error}").format(error=exc), "red")
+
+        # Run every available structural check, even when the transform gate
+        # fails or a prior stage reports findings. Only an explicit Cancel
+        # stops this pipeline; the transform gate is reported again only when
+        # edits may have changed its result.
+        stages = (
+            ('duplicates', lambda: self._confirm_duplicate_meshes_before_hp_analysis(hp_main, lp_main)),
+            ('zbrush', lambda: self._confirm_zbrush_candidates_before_hp_analysis(hp_main)),
+            ('combined', lambda: self._confirm_combined_meshes_before_hp_analysis(hp_main, lp_main)),
+        )
+        cancelled = False
+        for name, run_stage in stages:
+            try:
+                result = run_stage()
+                stage = self._hp_preflight_report['stages'].get(name)
+                if stage is None:
+                    self._set_hp_check_stage(name, 'passed' if result else 'failed',
+                                             reason=None if result else 'stage returned false without a recorded outcome')
+                    stage = self._hp_preflight_report['stages'][name]
+                # Backward-compatible checkers return False both for findings
+                # and cancellation; their stage report is the authoritative
+                # distinction. False without a report is an error, not a clean
+                # pass or an implicit user cancel.
+                if stage.get('status') == 'cancelled':
+                    cancelled = True
+                    break
+                self.log(bg_l10n.text("Check: {stage} stage complete; continuing...").format(stage=name), "lightblue")
+            except Exception as exc:
+                message = bg_l10n.text("Check failed unexpectedly: {error}").format(error=exc)
+                cmds.warning(message)
+                self.log(message, "red")
+                self._set_hp_check_stage(name, 'failed', error=str(exc))
+
+        if cancelled:
+            self.log(bg_l10n.text("Check canceled; later stages were not run."), "orange")
+            cmds.inViewMessage(amg=bg_l10n.text("Check canceled."), pos='midCenter', fade=True)
             return False
 
-        self._mark_chapter_pre_checked(pair['id'])
-        self.log("Check: no duplicate, ZBrush or combined-mesh issues found.", "lightgreen")
-        cmds.inViewMessage(amg="Check completed: no issues found.", pos='midCenter', fade=True)
-        return True
+        stages_report = self._hp_preflight_report['stages']
+        # Revalidate after edits when the first gate passed. If it initially
+        # failed, retry at most once and only after a structural stage reports
+        # a successful fix (for example, duplicate cleanup). This avoids
+        # repeated freeze dialogs while allowing a cleanup to change the gate.
+        fixed_stage = any(item.get('status') == 'fixed'
+                          for name, item in stages_report.items() if name != 'transforms')
+        retry_transforms = initial_transforms_passed or fixed_stage
+        transforms_passed = initial_transforms_passed
+        if retry_transforms:
+            try:
+                transforms_passed = self._ensure_hp_preflight_transforms(
+                    pair, hp_main, lp_main, "Check Before Analyze")
+            except Exception as exc:
+                transforms_passed = False
+                self._set_hp_check_stage('transforms', 'failed', error=str(exc))
+                self.log(bg_l10n.text("Check transform gate failed: {error}").format(error=exc), "red")
+
+        blockers = []
+        for name, item in stages_report.items():
+            status = item.get('status')
+            if status == 'failed' or (status == 'found' and not item.get('explicit_skip')):
+                blockers.append((name, status))
+        if not transforms_passed:
+            # `_ensure_hp_preflight_transforms` records a failed/cancelled
+            # transform result; keep it in the user-visible report.
+            blockers.append(('transforms', stages_report.get('transforms', {}).get('status', 'failed')))
+
+        analysis_allowed = not blockers and all(
+            item.get('status') in ('passed', 'fixed', 'skipped') or
+            (item.get('status') == 'found' and item.get('explicit_skip'))
+            for item in stages_report.values())
+        clean = analysis_allowed and all(
+            item.get('status') in ('passed', 'fixed')
+            for item in stages_report.values())
+        if clean:
+            self._mark_chapter_pre_checked(pair['id'])
+            summary = bg_l10n.text("Check completed: no issues found.")
+            self.log("Check: no duplicate, ZBrush or combined-mesh issues found.", "lightgreen")
+        elif analysis_allowed:
+            # A per-stage Skip is an explicit one-run override, not a clean
+            # preflight cache entry. It permits this Analyze invocation but
+            # keeps the chapter unverified for the next invocation.
+            summary = bg_l10n.text("Check completed with skipped stage(s); findings remain unverified.")
+            self.log(summary, "orange")
+        else:
+            titles = {'transforms': 'Transformations', 'duplicates': 'Duplicates',
+                      'zbrush': 'ZBrush', 'combined': 'Combined meshes'}
+            outcomes = ["{}: {}".format(bg_l10n.text(titles.get(name, name)),
+                                      bg_l10n.text(item.get('status', 'unknown')))
+                        for name, item in sorted(stages_report.items())
+                        if item.get('status') not in ('passed', 'fixed')]
+            summary = bg_l10n.text("Check completed with findings or skipped stages: {details}").format(
+                details=", ".join(outcomes) or bg_l10n.text("Mandatory transform gate failed"))
+            self.log(summary, "orange")
+        cmds.inViewMessage(amg=summary, pos='midCenter', fade=True)
+        return analysis_allowed
 
     # --- Analyze HP geometry cache -------------------------------------------
     # Caches extracted world verts + fingerprint + hole data per mesh so that a
@@ -1158,14 +1170,15 @@ class HPAnalysisMixin:
             cmds.warning("HighPoly root not found.")
             return
 
-        if not self.validate_frozen_transforms([hp_main], [hp_main], bg_l10n.text("Analyze HP")):
-            return
-
         # Duplicate/ZBrush/combined-mesh checks moved to the standalone "Check"
         # button (run_pre_analysis_checks) so Analyze HP is not slowed down by
         # them on every run. If this chapter hasn't been checked yet this
         # session, offer to run it now instead of silently skipping it.
-        if not self._chapter_is_pre_checked(pair['id']):
+        mesh_check = getattr(self, "mesh_check_panel", None)
+        if mesh_check is not None:
+            if not mesh_check.allow_analysis():
+                return
+        elif not self._chapter_is_pre_checked(pair['id']):
             box = QtWidgets.QMessageBox(self)
             box.setWindowTitle(bg_l10n.text("Structure Not Checked"))
             box.setIcon(QtWidgets.QMessageBox.Question)
@@ -1184,6 +1197,13 @@ class HPAnalysisMixin:
                     return
             elif clicked != continue_btn:
                 return
+
+        # Check Now runs the same gate at the end of its complete pipeline;
+        # Continue without checking still must pass this mandatory safety gate.
+        # The cache makes this a no-op after a successful Check, not another
+        # freeze prompt.
+        if mesh_check is None and not self._ensure_hp_preflight_transforms(pair, hp_main, lp_main, "Analyze HP"):
+            return
 
         self._reset_prep_undo_tracking('hp_analysis')
 
@@ -1268,7 +1288,7 @@ class HPAnalysisMixin:
                             current_p = cmds.listRelatives(t, parent=True, fullPath=True)
                             if current_p and current_p[0] != hp_main:
                                 try:
-                                    cmds.parent(t, hp_main, absolute=True)
+                                    _parent_preserving_equal_frame(t, hp_main)
                                 except:
                                     pass
                     try:
@@ -1299,22 +1319,7 @@ class HPAnalysisMixin:
         self.hp_data_cache.clear()
 
         def is_mesh_zbrush_main_thread(name, data):
-            if data and data.get("is_zbrush"):
-                return True
-            if "_zbrush" in name.lower():
-                return True
-            if cmds.objExists(name):
-                layers = cmds.listConnections(name, type="displayLayer") or []
-                for l in layers:
-                    if "zbrush" in l.lower():
-                        return True
-                shapes = cmds.listRelatives(name, shapes=True, fullPath=True) or []
-                for s in shapes:
-                    layers = cmds.listConnections(s, type="displayLayer") or []
-                    for l in layers:
-                        if "zbrush" in l.lower():
-                            return True
-            return False
+            return self._is_in_zbrush_display_layer(name)
 
         with bg_core.undo_chunk("PrepareHPAnalysis_MeshCache"):
             for m in final_meshes:
@@ -1365,6 +1370,7 @@ class HPAnalysisMixin:
             self.log("Loaded {} custom cluster(s) from GT / manual links.".format(len(custom_mapping)), "lightblue")
 
         lp_prebuilt_verts_cache = {}
+        material_slot_map = {}
 
         def _prepare_lp_data_cache_for_hp_analysis():
             final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
@@ -1411,25 +1417,6 @@ class HPAnalysisMixin:
 
             def _short_node(name):
                 return str(name).split('|')[-1].split(':')[-1]
-
-            def _lp_material_cache_key(lp_meshes):
-                entries = []
-                for mesh in lp_meshes:
-                    shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
-                    shape = shapes[0] if shapes else mesh
-                    try:
-                        shape_uuid = (cmds.ls(shape, uuid=True) or [""])[0]
-                    except Exception:
-                        shape_uuid = ""
-                    try:
-                        face_count = cmds.polyEvaluate(mesh, face=True)
-                    except Exception:
-                        face_count = 0
-                    sgs = []
-                    for sg in sorted(set(cmds.listConnections(shape, type='shadingEngine') or []), key=_short_node):
-                        sgs.append((sg, _sg_material_node(sg)))
-                    entries.append((shape_uuid, int(face_count or 0), tuple(sgs)))
-                return tuple(entries)
 
             def _connected_shader_records(lp_node, mesh_fn, dag, total_faces, include_faces):
                 try:
@@ -1527,7 +1514,9 @@ class HPAnalysisMixin:
                             "shading_engines": set()
                         })
                         material_by_key[key]["shading_engines"].add(sg)
-                ordered_keys = sorted(material_by_key.keys(), key=lambda k: (_short_node(material_by_key[k].get("material") or k).lower(), _short_node(k).lower()))
+                ordered_keys = sorted(material_by_key, key=lambda key: (
+                    _short_node(material_by_key[key].get("material") or key).lower(),
+                    _short_node(key).lower(), key))
                 slots_by_key = {}
                 if len(ordered_keys) > 1:
                     for index, key in enumerate(ordered_keys, 1):
@@ -1536,28 +1525,14 @@ class HPAnalysisMixin:
 
             lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = {}, {}, {}
             use_lp_material_slots = False
-            material_cache_key = None
-            material_cached_records = None
-            material_cache = getattr(self, '_lp_material_analysis_cache', None)
-            if material_cache is None:
-                material_cache = {}
-                self._lp_material_analysis_cache = material_cache
-
             if enable_lp_material_slots:
-                material_cache_key = _lp_material_cache_key(final_lp_meshes)
-                material_cached_records = material_cache.get(material_cache_key)
-                if material_cached_records:
-                    use_lp_material_slots = True
-                    for slot in material_cached_records.get("slots", []):
-                        lp_material_slots_by_key[slot] = slot
-                else:
-                    material_progress_dlg = _make_material_progress((len(final_lp_meshes) * 2) + 2)
-                    lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = _collect_lp_material_context(final_lp_meshes)
-                    if material_progress_dlg and material_progress_dlg.wasCanceled():
-                        _close_material_progress()
-                        self.log("Analyze HP material scan canceled.", "orange")
-                        return True
-                    use_lp_material_slots = bool(lp_material_slots_by_key)
+                material_progress_dlg = _make_material_progress((len(final_lp_meshes) * 2) + 2)
+                lp_materials_by_key, lp_sg_to_material_key, lp_material_slots_by_key = _collect_lp_material_context(final_lp_meshes)
+                if material_progress_dlg and material_progress_dlg.wasCanceled():
+                    _close_material_progress()
+                    self.log("Analyze HP material scan canceled.", "orange")
+                    return True
+                use_lp_material_slots = bool(lp_material_slots_by_key)
 
             def _lp_material_records(lp_node, total_faces, mesh_fn=None, dag=None):
                 shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
@@ -1739,40 +1714,26 @@ class HPAnalysisMixin:
                     self.log("LP shell cache failed for {}: {}".format(lp_node.split('|')[-1], e), "orange")
                     return []
 
-            computed_material_records = []
-            if material_cached_records:
-                for shell_key, shell_data, shell_verts in material_cached_records.get("records", []):
-                    self.lp_data_cache[shell_key] = dict(shell_data)
-                    lp_prebuilt_verts_cache[shell_key] = list(shell_verts)
-                self.log("Analyze HP: reused cached LP material slots.", "lightblue")
-            else:
-                for m in final_lp_meshes:
-                    if use_lp_material_slots and _update_material_progress("Building LP material cache: {}".format(m.split('|')[-1])):
-                        _close_material_progress()
-                        self.log("Analyze HP material scan canceled.", "orange")
-                        return True
-                    shell_records = build_virtual_lp_shells_for_hp_worker(m)
-                    if shell_records and (len(shell_records) > 1 or use_lp_material_slots):
-                        for shell_key, shell_data, shell_verts in shell_records:
-                            self.lp_data_cache[shell_key] = shell_data
-                            lp_prebuilt_verts_cache[shell_key] = shell_verts
-                            if use_lp_material_slots:
-                                computed_material_records.append((shell_key, dict(shell_data), list(shell_verts)))
-                        continue
+            # Regions depend on current face assignments and world positions.
+            for mesh in final_lp_meshes:
+                if use_lp_material_slots and _update_material_progress("Building LP material regions: {}".format(mesh.split('|')[-1])):
+                    _close_material_progress()
+                    self.log("Analyze HP material scan canceled.", "orange")
+                    return True
+                shell_records = build_virtual_lp_shells_for_hp_worker(mesh)
+                if shell_records and (len(shell_records) > 1 or use_lp_material_slots):
+                    for shell_key, shell_data, shell_verts in shell_records:
+                        self.lp_data_cache[shell_key] = shell_data
+                        lp_prebuilt_verts_cache[shell_key] = shell_verts
+                    continue
 
-                    data = bg_core.MeshDataManager.get_mesh_data(m)
-                    if data:
-                        if cmds.objExists(m):
-                            data["bbox"] = cmds.xform(m, q=True, ws=True, bb=True)
-                        self.lp_data_cache[m] = data
-
-            if use_lp_material_slots and computed_material_records and material_cache_key:
-                material_cache[material_cache_key] = {
-                    "records": computed_material_records,
-                    "slots": sorted(set([data.get("material_slot") for _key, data, _verts in computed_material_records if data.get("material_slot")]))
-                }
+                data = bg_core.MeshDataManager.get_mesh_data(mesh)
+                if data:
+                    data["bbox"] = cmds.xform(mesh, q=True, ws=True, bb=True)
+                    self.lp_data_cache[mesh] = data
 
             if use_lp_material_slots:
+                material_slot_map.update(lp_material_slots_by_key)
                 self.log("Analyze HP: detected {} LP material slot(s) for grouping.".format(len(lp_material_slots_by_key)), "lightblue")
             _close_material_progress()
         lp_prep_canceled = _prepare_lp_data_cache_for_hp_analysis()
@@ -1937,7 +1898,8 @@ class HPAnalysisMixin:
                         "orientation": orientation,
                         "score": avg_dot,
                         "samples": samples,
-                        "edge_count": len(component)
+                        "edge_count": len(component),
+                        "closed": all(len(vertex_to_edges[vertex]) == 2 for vertex in unique_points)
                     })
 
                 inward_weight = 0.0
@@ -2111,6 +2073,11 @@ class HPAnalysisMixin:
                     break
                 self.progress_dlg.setLabelText(bg_l10n.text("Caching LP: {name}").format(name=m_path.split('|')[-1]))
                 lp_data = self.lp_data_cache.get(m_path)
+                if lp_data is not None and cmds.objExists(m_path):
+                    try:
+                        lp_data["continuous_surface"] = cmds.polyEvaluate(m_path, shell=True) == 1
+                    except RuntimeError:
+                        pass
                 if m_path in lp_prebuilt_verts_cache:
                     # Virtual LP shells are already cached upstream; don't re-key them.
                     lp_verts_cache[m_path] = lp_prebuilt_verts_cache[m_path]
@@ -2206,6 +2173,12 @@ class HPAnalysisMixin:
         if isinstance(geo_cache, dict) and touched_geo_ids:
             self._analyze_geo_cache = {k: v for k, v in geo_cache.items() if k in touched_geo_ids}
 
+        self.progress_dlg.setLabelText(bg_l10n.text("Checking HP support surfaces…"))
+        hp_supports = bg_core.GeoMatcher.find_hp_surface_supports(
+            self.hp_data_cache, hp_holes_cache, hp_surface_cache, self.progress_dlg.wasCanceled)
+        if self.progress_dlg.wasCanceled():
+            self._cancel_hp_analysis()
+            return
         self.progress_dlg.setLabelText(bg_l10n.text("Starting Multithreaded Processing..."))
 
         # Scale-aware floater radius. floater_radius is an ABSOLUTE distance the
@@ -2242,20 +2215,21 @@ class HPAnalysisMixin:
             detect_floaters=not worker_params.get('ignore_floaters', True),
             floater_radius=_floater_radius,
             hp_surface_cache=hp_surface_cache,
-            lp_surface_cache=lp_surface_cache
+            lp_surface_cache=lp_surface_cache,
+            hp_supports=hp_supports
         )
         self._hp_analysis_terminal_handled = False
 
         # Fingerprinting already filled 0-40%; the worker owns the 40-100% band.
         self.hp_worker.progress_value.connect(self._on_hp_worker_progress)
         self.hp_worker.progress_text.connect(self.progress_dlg.setLabelText)
-        self.hp_worker.result_ready.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair))
+        self.hp_worker.result_ready.connect(lambda groups, logs: self.on_hp_finished(groups, logs, hp_main, pair, material_slot_map))
         self.hp_worker.cancelled.connect(self._finalize_hp_analysis_cancel)
         self.hp_worker.failed.connect(self._on_hp_analysis_failed)
         self.progress_dlg.canceled.connect(self._cancel_hp_analysis)
         self.hp_worker.start()
 
-    def on_hp_finished(self, groups, logs, hp_main, pair):
+    def on_hp_finished(self, groups, logs, hp_main, pair, material_slot_map=None):
         if not self._claim_hp_analysis_terminal():
             return
         # Analysis completed and we're about to commit the new structure -
@@ -2295,6 +2269,11 @@ class HPAnalysisMixin:
         # GT link here; otherwise bg_gt_matcher clusters multiply final groups.
 
         with bg_core.undo_chunk("ApplyHPGroups"):
+            slot_attr = hp_main + ".bgLpMaterialSlots"
+            if material_slot_map is not None:
+                if not cmds.objExists(slot_attr):
+                    cmds.addAttr(hp_main, longName="bgLpMaterialSlots", dataType="string")
+                cmds.setAttr(slot_attr, json.dumps(material_slot_map, sort_keys=True), type="string")
             for child in (cmds.listRelatives(hp_main, children=True, fullPath=True, type='transform') or []):
                 match = re.search(r'(_HP|_LP)(\d*)$', child.split('|')[-1])
                 grp_ui_name = child.split('|')[-1][:match.start()] + match.group(2) if match else child.split('|')[-1]
@@ -2323,7 +2302,7 @@ class HPAnalysisMixin:
 
                 m_move = [m['name'] for m in meshes if cmds.objExists(m['name'])]
                 if m_move:
-                    cmds.parent(m_move, new_grp, absolute=True)
+                    _parent_preserving_equal_frame(m_move, new_grp)
 
         self.refresh_left_panel()
         if hasattr(self, 'refresh_subgroup_color_preview'):
@@ -2331,6 +2310,8 @@ class HPAnalysisMixin:
         self.log("HP Auto-Grouping complete. Processed {} groups.".format(len(groups)), "lightblue")
         if hasattr(self, 'record_user_action'):
             self.record_user_action("Analyze HP finished", "groups={}".format(len(groups)))
+        if hasattr(self, 'mesh_check_tabs'):
+            self.mesh_check_tabs.setCurrentWidget(self.subgroups_scroll)
 
 
 # ============================================================================
@@ -2344,143 +2325,60 @@ class LPMatchingMixin:
         match = re.match(r"^(M\d{2,})(?:_|\.)", str(name or "").split('|')[-1])
         return match.group(1) if match else None
 
-    def _lp_material_records_for_match_repair(self, lp_node, include_faces=False):
-        if not lp_node or not cmds.objExists(lp_node):
-            return []
-        shapes = cmds.listRelatives(lp_node, shapes=True, fullPath=True, type='mesh', noIntermediate=True) or []
-        if not shapes:
-            return []
-        try:
-            sel = om.MSelectionList()
-            sel.add(lp_node)
-            dag = sel.getDagPath(0)
-            if dag.hasFn(om.MFn.kTransform):
-                dag.extendToShape()
-            mesh_fn = om.MFnMesh(dag)
-            shaders, face_shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
-        except Exception:
-            return []
-
-        records = []
-        for shader_index, shader_obj in enumerate(shaders):
-            try:
-                sg = om.MFnDependencyNode(shader_obj).name()
-            except Exception:
-                continue
-            try:
-                materials = cmds.listConnections("{}.surfaceShader".format(sg), source=True, destination=False) or []
-                material = materials[0] if materials else None
-            except Exception:
-                material = None
-            key = material or sg
-            faces = [
-                face_id for face_id, assigned_index in enumerate(face_shader_indices)
-                if int(assigned_index) == shader_index
-            ] if include_faces else []
-            if faces or not include_faces:
-                records.append({
-                    "key": key,
-                    "material": material,
-                    "faces": faces
-                })
-        return records
-
     def _lp_material_slot_map_for_match_repair(self, lp_paths):
-        records_by_key = {}
-        for lp_path in lp_paths or []:
-            for rec in self._lp_material_records_for_match_repair(lp_path, include_faces=False):
-                key = rec.get("key")
-                if key:
-                    records_by_key.setdefault(key, rec)
-        if len(records_by_key) <= 1:
+        records = {}
+        for lp_path in lp_paths:
+            for record in self.lp_material_records_for_node(lp_path, include_faces=True):
+                records.setdefault(record["key"], record)
+        if len(records) <= 1:
             return {}
-        ordered = sorted(
-            records_by_key.values(),
-            key=lambda rec: ((rec.get("material") or rec.get("key") or "").split('|')[-1].lower(), (rec.get("key") or "").split('|')[-1].lower())
-        )
-        return {rec.get("key"): "M{:02d}".format(index) for index, rec in enumerate(ordered, 1) if rec.get("key")}
+        def short_name(name):
+            return name.split('|')[-1].split(':')[-1].lower()
+        keys = sorted(records, key=lambda key: (
+            short_name(records[key].get("material") or key), short_name(key), key))
+        return {key: "M{:02d}".format(index) for index, key in enumerate(keys, 1)}
 
-    def _dominant_lp_material_slot_for_match_repair(self, lp_path, slot_by_key):
-        records = self._lp_material_records_for_match_repair(lp_path, include_faces=True)
-        if not records:
-            return None
-        counts = {}
-        for rec in records:
-            slot = slot_by_key.get(rec.get("key"))
-            if slot:
-                counts[slot] = counts.get(slot, 0) + len(rec.get("faces") or [])
-        if not counts:
-            return None
-        return max(counts.keys(), key=lambda slot: (counts[slot], slot))
-
-    def _repair_lp_matches_by_material_slot(self, matches, hp_groups, hp_verts_cache=None, lp_verts_cache_fast=None, lp_verts_cache_full=None):
-        all_lp_paths = sorted({lp_path for paths in (matches or {}).values() for lp_path in (paths or [])})
-        slot_by_key = self._lp_material_slot_map_for_match_repair(all_lp_paths)
-        if not slot_by_key:
+    def _repair_lp_matches_by_material_slot(self, matches, hp_groups, hp_verts_cache=None,
+                                           lp_verts_cache_fast=None, lp_verts_cache_full=None,
+                                           slot_by_key=None):
+        if slot_by_key is None:
+            slot_by_key = self._lp_material_slot_map_for_match_repair(self.lp_data_cache)
+        group_slots = {name: self._material_slot_from_group_name(name) for name in hp_groups}
+        if not slot_by_key or not any(group_slots.values()):
             return matches, 0
 
-        compatible_groups = {}
-        for grp_name in sorted((hp_groups or {}).keys()):
-            slot = self._material_slot_from_group_name(grp_name)
-            if slot:
-                compatible_groups.setdefault(slot, []).append(grp_name)
-        if not compatible_groups:
-            return matches, 0
-
-        repaired = {grp_name: set(paths or []) for grp_name, paths in (matches or {}).items()}
+        repaired = {name: set() for name in hp_groups}
         move_count = 0
-
-        for grp_name, lp_paths in list(repaired.items()):
-            group_slot = self._material_slot_from_group_name(grp_name)
-            if not group_slot:
-                continue
-            for lp_path in list(lp_paths):
-                lp_slot = self._dominant_lp_material_slot_for_match_repair(lp_path, slot_by_key)
-                if not lp_slot or lp_slot == group_slot:
-                    continue
-                target_candidates = compatible_groups.get(lp_slot) or []
-                if not target_candidates:
+        for group, paths in matches.items():
+            group_slot = group_slots.get(group)
+            for lp_path in paths:
+                lp_slots = {
+                    slot_by_key.get(record["key"])
+                    for record in self.lp_material_records_for_node(lp_path, include_faces=True)
+                }
+                if not group_slot or not lp_slots or None in lp_slots or group_slot in lp_slots:
+                    repaired.setdefault(group, set()).add(lp_path)
                     continue
 
-                target_group = None
+                candidates = {name: hp_groups[name] for name, slot in group_slots.items()
+                              if slot in lp_slots}
                 lp_verts = (lp_verts_cache_full or {}).get(lp_path) or (lp_verts_cache_fast or {}).get(lp_path)
-                if lp_verts:
-                    try:
-                        constrained_groups = {name: hp_groups.get(name, []) for name in target_candidates}
-                        repair_worker = LPMatchingWorker(
-                            hp_groups=constrained_groups,
-                            hp_data_cache=self.hp_data_cache,
-                            lp_data_cache={lp_path: self.lp_data_cache.get(lp_path, {})},
-                            hp_verts_cache=hp_verts_cache or {},
-                            lp_verts_cache_fast={lp_path: (lp_verts_cache_fast or {}).get(lp_path, [])},
-                            lp_verts_cache_full={lp_path: (lp_verts_cache_full or {}).get(lp_path, [])},
-                            lp_threshold_coef=1.5
-                        )
-                        target_group = repair_worker.get_best_match(self.lp_data_cache.get(lp_path, {}), lp_verts)
-                    except Exception:
-                        target_group = None
-
-                if not target_group:
-                    lp_data = self.lp_data_cache.get(lp_path, {})
-                    lp_center = lp_data.get("center") or [0.0, 0.0, 0.0]
-
-                    def candidate_score(candidate_group):
-                        best_dist = float('inf')
-                        for hp_path in hp_groups.get(candidate_group, []):
-                            hp_data = self.hp_data_cache.get(hp_path, {})
-                            hp_center = hp_data.get("center") or [0.0, 0.0, 0.0]
-                            dx = lp_center[0] - hp_center[0]
-                            dy = lp_center[1] - hp_center[1]
-                            dz = lp_center[2] - hp_center[2]
-                            best_dist = min(best_dist, (dx * dx + dy * dy + dz * dz) ** 0.5)
-                        return best_dist
-
-                    target_group = min(target_candidates, key=candidate_score)
-                repaired.setdefault(target_group, set()).add(lp_path)
-                repaired[grp_name].discard(lp_path)
-                move_count += 1
-
+                if not candidates or not lp_verts or not HAS_MATH_CORE:
+                    continue
+                repair_worker = LPMatchingWorker(
+                    candidates, self.hp_data_cache, {},
+                    hp_verts_cache or {}, {}, {}, lp_threshold_coef=0.12)
+                target = repair_worker.get_best_match(self.lp_data_cache[lp_path], lp_verts, require_geometry=True)
+                if target:
+                    repaired[target].add(lp_path)
+                    move_count += 1
         return repaired, move_count
+
+    @staticmethod
+    def _lp_subgroup_is_locked(node, locked):
+        name = node.rsplit('|', 1)[-1]
+        name = re.sub(r'_(?:HP|LP)([0-9]*)$', r'\1', name, flags=re.IGNORECASE)
+        return name in locked
 
     def run_lp_matching(self):
         pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
@@ -2490,27 +2388,16 @@ class LPMatchingMixin:
         if not hp_main or not lp_main:
             return
 
+        if getattr(self, 'lp_worker', None) is not None:
+            return
         if not self.validate_frozen_transforms([hp_main, lp_main], [hp_main, lp_main], bg_l10n.text("Assign LP Meshes")):
             return
 
-        self._reset_prep_undo_tracking('lp_matching')
-        final_lp_meshes = self.prepare_meshes(lp_main, flatten=True)
-        self._mark_prep_undo_step('lp_matching')
-        final_lp_meshes = [m for m in final_lp_meshes if not m.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_HP)]
-        if not final_lp_meshes:
-            return self.log("No valid LP meshes found.", "red")
-
-        self.lp_data_cache.clear()
-        for m in final_lp_meshes:
-            data = bg_core.MeshDataManager.get_mesh_data(m)
-            if data:
-                self.lp_data_cache[m] = data
-
-        if not self.lp_data_cache:
-            return self.log("No valid LP mesh data.", "red")
-
+        locked = set(pair.get('locked', []))
         hp_groups = {}
         for child in (cmds.listRelatives(hp_main, children=True, fullPath=True, type='transform') or []):
+            if self._lp_subgroup_is_locked(child, locked):
+                continue
             is_hp_attr = cmds.objExists(child + "." + bg_core.BakeConfig.ATTR_BAKE_GROUP) and cmds.getAttr(child + "." + bg_core.BakeConfig.ATTR_BAKE_GROUP) == "HP"
             if is_hp_attr or child.split('|')[-1].endswith(bg_core.BakeConfig.SUFFIX_HP):
                 if not cmds.listRelatives(child, shapes=True):
@@ -2521,6 +2408,25 @@ class LPMatchingMixin:
 
         if not hp_groups:
             return self.log("No HP subgroups found! Run HP Analysis first.", "orange")
+
+        self._reset_prep_undo_tracking('lp_matching')
+        self.lp_data_cache.clear()
+        for child in cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []:
+            if self._lp_subgroup_is_locked(child, locked):
+                continue
+            shapes = cmds.listRelatives(child, allDescendents=True, fullPath=True,
+                                        type='mesh', noIntermediate=True) or []
+            meshes = dict.fromkeys(
+                parent for shape in shapes
+                for parent in (cmds.listRelatives(shape, parent=True, fullPath=True) or []))
+            for mesh in meshes:
+                if mesh.rsplit('|', 1)[-1].endswith(bg_core.BakeConfig.SUFFIX_HP):
+                    continue
+                data = bg_core.MeshDataManager.get_mesh_data(mesh)
+                if data:
+                    self.lp_data_cache[mesh] = data
+        if not self.lp_data_cache:
+            return self.log("No assignable LP meshes found.", "orange")
 
         self.hp_data_cache.clear()
         all_hp_paths = []
@@ -2771,55 +2677,92 @@ class LPMatchingMixin:
 
         self.lp_worker.progress_value.connect(self.progress_dlg_lp.setValue)
         self.lp_worker.progress_text.connect(self.progress_dlg_lp.setLabelText)
-        self.lp_worker.finished.connect(lambda matches, groups=hp_groups, hvc=hp_verts_cache, lf=lp_verts_cache_fast, lfull=lp_verts_cache_full: self.on_lp_finished(matches, lp_main, groups, hvc, lf, lfull))
+        worker = self.lp_worker
+        pair_id = pair['id']
+
+        def apply_matches(matches):
+            if self.lp_worker is worker and not worker.is_cancelled:
+                self.on_lp_finished(matches, lp_main, hp_groups, hp_verts_cache,
+                                    lp_verts_cache_fast, lp_verts_cache_full, pair_id)
+
+        worker.finished.connect(apply_matches)
         self.progress_dlg_lp.canceled.connect(self._cancel_lp_matching)
 
         self.lp_worker.start()
 
-    def on_lp_finished(self, matches, lp_main, hp_groups=None, hp_verts_cache=None, lp_verts_cache_fast=None, lp_verts_cache_full=None):
-        # ... (Код завершения остается абсолютно без изменений) ...
+    def on_lp_finished(self, matches, lp_main, hp_groups=None, hp_verts_cache=None,
+                       lp_verts_cache_fast=None, lp_verts_cache_full=None, pair_id=None):
         self._reset_prep_undo_tracking('lp_matching')
         self.progress_dlg_lp.close()
         total_matched = 0
-        pair = next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
-        locked_subgroups = pair.get('locked', []) if pair else []
+        chapter_id = pair_id if pair_id is not None else self.active_root_id
+        pair = next((p for p in self.root_pairs if p['id'] == chapter_id), None)
+        hp_main, current_lp, _ = self.core.resolve_main_nodes(pair) if pair else (None, None, False)
+        if not hp_main or current_lp != lp_main:
+            self._release_analysis_worker('lp_worker')
+            self._clear_analysis_runtime_caches(clear_geometry=False)
+            return self.log("Assign LP skipped because the chapter roots changed.", "orange")
+        locked_subgroups = set(pair.get('locked', []))
+        slot_by_key = None
+        if hp_groups:
+            slot_attr = (hp_main or "") + ".bgLpMaterialSlots"
+            if hp_main and cmds.objExists(slot_attr):
+                try:
+                    stored_slots = json.loads(cmds.getAttr(slot_attr) or "{}")
+                    if isinstance(stored_slots, dict):
+                        slot_by_key = stored_slots
+                except (ValueError, TypeError):
+                    self.log("Assign LP: invalid saved material slots. Run Analyze HP to rebuild them.", "orange")
+                    slot_by_key = {}
         matches, material_repair_count = self._repair_lp_matches_by_material_slot(
             matches,
             hp_groups or {},
             hp_verts_cache=hp_verts_cache,
             lp_verts_cache_fast=lp_verts_cache_fast,
-            lp_verts_cache_full=lp_verts_cache_full
+            lp_verts_cache_full=lp_verts_cache_full,
+            slot_by_key=slot_by_key
         )
 
         with bg_core.undo_chunk("ApplyLPMatching"):
-            for child in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []):
-                match_re = re.search(r'(_HP|_LP)(\d*)$', child.split('|')[-1])
-                grp_ui_name = child.split('|')[-1][:match_re.start()] + match_re.group(2) if match_re else child.split('|')[-1]
-                if grp_ui_name not in locked_subgroups:
-                    if not cmds.listRelatives(child, shapes=True):
-                        try:
-                            cmds.delete(cmds.rename(child, "DELETE_ME_" + str(uuid.uuid4())[:8]))
-                        except:
-                            pass
-
+            children = cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []
+            by_name = {path.rsplit('|', 1)[-1]: path for path in children}
+            attr_name = bg_core.BakeConfig.ATTR_BAKE_GROUP
+            moves = {}
             for grp_name, lp_paths in matches.items():
-                s_name = bg_core.BakeConfig.trim_name(grp_name, bg_core.BakeConfig.SUFFIX_LP)
-                target_grp = None
-                for child in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or []):
-                    if child.split('|')[-1] == s_name:
-                        target_grp = child
-                        break
+                name = bg_core.BakeConfig.trim_name(grp_name, bg_core.BakeConfig.SUFFIX_LP)
+                if self._lp_subgroup_is_locked(name, locked_subgroups):
+                    continue
+                target = by_name.get(name)
+                if target:
+                    attr = target + "." + attr_name
+                    if (cmds.listRelatives(target, shapes=True) or
+                            not cmds.objExists(attr) or cmds.getAttr(attr) != "LP"):
+                        self.log("Assign LP skipped {}: an existing user node has this name.".format(name), "orange")
+                        continue
+                else:
+                    target = _create_identity_child_group(lp_main, name)
+                    cmds.addAttr(target, ln=attr_name, dt="string")
+                    cmds.setAttr(target + "." + attr_name, "LP", type="string")
 
-                if not target_grp:
-                    target_grp = _create_identity_child_group(lp_main, s_name)
-                    cmds.addAttr(target_grp, ln=bg_core.BakeConfig.ATTR_BAKE_GROUP, dt="string")
-                    cmds.setAttr("{}.{}".format(target_grp, bg_core.BakeConfig.ATTR_BAKE_GROUP), "LP", type="string")
+                for path in lp_paths:
+                    if not path.startswith(lp_main + "|") or not cmds.objExists(path):
+                        continue
+                    source_group = path[len(lp_main) + 1:].split('|', 1)[0]
+                    if self._lp_subgroup_is_locked(source_group, locked_subgroups):
+                        continue
+                    if path.rsplit('|', 1)[0] == target:
+                        total_matched += 1
+                    else:
+                        moves[path] = target
 
-                if lp_paths:
-                    vp = [p for p in lp_paths if cmds.objExists(p)]
-                    if vp:
-                        cmds.parent(vp, target_grp, absolute=True)
-                        total_matched += len(vp)
+            # Move descendants first while all planned paths still resolve.
+            for path in sorted(moves, key=lambda node: (-node.count('|'), node)):
+                try:
+                    moved = _parent_preserving_equal_frame([path], moves[path])
+                except RuntimeError as exc:
+                    self.log("Assign LP skipped {}: {}".format(path, exc), "orange")
+                    continue
+                total_matched += len(moved)
 
         self.refresh_left_panel()
         total_lp = len(self.lp_data_cache)
@@ -2959,7 +2902,7 @@ class FinalViewMixin:
     def _warn_if_lp_undistributed(self, lp_main):
         """Red warning when the LP still has meshes sitting directly under its
         root - i.e. Assign LP Meshes was never run (or didn't finish). Those
-        meshes are in no subgroup, so they get no cage and won't export."""
+        meshes are in no subgroup, so they will not export."""
         if not lp_main or not cmds.objExists(lp_main):
             return
         direct = [t for t in (cmds.listRelatives(lp_main, children=True, fullPath=True, type='transform') or [])
@@ -2997,9 +2940,7 @@ class FinalViewMixin:
             self.btn_toggle_view.setText(bg_l10n.text("Export Settings"))
             self.btn_preview.setVisible(False)
             self.btn_process_final.setVisible(False)
-            # Leaving Export Settings also leaves cage configuration.
-            if getattr(self, 'is_cage_config', False):
-                self.exit_cage_config()
+            self.hide_export_settings_panel()
             if getattr(self, 'is_preview_active', False):
                 self.toggle_preview_smoothing()
 
@@ -3045,23 +2986,6 @@ class FinalViewMixin:
                     if hasattr(self, '_saved_lp_root_vis'):
                         cmds.setAttr(lp_main + ".visibility", self._saved_lp_root_vis)
 
-            # Cage: only meaningful while working the chapter in Export
-            # Settings, so hide it on Back; shown again by _ensure_cage_visible
-            # when Export Settings / the cage panel is re-entered.
-            cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-            if cmds.objExists(cage_grp):
-                cmds.setAttr(cage_grp + ".visibility", bool(self.is_final_view))
-            # The whole Cage_BG root is only relevant inside Export Settings:
-            # hide the entire cage hierarchy on Back and show the root again on
-            # entry (per-chapter groups keep their own state underneath).
-            cage_root = "|{}".format(bg_cage.CAGE_ROOT)
-            if cmds.objExists(cage_root):
-                cmds.setAttr(cage_root + ".visibility", bool(self.is_final_view))
-            # Entering Export Settings shows the cage, so reset the session-wide
-            # Cage Vis/Hid preference to "shown"; it then persists across chapter
-            # switches (see activate_root / toggle_root_vis).
-            if self.is_final_view:
-                self.cage_vis_pref = True
 
             self.is_final_low_visible = False
 
@@ -3086,18 +3010,11 @@ class FinalViewMixin:
                             cmds.isolateSelect(panel, addDagObject=hp_main)
                             if lp_main and cmds.objExists(lp_main):
                                 cmds.isolateSelect(panel, addDagObject=lp_main)
-                        # Keep the chapter cage isolated together with it.
-                        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-                        if cmds.objExists(cage_grp):
-                            cmds.isolateSelect(panel, addDagObject=cage_grp)
 
         self.refresh_left_panel()
 
-        # Cage settings open automatically on entering Export Settings (no
-        # separate Cage button anymore); leaving already calls exit_cage_config
-        # above.
         if self.is_final_view and pair:
-            self.enter_cage_config()
+            self.show_export_settings_panel()
 
     def render_final_view(self):
         self.final_mesh_widgets = []
@@ -3106,8 +3023,6 @@ class FinalViewMixin:
             return
         pair.setdefault('final_smooth_states', {})
         self.final_smooth_states = dict(pair.get('final_smooth_states') or {})
-        pair.setdefault('cage_overrides', {})
-        self.cage_overrides = dict(pair.get('cage_overrides') or {})
 
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
         if not hp_main or not lp_main:
@@ -3221,23 +3136,6 @@ class FinalViewMixin:
             btn_smooth_down.clicked.connect(lambda checked=False, c=combo, delta=-1: self.adjust_final_smooth_level(c, delta))
             row_layout.addWidget(btn_smooth_down)
 
-            # Per-subgroup cage max-offset override (blank = global default).
-            cage_edit = QtWidgets.QLineEdit()
-            cage_edit.setProperty("bg_help_id", "cage.controls")
-            cage_edit.setObjectName("CageOverride")
-            cage_edit.setFixedWidth(46)
-            cage_edit.setAlignment(QtCore.Qt.AlignCenter)
-            cage_edit.setPlaceholderText("gl.")
-            cage_edit.setToolTip(bg_l10n.text(
-                "Cage max offset override for this subgroup (blank = global). "
-                "Percent of bbox diagonal."))
-            cage_edit.setStyleSheet("background-color: #3a2d40; color: #d9b3ff;")
-            cached_ov = self.cage_overrides.get(display_name)
-            if cached_ov is not None:
-                cage_edit.setText(str(cached_ov))
-            cage_edit.editingFinished.connect(
-                lambda name=display_name, e=cage_edit: self.on_cage_override_changed(name, e))
-            row_layout.addWidget(cage_edit)
 
             self.subgroups_layout.addWidget(frame)
 
@@ -3250,7 +3148,6 @@ class FinalViewMixin:
                 'btn_vis': btn_vis,
                 'btn_smooth_up': btn_smooth_up,
                 'btn_smooth_down': btn_smooth_down,
-                'cage_edit': cage_edit,
                 'hp_nodes': hp_nodes
             })
         bg_l10n.localize_widget_tree(self.subgroups_widget)
@@ -3413,1409 +3310,35 @@ class FinalViewMixin:
         bg_core.BakeSessionModel.save(self.root_pairs)
 
     # ------------------------------------------------------------------
-    # CAGE
+    # Active chapter
     # ------------------------------------------------------------------
     def _active_pair(self):
         return next((p for p in self.root_pairs if p['id'] == self.active_root_id), None)
 
-    def on_cage_override_changed(self, name, edit):
-        """Store/clear a per-subgroup cage max-offset override from the row field."""
+
+    def show_export_settings_panel(self):
         pair = self._active_pair()
-        if not pair:
+        container = getattr(self, 'export_container', None)
+        if pair is None or container is None:
             return
-        pair.setdefault('cage_overrides', {})
-        raw = (edit.text() or "").strip().replace(',', '.')
-        if not raw:
-            pair['cage_overrides'].pop(name, None)
-            if hasattr(self, 'cage_overrides'):
-                self.cage_overrides.pop(name, None)
-        else:
-            try:
-                val = float(raw)
-            except ValueError:
-                edit.setText("")
-                pair['cage_overrides'].pop(name, None)
-                cmds.warning("Cage override must be a number.")
-                return
-            if val <= 0:
-                edit.setText("")
-                pair['cage_overrides'].pop(name, None)
-            else:
-                pair['cage_overrides'][name] = val
-                if hasattr(self, 'cage_overrides'):
-                    self.cage_overrides[name] = val
-        bg_core.BakeSessionModel.save(self.root_pairs)
-
-    def _cage_params_for(self, pair, display_name):
-        settings = dict(pair.get('cage_settings') or {})
-        settings.setdefault('inflate', bg_cage.CageProcessor.DEFAULT_INFLATE_PCT)
-        settings.setdefault('gap', bg_cage.CageProcessor.DEFAULT_GAP_PCT)
-        settings.setdefault('unit', 'percent')
-        settings.setdefault('fitted', False)
-        settings.setdefault('display_mode', 'solid')
-        override = (pair.get('cage_overrides') or {}).get(display_name)
-        if isinstance(override, dict):
-            settings.update(override)       # per-subgroup overrides win
-        elif override is not None:
-            settings['inflate'] = override  # legacy scalar override
-        return settings
-
-    def _collect_cage_subgroups(self, base_name, hp_main, lp_main):
-        """Map subgroup display name -> {'lp': [...], 'hp': [...]} from the
-        finalized in-place meshes under lp_main / hp_main."""
-        groups = {}
-        lp_desc = cmds.listRelatives(lp_main, allDescendents=True, fullPath=True, type='transform') or []
-        for lp in lp_desc:
-            short = lp.split('|')[-1]
-            if not (short.startswith(base_name) and "_low" in short and cmds.listRelatives(lp, shapes=True, type='mesh')):
-                continue
-            sg = short.replace(base_name + "_", "").split("_low")[0]
-            groups.setdefault(sg, {'lp': [], 'hp': []})['lp'].append(lp)
-
-        hp_desc = cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or []
-        for hp in hp_desc:
-            short = hp.split('|')[-1]
-            if not (short.startswith(base_name) and "_high" in short and cmds.listRelatives(hp, shapes=True, type='mesh')):
-                continue
-            sg = short.replace(base_name + "_", "").split("_high")[0]
-            if sg in groups:
-                groups[sg]['hp'].append(hp)
-        return groups
-
-    def rebuild_active_cage(self, only_subgroups=None, resolve_overlaps=False, create_missing_only=True):
-        """Build cage meshes for the active chapter and prune orphans.
-
-        ``only_subgroups`` (a set of display names) limits the build to those
-        subgroups (the rest keep their current cage) so a selection can be
-        created on its own. ``resolve_overlaps`` runs the (heavier) cross-cage
-        overlap cleanup - only wanted after a Fit. ``create_missing_only``
-        (default True) skips any subgroup that already HAS a cage mesh, so an
-        existing cage - which may carry manual brush sculpting - is never
-        recreated/overwritten; only genuinely missing cages get built. Pass
-        False (used by the hidden Fit-to-HP path) to force a full recompute.
-        Returns a summary dict."""
-        pair = self._active_pair()
-        if not pair:
-            self.log("No active chapter for cage.", "red")
-            return {}
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        if not hp_main or not lp_main:
-            self.log("HP or LP root not found for cage.", "red")
-            return {}
-        base_name = pair.get('base', 'Chapter')
-        import time as _time
-        t = {}
-        _t0 = _time.time()
-
-        # Ensure finalized _low_NNN / _high_NNN naming exists even if the cage is
-        # built before entering Export Settings.
-        self.finalize_subgroup_naming(base_name, hp_main, lp_main)
-        t['naming'] = _time.time() - _t0; _t0 = _time.time()
-        groups = self._collect_cage_subgroups(base_name, hp_main, lp_main)
-        if not groups:
-            self.log("No finalized LP meshes found for cage.", "red")
-            return {}
-        try:
-            for sg, meshes in groups.items():
-                if only_subgroups and sg not in only_subgroups:
-                    continue
-                for lp in meshes['lp']:
-                    fn, _dag = bg_cage.CageProcessor._fn_mesh(lp)
-                    if fn.numVertices == 0 or fn.numPolygons == 0:
-                        raise ValueError("LP has no polygons: {}".format(lp))
-        except Exception as exc:
-            self.log(str(exc), "red")
-            return {'made': 0, 'updated': 0, 'errors': [str(exc)]}
-
-        # All chapter HP meshes: obstacle HP for a subgroup is everything except
-        # its own HP (other subgroups' geometry the cage must not intersect).
-        all_hp = [m for m in (cmds.listRelatives(hp_main, allDescendents=True, fullPath=True, type='transform') or [])
-                  if cmds.listRelatives(m, shapes=True, type='mesh')]
-
-        # Single reference diagonal for the whole chapter so a percent inflation
-        # is the SAME absolute distance on every subgroup (big and small alike).
-        try:
-            bb = cmds.exactWorldBoundingBox(lp_main)
-            ref_diag = ((bb[3] - bb[0]) ** 2 + (bb[4] - bb[1]) ** 2 + (bb[5] - bb[2]) ** 2) ** 0.5
-        except Exception:
-            ref_diag = None
-        t['collect'] = _time.time() - _t0; _t0 = _time.time()
-
-        made = updated = 0
-        cage_errors = []
-        expected = set()
-
-        # Progress bar for the build (stays up until the viewport redraw starts).
-        # No Cancel button: a half-built cage set is worse than waiting a beat.
-        cage_progress = None
-        try:
-            cage_progress = QtWidgets.QProgressDialog(
-                bg_l10n.text("Building cage..."), "", 0, 100, self)
-            cage_progress.setWindowModality(QtCore.Qt.WindowModal)
-            cage_progress.setMinimumDuration(0)
-            cage_progress.setCancelButton(None)
-            cage_progress.setValue(0)
-            QtWidgets.QApplication.processEvents()
-        except Exception:
-            cage_progress = None
-
-        def _cage_p(val, label=None):
-            if not cage_progress:
-                return
-            try:
-                if label is not None:
-                    cage_progress.setLabelText(label)
-                cage_progress.setValue(max(0, min(int(val), 100)))
-                cage_progress.repaint()
-                QtWidgets.QApplication.processEvents()
-            except Exception:
-                pass
-
-        cmds.refresh(suspend=True)
-        try:
-            with bg_core.undo_chunk("BuildCage"):
-                chapter_grp = bg_cage.CageProcessor.ensure_chapter_group(base_name)
-                # One scan of the existing cage hierarchy instead of a full scan
-                # per LP mesh (was O(N^2)).
-                cage_index = bg_cage.CageProcessor.index_existing_cages(chapter_grp)
-                # Classify the work: a fresh DEFLATED cage (inflate=0, not fitted)
-                # - the plain "Create Cage" case - goes through the batched fast
-                # path (one duplicate + one shading assign for the whole chapter).
-                # Fits and existing-cage updates stay on the per-mesh path.
-                create_specs = []   # {'lp','name','folder','mode'}
-                individual = []     # (lp, cage_name, target_hp, obstacle_hp, params)
-                for sg, meshes in groups.items():
-                    # Expected covers ALL subgroups so a selective rebuild does
-                    # not prune the cages we intentionally skipped.
-                    for lp in meshes['lp']:
-                        expected.add(lp.split('|')[-1] + bg_cage.SUFFIX_CAGE)
-                    if only_subgroups and sg not in only_subgroups:
-                        continue
-                    params = self._cage_params_for(pair, sg)
-                    target_hp = meshes['hp']
-                    target_set = set(cmds.ls(target_hp, long=True) or [])
-                    obstacle_hp = [m for m in all_hp if m not in target_set]
-                    if not target_hp:
-                        self.log("Cage: subgroup '{}' has no HP.".format(sg), "orange")
-                    # inflate is the same for every LP of the subgroup (shared
-                    # ref_diag), so decide the batch eligibility once per subgroup.
-                    sg_inflate, _sg_gap = bg_cage.CageProcessor.resolve_amounts(
-                        (meshes['lp'][0] if meshes['lp'] else lp_main), params, ref_diag)
-                    batchable_sg = (not params.get('fitted')) and sg_inflate <= 1e-9
-                    sg_mode = params.get('display_mode', 'solid')
-                    for lp in meshes['lp']:
-                        cage_name = lp.split('|')[-1] + bg_cage.SUFFIX_CAGE
-                        try:
-                            existing = bg_cage.CageProcessor.find_cage_for_lp(lp, cage_index)
-                        except ValueError as exc:
-                            self.log(str(exc), "red")
-                            cage_errors.append(str(exc))
-                            continue
-                        existing = existing if (existing and cmds.objExists(existing)) else None
-                        if create_missing_only and existing:
-                            folder = bg_cage.CageProcessor.ensure_relative_folders(
-                                chapter_grp, bg_cage.CageProcessor.relative_folders_for_lp(lp, lp_main))
-                            parent = cmds.listRelatives(existing, parent=True, fullPath=True) or []
-                            if parent != [folder]:
-                                existing = cmds.parent(existing, folder, absolute=True)[0]
-                                existing = (cmds.ls(existing, long=True) or [existing])[0]
-                            cage_index['source:' + (cmds.ls(lp, uuid=True) or [''])[0]] = existing
-                            continue  # keep the existing (possibly sculpted) cage untouched
-                        if batchable_sg and not existing:
-                            folder = bg_cage.CageProcessor.ensure_relative_folders(
-                                chapter_grp,
-                                bg_cage.CageProcessor.relative_folders_for_lp(lp, lp_main))
-                            create_specs.append({'lp': lp, 'name': cage_name,
-                                                 'folder': folder, 'mode': sg_mode})
-                        else:
-                            individual.append((lp, cage_name, target_hp, obstacle_hp, params))
-
-                # Progress advances 5 -> 80% across the created cages, then
-                # 80 -> 92% across the per-mesh updates.
-                total_units = max(len(create_specs) + len(individual), 1)
-                done_units = 0
-                _cage_p(5, bg_l10n.text("Building cage..."))
-
-                # Batched fast create, grouped by display mode and chunked so the
-                # bar advances (chunks stay large, keeping the batching win).
-                CHUNK = 50
-                by_mode = {}
-                for spec in create_specs:
-                    by_mode.setdefault(spec['mode'], []).append(spec)
-                for mode, specs in by_mode.items():
-                    for c in range(0, len(specs), CHUNK):
-                        chunk = specs[c:c + CHUNK]
-                        new_cages = bg_cage.CageProcessor.batch_create_cages(chunk, mode)
-                        for spec, cage in zip(chunk, new_cages):
-                            if cage:
-                                cage_index[spec['name']] = cage
-                                made += 1
-                        done_units += len(chunk)
-                        _cage_p(5 + int(75 * done_units / total_units))
-
-                # Per-mesh path for fits and existing-cage updates.
-                for (lp, cage_name, target_hp, obstacle_hp, params) in individual:
-                    cage, created = bg_cage.CageProcessor.update_or_create_cage(
-                        lp, target_hp, obstacle_hp, params, chapter_grp, lp_main, ref_diag,
-                        existing_index=cage_index)
-                    if cage:
-                        cage_index[cage_name] = cage
-                        made += 1 if created else 0
-                        updated += 0 if created else 1
-                    done_units += 1
-                    _cage_p(5 + int(75 * done_units / total_units))
-                t['build'] = _time.time() - _t0; _t0 = _time.time()
-                _cage_p(88, bg_l10n.text("Finalizing..."))
-                bg_cage.CageProcessor.prune_orphans(chapter_grp, expected)
-                t['prune'] = _time.time() - _t0; _t0 = _time.time()
-                _cage_p(95)
-
-                # Resolve intersections BETWEEN different subgroups' cages by
-                # shrinking them in the conflict zones (never wanted for baking).
-                # Only on Fit - a plain Expansion/Gap tweak keeps the clean hull.
-                if resolve_overlaps:
-                    entries = []
-                    for sg, meshes in groups.items():
-                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
-                            entries.append({'cage': cage, 'own_hp': meshes['hp']})
-                    if len(entries) >= 2:
-                        floor = max((ref_diag or 1.0) * 0.0005, 1e-5)
-                        bg_cage.CageProcessor.resolve_cage_overlaps(entries, floor)
-                t['resolve'] = _time.time() - _t0
-        finally:
-            cmds.refresh(suspend=False)
-            _cage_p(100)
-            # Redraw the viewport so the freshly built cages appear right away.
-            # Deferred by 100 ms (same safe pattern as the Smooth preview) to let
-            # Maya settle the new geometry before drawing. Unlike Smooth preview -
-            # which only tweaks attributes on ALREADY-drawn meshes - Create Cage
-            # adds NEW meshes that Viewport 2.0 has no render items for yet, so a
-            # plain refresh() is skipped as "not needed" (the mesh only appears
-            # once the camera moves and forces a rebuild). force=True bypasses that
-            # check and forces a full redraw. The progress bar is closed here,
-            # right before the redraw starts, so it stays up for the whole build.
-            # Wrapped so it can never throw.
-            def _safe_cage_refresh():
-                if cage_progress:
-                    try:
-                        cage_progress.close()
-                    except Exception:
-                        pass
-                try:
-                    cmds.refresh(force=True)
-                except Exception:
-                    try:
-                        cmds.refresh()
-                    except Exception:
-                        pass
-            try:
-                QtCore.QTimer.singleShot(100, _safe_cage_refresh)
-            except Exception:
-                _safe_cage_refresh()
-
-        if made or updated:
-            self.log("Cage: {} created, {} adjusted under Cage_BG.".format(made, updated), "lightgreen")
-        # Phase timings (help diagnose the slow-Create report in a real scene).
-        total = sum(t.values())
-        if total > 0.5:
-            self.log("Cage timing (s): " + "  ".join("{}={:.2f}".format(k, v) for k, v in t.items())
-                     + "  total={:.2f}".format(total), "orange")
-        self.save_cage_states()
-        return {'made': made, 'updated': updated, 'errors': cage_errors}
-
-    def save_cage_states(self):
-        pair = self._active_pair()
-        if not pair or not hasattr(self, 'cage_overrides'):
-            return
-        pair['cage_overrides'] = dict(self.cage_overrides)
-        bg_core.BakeSessionModel.save(self.root_pairs)
-
-    def clear_active_cage(self):
-        pair = self._active_pair()
-        if not pair:
-            return
-        base_name = pair.get('base', 'Chapter')
-        with bg_core.undo_chunk("ClearCage"):
-            bg_cage.CageProcessor.clear_chapter_cage(base_name)
-        pair.setdefault('cage_settings', {})['export_enabled'] = False
-        self._standard_cage_include = False
-        if hasattr(self, 'exp_inc_cage'):
-            self.exp_inc_cage.setChecked(False)
-        bg_core.BakeSessionModel.save(self.root_pairs)
-        self.log("Cage cleared for chapter '{}'.".format(base_name), "lightblue")
-
-    def sculpt_active_cage(self):
-        """Select the cage mesh(es) - only the selected subgroup's if one is
-        picked in the panel, otherwise the whole chapter - and switch Maya to
-        the sculpting brush that pushes vertices along their own normal (Maya's
-        Sculpting Tools name this brush 'Bulge'; there is no brush literally
-        named 'Inflate', but Bulge is exactly that behaviour)."""
-        pair = self._active_pair()
-        if not pair:
-            return cmds.warning("No active chapter selected.")
-        base_name = pair.get('base', 'Chapter')
-        targets = set(getattr(self, 'final_selected_names', None) or set())
-        if targets:
-            meshes = []
-            for sg in targets:
-                meshes.extend(self._cage_meshes_for_subgroup(base_name, sg))
-        else:
-            meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
-        if not meshes:
-            return cmds.warning("No cage meshes to sculpt. Adjust Expansion first to build the cage.")
-        cmds.select(meshes, replace=True)
-
-        # Informational only (read-only check, nothing is modified): the cage
-        # is a straight duplicate of the LP with only its vertex POSITIONS
-        # edited, never its topology, so it can only be non-manifold if the
-        # source LP mesh already is. Maya's Sculpting Tools then warn (but
-        # still function) on that inherited topology. Surfacing which mesh it
-        # comes from here, instead of auto-running a cleanup, avoids risking a
-        # vertex-count/order change that would break the cage<->LP
-        # correspondence Substance relies on.
-        flagged = []
-        for m in meshes:
-            try:
-                if cmds.polyInfo(m, nonManifoldVertices=True) or cmds.polyInfo(m, nonManifoldEdges=True):
-                    flagged.append(m.split('|')[-1])
-            except Exception:
-                pass
-        if flagged:
-            self.log(
-                "Cage sculpt: non-manifold topology inherited from the LP source on {} "
-                "- Maya may warn while sculpting but it still works.".format(", ".join(flagged)), "orange")
-
-        try:
-            mel.eval('SetMeshBulgeTool;')
-        except Exception as e:
-            cmds.warning("Could not activate the sculpting brush: {}".format(e))
-
-    def export_chapter_cage_if_enabled(self, pair, export_dir, snapshot=None):
-        """Export the chapter's cage as its own {base}_cage.fbx into
-        ``export_dir`` - always a separate file, alongside the regular HP/LP
-        export, whenever a cage exists AND the chapter's 'export cage' flag
-        (enabled by Create Cage) is on. No-op (returns False) if there is no cage or
-        the flag is off - there is no separate Export Cage button anymore."""
-        if pair.get('export_excluded', False):
-            return False
-        base_name = pair.get('base', 'Chapter')
-        settings = pair.get('cage_settings') or {}
-        if not settings.get('export_enabled', False):
-            return False
-        cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
-                       else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
-        if not cage_meshes:
-            return False
-        if not self._validate_cage_export(pair, cage_meshes, snapshot):
-            return False
-        export_name = "{}_cage".format(base_name)
-        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-        # Triangulate on export (undone afterwards) to mirror the LP export so
-        # Substance's cage<->low vertex matching stays consistent.
-        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
-            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
-            return True
-        cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
-        return False
-
-    def export_active_cage(self):
-        """Explicit Export Cage button: write the active chapter's cage to its
-        own {base}_cage.fbx. Reuses the folder the chapter was last exported to
-        (``pair['export_dir']``) with no dialog; only prompts once, and stores
-        the choice, if the chapter has never been exported. Runs regardless of
-        the 'Export cage with chapter' checkbox - it is a deliberate action."""
-        pair = self._active_pair()
-        if not pair:
-            return cmds.warning("No active chapter selected.")
-        if not self._allow_chapter_export(pair):
-            return
-        base_name = pair.get('base', 'Chapter')
-        cage_meshes = bg_cage.CageProcessor.get_chapter_cage_meshes(base_name)
-        if not cage_meshes:
-            return cmds.warning("No cage to export - press Create Cage first.")
-        if not self._validate_cage_export(pair, cage_meshes):
-            return False
-
-        export_dir = pair.get('export_dir')
-        if not export_dir or not os.path.isdir(export_dir):
-            export_dirs = cmds.fileDialog2(
-                fileMode=3,
-                caption=bg_l10n.text("Select Export Directory for {name}").format(name=base_name))
-            if not export_dirs:
-                return
-            export_dir = export_dirs[0]
-            pair['export_dir'] = export_dir
-            bg_core.BakeSessionModel.save(self.root_pairs)
-
-        export_name = "{}_cage".format(base_name)
-        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-        with self.suspend_subgroup_color_preview():
-            with self.suspend_isolation():
-                if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
-                    self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
-                    cmds.inViewMessage(amg="Cage exported: {}.fbx".format(export_name),
-                                       pos='midCenter', fade=True)
-                else:
-                    cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
-
-    def _make_cage_slider_row(self, lo, hi, value, decimals, step=None, curve=1.0):
-        """Return (widget, spinbox, slider, read_fn). Slider and spinbox stay in
-        sync; the caller wires rebuild triggers to sliderReleased / editingFinished.
-        ``curve`` > 1 gives a non-linear response so small values (typical for a
-        cage) get most of the slider travel and are easy to dial in."""
-        row = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(6)
-        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        slider.setRange(0, 1000)
-        spin = QtWidgets.QDoubleSpinBox()
-        spin.setDecimals(decimals)
-        spin.setRange(lo, max(hi, value))
-        if step:
-            spin.setSingleStep(step)
-        spin.setValue(value)
-        spin.setFixedWidth(80)
-        # ``bipolar`` (a symmetric lo=-hi range) maps 0 to the slider CENTRE and
-        # applies the curve to the magnitude on each side, so the handle rests in
-        # the middle and travels both ways with fine control near zero.
-        bipolar = lo < 0 and abs(lo + hi) < 1e-9
-        state = {'syncing': False, 'lo': lo, 'hi': hi, 'curve': float(curve) or 1.0,
-                 'bipolar': bipolar}
-
-        def to_slider(val):
-            if state['bipolar']:
-                half = state['hi'] or 1.0
-                frac = max(-1.0, min(1.0, val / half))
-                mag = abs(frac) ** (1.0 / state['curve'])
-                sign = 1.0 if frac >= 0 else -1.0
-                return int(max(0, min(1000, round(500 + sign * mag * 500))))
-            span = (state['hi'] - state['lo']) or 1.0
-            frac = max(0.0, min(1.0, (val - state['lo']) / span))
-            return int(max(0, min(1000, round((frac ** (1.0 / state['curve'])) * 1000))))
-
-        def from_slider(pos):
-            if state['bipolar']:
-                half = state['hi'] or 1.0
-                d = (pos - 500) / 500.0
-                mag = abs(d) ** state['curve']
-                sign = 1.0 if d >= 0 else -1.0
-                return sign * mag * half
-            span = (state['hi'] - state['lo']) or 1.0
-            frac = (pos / 1000.0) ** state['curve']
-            return state['lo'] + frac * span
-
-        slider.setValue(to_slider(value))
-
-        def on_slider(pos):
-            if state['syncing']:
-                return
-            state['syncing'] = True
-            spin.setValue(from_slider(pos))
-            state['syncing'] = False
-
-        def on_spin(val):
-            if state['syncing']:
-                return
-            state['syncing'] = True
-            slider.setValue(to_slider(val))
-            state['syncing'] = False
-
-        slider.valueChanged.connect(on_slider)
-        spin.valueChanged.connect(on_spin)
-        h.addWidget(slider, stretch=1)
-        h.addWidget(spin)
-        return row, spin, slider, state
-
-    def _enable_cage_export_on_creation(self, pair, result):
-        """Arm Cage export only after Create Cage actually produced/found meshes."""
-        if not result or result.get('errors'):
-            return False
-        if not (result.get('made') or bg_cage.CageProcessor.get_chapter_cage_meshes(
-                pair.get('base', 'Chapter'))):
-            return False
-        pair.setdefault('cage_settings', {})['export_enabled'] = True
-        checkbox = getattr(self, 'exp_inc_cage', None)
-        target = getattr(self, 'exp_target', None)
-        if checkbox is not None and (target is None or target.currentIndex() == 0):
-            checkbox.setChecked(True)
-        elif checkbox is not None:
-            self._standard_cage_include = True
-        return True
-
-    def build_cage_settings_panel(self, pair):
-        """Build the embedded Cage settings panel on the right side."""
-        finish_previous = getattr(self, '_cage_finish_edits', None)
-        if finish_previous:
-            finish_previous()
-        from bg_cage_undo import MeshEditTransaction
-        settings = dict(pair.get('cage_settings') or {})
-        fitted = {'v': bool(settings.get('fitted', False))}
-
-        # Work in absolute world units, with slider range and step derived from
-        # the whole chapter scale so the useful range spans the slider (instead
-        # of being squished near zero) and one step is a sensible world distance.
-        hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
-        base_name = pair.get('base', 'Chapter')
-        # Enumerate the chapter's subgroups once - reused below by Create Cage
-        # and Expansion. Naming is NOT re-finalized here: toggle_final_view
-        # already finalizes it once on entering Export Settings (a prerequisite
-        # for this panel to exist at all), and re-running that full rename pass
-        # here on every panel build was pure redundant overhead.
-        if hp_main and lp_main:
-            groups = self._collect_cage_subgroups(base_name, hp_main, lp_main)
-        else:
-            groups = {}
-        chapter_diag = 1.0
-        try:
-            ref = lp_main if (lp_main and cmds.objExists(lp_main)) else hp_main
-            bb = cmds.exactWorldBoundingBox(ref)
-            chapter_diag = ((bb[3] - bb[0]) ** 2 + (bb[4] - bb[1]) ** 2 + (bb[5] - bb[2]) ** 2) ** 0.5 or 1.0
-        except Exception:
-            chapter_diag = 1.0
-
-        # Migrate stored values (older builds saved percent-of-diagonal).
-        if settings.get('unit', 'percent') == 'percent':
-            cur_inflate = chapter_diag * float(settings.get('inflate', bg_cage.CageProcessor.DEFAULT_INFLATE_PCT)) / 100.0
-        else:
-            cur_inflate = float(settings.get('inflate', chapter_diag * 0.05))
-
-        # The Expansion slider is a RELATIVE jog: the handle rests in the CENTRE
-        # (0), a move dials a delta (right = inflate, left = deflate) applied
-        # uniformly to every cage in scope, and on release the value snaps back to
-        # 0 / centre for the next nudge. Because subgroups can hold different
-        # absolute inflate amounts, an absolute slider position is meaningless -
-        # only the relative delta is; one delta for the whole scope also stops
-        # some cages deflating while others inflate on the same drag.
-
-        infl_hi = max(chapter_diag * 0.30, cur_inflate)
-        # Sensible spinbox step / decimals for this scale (~200 steps across range).
-        import math as _math
-        mag = _math.floor(_math.log10(infl_hi)) if infl_hi > 0 else -2
-        decimals = int(max(2, 3 - mag))
-        infl_step = round(infl_hi / 200.0, decimals) or (10 ** -decimals)
-
-        panel = QtWidgets.QWidget()
-        panel.setProperty("bg_help_id", "cage.controls")
-        # STYLE_MAIN leaves QSlider unstyled, so on Maya's dark theme the groove
-        # is nearly invisible. Draw an explicit groove + handle so the jog track
-        # (the long bar) and its centred handle read clearly.
-        cage_slider_css = """
-            QSlider::groove:horizontal { height: 6px; background: #1E1E1E;
-                border: 1px solid #444; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #b48ead;
-                border: 1px solid #5a3d6b; width: 14px; margin: -6px 0;
-                border-radius: 7px; }
-            QSlider::handle:horizontal:hover { background: #d9b3ff; }
-        """
-        panel.setStyleSheet(bg_core.BakeConfig.STYLE_MAIN + cage_slider_css)
-        outer = QtWidgets.QVBoxLayout(panel)
-        outer.setContentsMargins(4, 4, 4, 4)
-
-        header = QtWidgets.QLabel(bg_l10n.text("CAGE SETTINGS"))
-        header.setProperty("bg_help_id", "cage.controls")
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        header.setStyleSheet("font-weight: bold; background-color: #3a2a44; border: 1px solid #5a3d6b; padding: 6px;")
-        outer.addWidget(header)
-
-        # Labels sit ABOVE their controls (vertical layout) so nothing collapses
-        # when the docked panel is narrow or the window is resized.
-        def add_labeled(text_key, widget):
-            lbl = QtWidgets.QLabel(bg_l10n.text(text_key))
-            lbl.setProperty("bg_help_id", "cage.inflation" if text_key in
-                            ("Expansion (inflate)", "Normal move") else "cage.controls")
-            lbl.setStyleSheet("color: #bbbbbb; margin-top: 4px;")
-            outer.addWidget(lbl)
-            outer.addWidget(widget)
-
-        # Bipolar jog (centre = 0), cubic response so tiny nudges near the centre
-        # are easy to dial - cage deltas are typically a couple % of the diagonal.
-        # The Expansion row, status and checkbox are added later, in the assembly
-        # block, so the panel reads in the final visual order.
-        inflate_row, inflate_spin, inflate_slider, inflate_sync = self._make_cage_slider_row(
-            -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
-        inflate_spin.setProperty("bg_help_id", "cage.inflation")
-        inflate_slider.setProperty("bg_help_id", "cage.inflation")
-
-        status = QtWidgets.QLabel("")
-        status.setWordWrap(True)
-        status.setStyleSheet("color: #d9b3ff;")
-
-        # Cage actions are square icon buttons (icon only, text moved to the
-        # tooltip). The tooltip is localized at build time; the panel is rebuilt
-        # on language change, so it stays in sync.
-        CAGE_BTN, CAGE_ICON = 42, 30
-
-        def _square_btn(icon_name, tip_key):
-            b = QtWidgets.QPushButton()
-            b.setProperty("bg_help_id", "cage.controls")
-            b.setIcon(get_icon(icon_name))
-            b.setIconSize(QtCore.QSize(CAGE_ICON, CAGE_ICON))
-            b.setFixedSize(CAGE_BTN, CAGE_BTN)
-            b.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-            tip = bg_l10n.text(tip_key)
-            b.setToolTip(tip)
-            b.setStatusTip(tip)
-            return b
-
-        def _btn_row(*btns):
-            row = QtWidgets.QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            for b in btns:
-                row.addWidget(b)
-            row.addStretch(1)
-            return row
-
-        def _recenter(spin, slider):
-            """Snap a jog slider (and its spinbox) back to 0 / the centre after
-            its delta has been applied, ready for the next relative nudge."""
-            spin.blockSignals(True)
-            slider.blockSignals(True)
-            spin.setValue(0.0)
-            slider.setValue(500)
-            spin.blockSignals(False)
-            slider.blockSignals(False)
-
-        def _selected():
-            return set(getattr(self, 'final_selected_names', None) or set())
-
-        def save_settings(scope_names, is_global):
-            changed = {
-                'unit': 'absolute',
-                'inflate': inflate_spin.value(),
-                'fitted': fitted['v'],
-            }
-            overrides = pair.setdefault('cage_overrides', {})
-            if is_global:
-                # Nothing selected: global change, reset per-subgroup overrides.
-                # Preserve the display mode (it is a separate, chapter-wide look).
-                changed['display_mode'] = (pair.get('cage_settings') or {}).get('display_mode', 'solid')
-                changed['export_enabled'] = (pair.get('cage_settings') or {}).get('export_enabled', False)
-                pair['cage_settings'] = changed
-                overrides.clear()
-            else:
-                for sg in scope_names:
-                    ov = overrides.get(sg)
-                    ov = dict(ov) if isinstance(ov, dict) else {}
-                    ov.update(changed)
-                    overrides[sg] = ov
-            bg_core.BakeSessionModel.save(self.root_pairs)
-
-        def do_create():
-            """Build cage meshes only where one doesn't exist yet. Never
-            touches an existing cage (which may carry manual brush sculpting).
-            Always covers the WHOLE chapter - unlike Expansion, a subgroup
-            selection or hidden subgroups do NOT narrow this down, since Create
-            Cage is chapter-wide scaffolding, not a per-subgroup tweak.
-
-            The cage is created DEFLATED (identical to the LP, inflate = 0) and
-            the Expansion slider is reset to 0, so the artist always inflates
-            from a known, reversible baseline. Selection is cleared afterwards so
-            the just-created mesh isn't accidentally the target of the next
-            Expansion."""
-            fitted['v'] = False
-            # Slider back to the centre (0) BEFORE building, so the artist always
-            # inflates from a known, reversible baseline.
-            _recenter(inflate_spin, inflate_slider)
-            self._cage_islands = {}  # stale intersection islands no longer valid
-            save_settings(set(groups.keys()), True)  # inflate=0 global, overrides cleared
-            try:
-                result = self.rebuild_active_cage(
-                    only_subgroups=None, resolve_overlaps=False, create_missing_only=True)
-            except Exception as exc:
-                status.setText(str(exc))
-                cmds.warning(str(exc))
-                return
-            if self._enable_cage_export_on_creation(pair, result):
-                bg_core.BakeSessionModel.save(self.root_pairs)
-            try:
-                cmds.select(clear=True)
-            except Exception:
-                pass
-            # Creating the cage is an explicit "show me the cage" action, so reset
-            # the Cage Vis/Hid preference to shown before _ensure_cage_visible.
-            self.cage_vis_pref = True
-            self._ensure_cage_visible(pair)
-            # The cage now exists: flip the LP Visible button to Cage Vis.
-            self.sync_toggle_buttons(hp_main, lp_main)
-            if result.get('errors'):
-                status.setText("; ".join(result['errors']))
-            else:
-                status.setText(bg_l10n.text("Cage created.") + " [" + bg_l10n.text("all subgroups") + "]")
-
-        # The Expansion jog applies LIVE while the handle moves, so the cage
-        # inflates smoothly in real time (not one jump on release). Because the
-        # cubic slider curve puts fine control near the centre and coarse control
-        # near the ends, one drag is comfortable at both small and large scales.
-        # Only the incremental change since the last step is pushed each time, so
-        # summing the steps equals one big delta (inflate is linear along a fixed
-        # LP-normal field) - fully reversible.
-        lp_by_cage_short = dict(
-            (lp.split('|')[-1] + bg_cage.SUFFIX_CAGE, lp)
-            for meshes in groups.values() for lp in meshes.get('lp', []))
-
-        def _lp_for(cage):
-            return bg_cage.CageProcessor.source_lp(cage)
-
-        def _expansion_targets():
-            """[(cage, lp), ...] plus a scope label, in priority order: cage
-            meshes picked in the viewport -> selected subgroup rows -> every
-            currently VISIBLE subgroup."""
-            mesh_sel = self._selected_cage_meshes(base_name)
-            row_sel = _selected()
-            targets = []
-            if mesh_sel:
-                for m in mesh_sel:
-                    sg = self._subgroup_for_cage_mesh(base_name, m)
-                    if sg and sg in groups:
-                        targets.append((m, _lp_for(m)))
-                return targets, bg_l10n.text("selected cage mesh(es)")
-            if row_sel:
-                for sg in row_sel:
-                    if sg in groups:
-                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
-                            targets.append((cage, _lp_for(cage)))
-                return targets, bg_l10n.text("selected subgroup(s)")
-            for sg, meshes in groups.items():
-                if any(cmds.objExists(hp) and cmds.getAttr(hp + ".visibility") for hp in meshes.get('hp', [])):
-                    for cage in self._cage_meshes_for_subgroup(base_name, sg):
-                        targets.append((cage, _lp_for(cage)))
-            return targets, bg_l10n.text("visible subgroups")
-
-        expo = {'last': 0.0, 'targets': [], 'label': '', 'transaction': None,
-                'directions': {}, 'error': None}
-
-        def commit_edit(state):
-            transaction = state['transaction']
-            state['transaction'] = None
-            if transaction is None:
-                return False
-            try:
-                return transaction.commit()
-            except Exception as exc:
-                state['error'] = str(exc)
-                status.setText(str(exc))
-                cmds.warning(str(exc))
-                return False
-
-        def expansion_begin():
-            if expo['transaction'] is not None:
-                return
-            fitted['v'] = False
-            expo['error'] = None
-            expo['targets'], expo['label'] = _expansion_targets()
-            expo['last'] = 0.0  # the jog always starts from the centre
-            if expo['targets']:
-                try:
-                    directions = {}
-                    for cage, lp in expo['targets']:
-                        bg_cage.CageProcessor.validate_pair(lp, cage)
-                        fn, _dag = bg_cage.CageProcessor._fn_mesh(lp)
-                        directions[cage] = [
-                            (v.x, v.y, v.z) for v in fn.getVertexNormals(True, om.MSpace.kWorld)]
-                    expo['directions'] = directions
-                    expo['transaction'] = MeshEditTransaction("CageExpansion")
-                    for cage, lp in expo['targets']:
-                        expo['transaction'].capture(cage)
-                except Exception as exc:
-                    expo['error'] = str(exc)
-                    expo['transaction'] = None
-                    expo['targets'] = []
-                    status.setText(str(exc))
-                    cmds.warning(str(exc))
-
-        def expansion_live():
-            if inflate_sync['syncing']:
-                return  # a typed value is applied once by editingFinished
-            if expo['transaction'] is None:
-                expansion_begin()
-            if not expo['targets']:
-                return
-            cur = inflate_spin.value()
-            delta = cur - expo['last']
-            if abs(delta) < 1e-9:
-                return
-            expo['last'] = cur
-            try:
-                for cage, lp in expo['targets']:
-                    bg_cage.CageProcessor.inflate_existing_cage(
-                        cage, delta, lp, transaction=expo['transaction'],
-                        directions=expo['directions'][cage])
-            except Exception as exc:
-                expo['error'] = str(exc)
-                if expo['transaction']:
-                    expo['transaction'].cancel()
-                expo['transaction'] = None
-                expo['targets'] = []
-                status.setText(str(exc))
-                cmds.warning(str(exc))
-                return
-            if not inflate_slider.isSliderDown():
-                expansion_idle.start(180)
-
-        def expansion_end():
-            expansion_idle.stop()
-            with bg_core.undo_chunk("CageExpansion"):
-                changed = commit_edit(expo)
-                if changed:
-                    self._ensure_cage_visible(pair)
-            self._cage_islands = {}
-            # No absolute inflate is stored: the slider is a relative jog that
-            # always starts at 0, and per-subgroup absolute values diverge (that
-            # divergence caused the old partial-deflation bug).
-            if expo['error']:
-                status.setText(expo['error'])
-            elif expo['targets']:
-                status.setText(bg_l10n.text("Expansion adjusted (sculpting preserved).")
-                               + " [" + expo['label'] + "]")
-            else:
-                status.setText(bg_l10n.text("No cage yet - press Create Cage."))
-            _recenter(inflate_spin, inflate_slider)
-            expo['last'] = 0.0
-            expo['targets'] = []
-            expo['directions'] = {}
-
-        def expansion_spin_commit():
-            # Typed value / spinbox focus-out: apply the net delta in one step.
-            if abs(inflate_spin.value()) < 1e-9:
-                _recenter(inflate_spin, inflate_slider)
-                return
-            expansion_begin()
-            expansion_live()
-            expansion_end()
-
-        expansion_idle = QtCore.QTimer(panel)
-        expansion_idle.setSingleShot(True)
-        expansion_idle.timeout.connect(expansion_end)
-
-        def do_fit():
-            # Hidden from the UI (unreliable) but kept intact: forces a full
-            # from-scratch recompute, unlike Expansion's incremental push.
-            fitted['v'] = True
-            only = _selected() or None
-            save_settings(only or set(groups.keys()), not only)
-            self.rebuild_active_cage(only_subgroups=only, resolve_overlaps=True, create_missing_only=False)
-            self._ensure_cage_visible(pair)
-            status.setText(bg_l10n.text("Cage fitted to HP (gap kept)."))
-
-        inflate_slider.sliderPressed.connect(expansion_begin)
-        inflate_slider.valueChanged.connect(expansion_live)
-        inflate_slider.sliderReleased.connect(expansion_end)
-        inflate_spin.editingFinished.connect(expansion_spin_commit)
-
-        btn_create = _square_btn("Cage_Create.png", "Create Cage")
-        btn_create.clicked.connect(do_create)
-
-        # Display mode toggle: transparent wireframe <-> opaque gray. Only
-        # changes the look (no rebuild). The icon swaps to match the active mode.
-        display_mode = {'v': (pair.get('cage_settings') or {}).get('display_mode', 'solid')}
-        btn_display = _square_btn("Cage_Solid_Gray.png", "Display: Solid gray")
-
-        def _refresh_display_btn():
-            solid = display_mode['v'] == 'solid'
-            # Show the icon of the mode the click will switch TO, so the artist
-            # sees what the cage display will become (not the current look).
-            btn_display.setIcon(get_icon("Cage_Wireframe.png" if solid else "Cage_Solid_Gray.png"))
-            tip = bg_l10n.text("Display: Wireframe") if solid else bg_l10n.text("Display: Solid gray")
-            btn_display.setToolTip(tip)
-            btn_display.setStatusTip(tip)
-
-        def toggle_display():
-            display_mode['v'] = 'solid' if display_mode['v'] == 'wire' else 'wire'
-            settings = pair.setdefault('cage_settings', {})
-            settings['display_mode'] = display_mode['v']
-            bg_core.BakeSessionModel.save(self.root_pairs)
-            bg_cage.CageProcessor.set_chapter_cage_display(pair.get('base', ''), display_mode['v'])
-            _refresh_display_btn()
-
-        _refresh_display_btn()
-        btn_display.clicked.connect(toggle_display)
-
-        # (The old "Export cage with chapter" checkbox moved to the Export panel's
-        #  Cage include-checkbox.)
-
-        btn_fit = QtWidgets.QPushButton(bg_l10n.text("Fit to HP"))
-        btn_fit.setStyleSheet("background-color: #8e44ad; font-weight: bold; color: white;")
-        btn_fit.clicked.connect(do_fit)
-        # Fit to HP is currently unreliable - hidden from the UI until fixed,
-        # the underlying rebuild/resolve logic stays intact for later.
-        btn_fit.setVisible(False)
-
-        btn_brush = _square_btn("Cage_Brush.png", "Sculpt Cage (Inflate)")
-        btn_brush.clicked.connect(self.sculpt_active_cage)
-
-        # --- Cage/HP intersection touch-up ------------------------------------
-        # Find where the cage still pierces its HP, then push those polygon
-        # islands straight out along their own normal with the slider below.
-        def _scoped_cage_hp_pairs():
-            """[(cage_path, hp_nodes)] for the current scope (selected cage
-            meshes -> selected subgroups -> visible subgroups)."""
-            pairs = []
-            mesh_sel = self._selected_cage_meshes(base_name)
-            row_sel = _selected()
-            if mesh_sel:
-                for m in mesh_sel:
-                    sg = self._subgroup_for_cage_mesh(base_name, m)
-                    if sg in groups:
-                        pairs.append((m, groups[sg]['hp']))
-            elif row_sel:
-                for sg in row_sel:
-                    if sg in groups:
-                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
-                            pairs.append((cage, groups[sg]['hp']))
-            else:
-                for sg, meshes in groups.items():
-                    if any(cmds.objExists(hp) and cmds.getAttr(hp + ".visibility") for hp in meshes.get('hp', [])):
-                        for cage in self._cage_meshes_for_subgroup(base_name, sg):
-                            pairs.append((cage, meshes['hp']))
-            return pairs
-
-        # Bipolar jog (centre = 0), same live real-time behaviour and cubic
-        # (scale-adaptive) response as Expansion: fine control near the centre,
-        # coarse near the ends, applied smoothly while the handle moves.
-        ix_row, ix_spin, ix_slider, ix_sync = self._make_cage_slider_row(
-            -infl_hi, infl_hi, 0.0, decimals, infl_step, curve=3.0)
-        ix_spin.setProperty("bg_help_id", "cage.inflation")
-        ix_slider.setProperty("bg_help_id", "cage.inflation")
-
-        def do_find_intersections():
-            pairs = _scoped_cage_hp_pairs()
-            self._cage_islands = {}
-            self._cage_island_stamps = {}
-            faces_sel = []
-            n_isl = 0
-            failures = []
-            cmds.refresh(suspend=True)
-            try:
-                for cage, hp_nodes in pairs:
-                    try:
-                        lp = bg_cage.CageProcessor.source_lp(cage)
-                        bg_cage.CageProcessor.validate_pair(lp, cage)
-                        isls = bg_cage.CageProcessor.find_hp_intersection_islands(cage, hp_nodes)
-                    except Exception as exc:
-                        failures.append(str(exc))
-                        continue
-                    if isls:
-                        self._cage_islands[cage] = isls
-                        self._cage_island_stamps[cage] = {
-                            'cage': bg_cage.CageProcessor.geometry_stamp(cage),
-                            'hp': [(hp, bg_cage.CageProcessor.geometry_stamp(
-                                hp, allow_instances=True)) for hp in hp_nodes]}
-                        n_isl += len(isls)
-                        for isl in isls:
-                            faces_sel.extend("{}.f[{}]".format(cage, f) for f in isl['faces'])
-            finally:
-                cmds.refresh(suspend=False)
-            _recenter(ix_spin, ix_slider)  # start the jog from the centre
-            if failures:
-                self._cage_islands = {}
-                self._cage_island_stamps = {}
-                status.setText(bg_l10n.text("Cage scan incomplete.") + " " + "; ".join(failures))
-                cmds.warning(status.text())
-            elif faces_sel:
-                try:
-                    cmds.select(faces_sel, replace=True)
-                except Exception:
-                    pass
-                status.setText(bg_l10n.text("Found {n} intersection island(s).").format(n=n_isl))
-            else:
-                cmds.select(clear=True)
-                status.setText(bg_l10n.text("No detected intersections. Check coplanar contacts manually."))
-
-        # Normal move jogs the found islands LIVE while the handle moves, exactly
-        # like Expansion, so the touch-up is smooth at any scale. Incremental and
-        # reversible (move_islands along a fixed object-space normal).
-        nmove = {'last': 0.0, 'transaction': None, 'error': None}
-
-        def normal_begin():
-            if nmove['transaction'] is not None:
-                return
-            nmove['last'] = 0.0
-            nmove['error'] = None
-            if getattr(self, '_cage_islands', None):
-                try:
-                    self._validate_cage_island_cache()
-                    nmove['transaction'] = MeshEditTransaction("CageNormalMove")
-                    for cage in self._cage_islands:
-                        nmove['transaction'].capture(cage)
-                except Exception as exc:
-                    nmove['transaction'] = None
-                    self._cage_islands = {}
-                    status.setText(str(exc))
-                    cmds.warning(str(exc))
-
-        def normal_live():
-            if ix_sync['syncing']:
-                return
-            if nmove['transaction'] is None:
-                normal_begin()
-            islands_map = getattr(self, '_cage_islands', None) or {}
-            if not islands_map or nmove['transaction'] is None:
-                return
-            cur = ix_spin.value()
-            delta = cur - nmove['last']
-            if abs(delta) < 1e-9:
-                return
-            nmove['last'] = cur
-            try:
-                for cage, isls in islands_map.items():
-                    bg_cage.CageProcessor.move_islands(
-                        cage, isls, delta, transaction=nmove['transaction'])
-            except Exception as exc:
-                nmove['transaction'].cancel()
-                nmove['transaction'] = None
-                self._cage_islands = {}
-                status.setText(str(exc))
-                cmds.warning(str(exc))
-            if not ix_slider.isSliderDown():
-                normal_idle.start(180)
-
-        def normal_end():
-            normal_idle.stop()
-            with bg_core.undo_chunk("CageNormalMove"):
-                changed = commit_edit(nmove)
-                if changed:
-                    self._refresh_cage_island_stamps()
-                if changed and getattr(self, '_cage_islands', None):
-                    self._ensure_cage_visible(pair)
-            _recenter(ix_spin, ix_slider)
-            nmove['last'] = 0.0
-
-        def normal_spin_commit():
-            if abs(ix_spin.value()) < 1e-9:
-                _recenter(ix_spin, ix_slider)
-                return
-            normal_begin()
-            normal_live()
-            normal_end()
-
-        normal_idle = QtCore.QTimer(panel)
-        normal_idle.setSingleShot(True)
-        normal_idle.timeout.connect(normal_end)
-
-        def finish_transactions(*_args):
-            for timer in (expansion_idle, normal_idle):
-                try:
-                    timer.stop()
-                except RuntimeError:
-                    pass
-            for state in (expo, nmove):
-                transaction = state['transaction']
-                if transaction:
-                    try:
-                        transaction.commit()
-                    except Exception as exc:
-                        cmds.warning(str(exc))
-                    finally:
-                        state['transaction'] = None
-        self._cage_finish_edits = finish_transactions
-        panel.destroyed.connect(finish_transactions)
-
-        ix_slider.sliderPressed.connect(normal_begin)
-        ix_slider.valueChanged.connect(normal_live)
-        ix_slider.sliderReleased.connect(normal_end)
-        ix_spin.editingFinished.connect(normal_spin_commit)
-
-        btn_find = _square_btn("Cage_Find.png", "Find intersections")
-        btn_find.clicked.connect(do_find_intersections)
-
-        # No Back button here anymore - the main Export Settings Back button
-        # (top toolbar) already leaves this panel too (exit_cage_config).
-        btn_clear = _square_btn("Cage_Delete.png", "Delete Cage")
-        btn_clear.clicked.connect(lambda: (self.run_undoable_bg_action("Clear Cage", self.clear_active_cage),
-                                           self.sync_toggle_buttons(hp_main, lp_main),
-                                           status.setText(bg_l10n.text("Cage cleared."))))
-
-        btn_export_cage = _square_btn("Cage_Export.png", "Export Cage")
-        btn_export_cage.clicked.connect(self.export_active_cage)
-
-        # --- Assemble the panel in final visual order ------------------------
-        # Build/sculpt/look buttons sit directly under the header, then the
-        # Expansion jog. Find + Export Cage + Clear share one row above the
-        # Normal move jog. Status line pinned to the bottom.
-        outer.addLayout(_btn_row(btn_create, btn_brush, btn_display))
-        add_labeled("Expansion (inflate)", inflate_row)
-        outer.addWidget(btn_fit)  # hidden, kept for later
-        outer.addLayout(_btn_row(btn_find, btn_export_cage, btn_clear))
-        add_labeled("Normal move", ix_row)
-        outer.addStretch(1)
-        outer.addWidget(status)
-
-        # No auto-build on entry: the artist presses Create Cage explicitly.
-        if not bg_cage.CageProcessor.get_chapter_cage_meshes(base_name):
-            status.setText(bg_l10n.text("No cage yet - press Create Cage."))
-        else:
-            self._ensure_cage_visible(pair)
-            status.setText("")
-
-        bg_l10n.localize_widget_tree(panel)
-        return panel
-
-    @staticmethod
-    def _set_visible(node, state):
-        try:
-            if node and cmds.objExists(node) and cmds.attributeQuery('visibility', node=node, exists=True):
-                attr = node + ".visibility"
-                # Skip the setAttr when already correct - this runs on the whole
-                # cage subtree on every Expansion tweak / Create Cage, and it is
-                # almost always already visible, so avoiding a no-op dirty/notify
-                # pass on every node is a real, cheap win.
-                if bool(cmds.getAttr(attr)) != bool(state):
-                    cmds.setAttr(attr, bool(state))
-        except Exception:
-            pass
-
-    def _ensure_cage_visible(self, pair):
-        """Set up the chapter cage hierarchy (mirrored folders and all cage
-        meshes) plus its parents visible, mirror the per-subgroup 'Vis' state
-        onto the cages, then pin the CHAPTER GROUP to the session-wide Cage
-        Vis/Hid preference as the final word - so a cage the artist hid stays
-        hidden across Expansion, Sculpt, chapter switches, etc. Callers that must
-        force the cage on (Create Cage, entering Export Settings) set
-        ``cage_vis_pref = True`` first."""
-        base_name = pair.get('base', 'Chapter')
-        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if not cmds.objExists(chapter):
-            return
-        # Folders + meshes under the chapter. Their effective visibility is still
-        # gated by the chapter group, which is pinned to the preference below.
-        for node in cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []:
-            self._set_visible(node, True)
-        # Parents up to the root always visible so the chapter CAN show at all.
-        parents = cmds.listRelatives(chapter, parent=True, fullPath=True)
-        node = parents[0] if parents else None
-        while node and cmds.objExists(node):
-            self._set_visible(node, True)
-            parents = cmds.listRelatives(node, parent=True, fullPath=True)
-            node = parents[0] if parents else None
-        # Mirror the current per-subgroup Vis state onto the cages (this can flip
-        # the chapter group via a mesh's immediate parent) ...
-        self._sync_cage_visibility_to_subgroups(pair)
-        # ... so pin the chapter group to the Cage Vis/Hid preference LAST.
-        self._set_visible(chapter, bool(getattr(self, 'cage_vis_pref', True)))
-        # The cage is built AFTER isolation is set up, so add it to the active
-        # isolate set now or it would stay hidden / out of sync in isolation.
-        self._isolate_add_cage(pair)
-
-    def _isolate_add_cage(self, pair):
-        """Add the chapter cage to every isolated model panel's view set - but
-        only where it isn't already there, and only actually redraw ('update')
-        the panels that changed. This is called on every Expansion tweak /
-        Create Cage, and 'isolateSelect -update' forces a real, un-suspended
-        viewport redraw per panel - re-running it when the isolate set is
-        already correct was the main cost behind the multi-second Create Cage
-        delay in a real Maya session with several viewports open."""
-        base_name = pair.get('base', 'Chapter')
-        cage_grp = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if not cmds.objExists(cage_grp):
-            return
-        to_update = []
-        for panel in cmds.getPanel(type='modelPanel') or []:
-            try:
-                if not cmds.isolateSelect(panel, query=True, state=True):
-                    continue
-                iso_set = cmds.isolateSelect(panel, q=True, viewObjects=True)
-                set_name = iso_set[0] if isinstance(iso_set, list) else iso_set
-                if set_name and cmds.objExists(set_name) and cmds.sets(cage_grp, isMember=set_name):
-                    continue  # already isolated - nothing to do for this panel
-                cmds.isolateSelect(panel, addDagObject=cage_grp)
-                to_update.append(panel)
-            except Exception:
-                pass
-        if not to_update:
-            return
-        cmds.refresh(suspend=True)
-        try:
-            for panel in to_update:
-                cmds.isolateSelect(panel, update=True)
-        finally:
-            cmds.refresh(suspend=False)
-
-    def _cage_meshes_for_subgroup(self, base_name, display_name):
-        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if not cmds.objExists(chapter):
-            return []
-        prefix = "{}_{}_low".format(base_name, display_name)
-        out = []
-        for tr in cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or []:
-            lp = bg_cage.CageProcessor.source_lp(tr)
-            short = (lp or tr).split('|')[-1]
-            if short.startswith(prefix) \
-                    and cmds.listRelatives(tr, shapes=True, type='mesh'):
-                out.append(tr)
-        return out
-
-    @staticmethod
-    def _subgroup_for_cage_mesh(base_name, mesh):
-        """Display name of the subgroup a cage mesh belongs to, parsed from its
-        name ({base}_{sg}_low..._cage) - same convention as
-        _collect_cage_subgroups. None if it doesn't match."""
-        source = bg_cage.CageProcessor.source_lp(mesh)
-        short = (source or mesh).split('|')[-1]
-        prefix = base_name + '_'
-        if not short.startswith(prefix):
-            return None
-        rest = short[len(prefix):]
-        if '_low' not in rest:
-            return None
-        return rest.split('_low')[0]
-
-    def _validate_cage_island_cache(self):
-        stamps = getattr(self, '_cage_island_stamps', {})
-        for cage in getattr(self, '_cage_islands', {}):
-            saved = stamps.get(cage)
-            if (not saved or
-                    saved['cage'] != bg_cage.CageProcessor.geometry_stamp(cage) or
-                    any(stamp != bg_cage.CageProcessor.geometry_stamp(hp, allow_instances=True)
-                        for hp, stamp in saved['hp'])):
-                raise ValueError(bg_l10n.text("Cage or HP changed. Run Find intersections again."))
-            bg_cage.CageProcessor.validate_pair(bg_cage.CageProcessor.source_lp(cage), cage)
-
-    def _refresh_cage_island_stamps(self):
-        for cage, saved in getattr(self, '_cage_island_stamps', {}).items():
-            if cmds.objExists(cage):
-                saved['cage'] = bg_cage.CageProcessor.geometry_stamp(cage)
-
-    def _selected_cage_meshes(self, base_name):
-        """Cage meshes of this chapter that are directly selected in the
-        viewport right now (as opposed to a subgroup row picked in the panel).
-        Lets Expansion target just a piece of a subgroup's cage."""
-        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if not cmds.objExists(chapter):
-            return []
-        chapter_prefix = chapter + "|"
-        hits = []
-        for node in cmds.ls(selection=True, long=True) or []:
-            if not node.startswith(chapter_prefix):
-                continue
-            short = node.split('|')[-1]
-            if (short.endswith(bg_cage.SUFFIX_CAGE) or cmds.attributeQuery(
-                    bg_cage.SOURCE_ATTR, node=node, exists=True)) and cmds.listRelatives(
-                    node, shapes=True, type='mesh'):
-                hits.append(node)
-        return hits
-
-    def set_cage_subgroup_visibility(self, base_name, display_name, visible):
-        for cage in self._cage_meshes_for_subgroup(base_name, display_name):
-            self._set_visible(cage, visible)
-            if visible:
-                parent = cmds.listRelatives(cage, parent=True, fullPath=True)
-                if parent:
-                    self._set_visible(parent[0], True)
-
-    def _sync_cage_visibility_to_subgroups(self, pair):
-        """Cages follow their subgroup's HP visibility: a subgroup hidden via
-        'Vis' hides its cage too. Scans the cage hierarchy ONCE (instead of once
-        per subgroup, which is what repeatedly calling set_cage_subgroup_visibility
-        /_cage_meshes_for_subgroup would do) - this runs on every Expansion
-        tweak / Create Cage, so re-scanning per subgroup was a real cost."""
-        base_name = pair.get('base', 'Chapter')
-        chapter = bg_cage.CageProcessor.cage_group_for_chapter(base_name)
-        if not cmds.objExists(chapter):
-            return
-        widgets = [wd for wd in (getattr(self, 'final_mesh_widgets', []) or [])
-                   if any(cmds.objExists(n) for n in wd.get('hp_nodes', []))]
-        if not widgets:
-            return
-        all_cage_meshes = [
-            tr for tr in (cmds.listRelatives(chapter, allDescendents=True, fullPath=True, type='transform') or [])
-            if tr.split('|')[-1].endswith(bg_cage.SUFFIX_CAGE) and cmds.listRelatives(tr, shapes=True, type='mesh')
-        ]
-        for widget_data in widgets:
-            hp_nodes = [n for n in widget_data.get('hp_nodes', []) if cmds.objExists(n)]
-            visible = bool(cmds.getAttr(hp_nodes[0] + ".visibility"))
-            prefix = "{}_{}_low".format(base_name, widget_data.get('subgroup_name'))
-            for cage in all_cage_meshes:
-                if not cage.split('|')[-1].startswith(prefix):
-                    continue
-                self._set_visible(cage, visible)
-                if visible:
-                    parent = cmds.listRelatives(cage, parent=True, fullPath=True)
-                    if parent:
-                        self._set_visible(parent[0], True)
-
-    def enter_cage_config(self):
-        pair = self._active_pair()
-        if not pair:
-            return cmds.warning("No active chapter selected.")
-        container = getattr(self, 'cage_container', None)
-        if container is None:
-            # Fallback if the cage slot is unavailable for any reason.
-            return self.rebuild_active_cage()
-        # Remember the splitter layout before we reshape it (only on first entry,
-        # not on the in-place rebuilds done for language changes).
-        was_active = getattr(self, 'is_cage_config', False)
-        # Rebuild the panel fresh so it reflects the active chapter's settings
-        # and the current language.
         layout = container.layout()
-        old = getattr(self, 'cage_panel', None)
-        if old is not None:
-            layout.removeWidget(old)
-            old.deleteLater()
-        self.cage_panel = self.build_cage_settings_panel(pair)
-        layout.addWidget(self.cage_panel)
-        # Export panel lives right below the cage panel.
-        exp_container = getattr(self, 'export_container', None)
-        if exp_container is not None:
-            elayout = exp_container.layout()
-            eold = getattr(self, 'export_panel', None)
-            if eold is not None:
-                elayout.removeWidget(eold)
-                eold.deleteLater()
-            self.export_panel = self.build_export_panel(pair)
-            elayout.addWidget(self.export_panel)
-            exp_container.setVisible(True)
-        # Show the cage panel under the Table of Contents.
-        if not was_active and hasattr(self, 'right_splitter'):
-            self._saved_right_sizes = self.right_splitter.sizes()
-        container.setVisible(True)
-        self.is_cage_config = True
-        # Keep the cage panel only as tall as its content. Deferred so the
-        # panel's sizeHint is valid after this layout pass.
-        QtCore.QTimer.singleShot(0, self._fit_cage_split)
-
-    def _fit_cage_split(self):
-        if not getattr(self, 'is_cage_config', False):
-            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.export_panel = self.build_export_panel(pair)
+        layout.addWidget(self.export_panel)
+        container.show()
         splitter = getattr(self, 'right_splitter', None)
-        cage_panel = getattr(self, 'cage_panel', None)
-        export_panel = getattr(self, 'export_panel', None)
-        if splitter is None or cage_panel is None:
-            return
-        total = splitter.height()
-        if total <= 0:
-            return
-        cage_h = cage_panel.sizeHint().height()
-        exp_h = export_panel.sizeHint().height() if export_panel is not None else 0
-        bottom = cage_h + exp_h
-        if bottom > total - 120 and bottom > 0:
-            scale = max(total - 120, 200) / float(bottom)
-            cage_h = int(cage_h * scale)
-            exp_h = int(exp_h * scale)
-        toc_h = max(120, total - cage_h - exp_h)
-        # [Table of Contents, Cage panel, Export panel]
-        splitter.setSizes([toc_h, cage_h, exp_h])
+        if splitter is not None:
+            height = max(400, splitter.height())
+            export_height = self.export_panel.sizeHint().height()
+            splitter.setSizes([max(120, height - export_height), export_height])
 
-    def exit_cage_config(self):
-        finish = getattr(self, '_cage_finish_edits', None)
-        if finish:
-            finish()
-        self.is_cage_config = False
-        container = getattr(self, 'cage_container', None)
+    def hide_export_settings_panel(self):
+        container = getattr(self, 'export_container', None)
         if container is not None:
-            container.setVisible(False)
-        exp_container = getattr(self, 'export_container', None)
-        if exp_container is not None:
-            exp_container.setVisible(False)
-        # Restore the splitter proportions from before cage config.
-        saved = getattr(self, '_saved_right_sizes', None)
-        if saved and hasattr(self, 'right_splitter'):
-            try:
-                self.right_splitter.setSizes(saved)
-            except Exception:
-                pass
-            self._saved_right_sizes = None
+            container.hide()
 
     def on_final_smooth_combo_changed(self, triggered_name, new_level, full_prefix, combo_widget):
         # Keep both key forms during the migration from the old short-name-only
@@ -4850,11 +3373,6 @@ class FinalViewMixin:
             return
         current_state = cmds.getAttr(valid_nodes[0] + ".visibility")
         new_state = not current_state
-        # Cages follow their subgroup: hide the cage when the subgroup is hidden.
-        if display_name:
-            pair = self._active_pair()
-            if pair:
-                self.set_cage_subgroup_visibility(pair.get('base', ''), display_name, new_state)
         for node in valid_nodes:
             cmds.setAttr(node + ".visibility", new_state)
             if new_state:
@@ -4883,7 +3401,7 @@ class FinalViewMixin:
 
     def isolate_final_hp_vis(self, display_name):
         """Right-click on a Final-view Vis button: show ONLY this subgroup (its
-        HP AND its cage), hide the others. If it is already the only one shown,
+        HP meshes), hide the others. If it is already the only one shown,
         reveal everything again - mirrors the base-mode isolate."""
         pair = self._active_pair()
         if not pair:
@@ -4905,7 +3423,6 @@ class FinalViewMixin:
             vis = bool(show_all or name == display_name)
             nodes = [n for n in wd.get('hp_nodes', []) if cmds.objExists(n)]
             self._set_final_hp_vis(nodes, vis)
-            self.set_cage_subgroup_visibility(base, name, vis)
             btn = wd.get('btn_vis')
             if btn:
                 btn.setIcon(get_icon("open_eye.png" if vis else "close_eye.png"))
@@ -4975,7 +3492,7 @@ class ExportMixin:
         return pair.get('id') if pair and pair.get('id') is not None else id(pair)
 
     def _prepare_export_snapshots(self, pairs, finalize_names=True, final_widgets_by_key=None):
-        """Collect each chapter once and reuse it across preflight/HP/LP/Cage."""
+        """Collect each chapter once and reuse it across preflight/HP/LP."""
         snapshots = {}
         seen = set()
         for pair in self._included_export_pairs(pairs):
@@ -4997,8 +3514,6 @@ class ExportMixin:
                 if cmds.listRelatives(
                     node, shapes=True, type='mesh', noIntermediate=True)
             ] if lp_main and cmds.objExists(lp_main) else []
-            snapshot['cage_meshes'] = bg_cage.CageProcessor.get_chapter_cage_meshes(
-                pair.get('base', 'Chapter'))
             snapshot['material_names'] = None
             snapshots[key] = snapshot
         return snapshots
@@ -5038,8 +3553,6 @@ class ExportMixin:
         if not export_dirs:
             return
         export_dir = export_dirs[0]
-        # Remember the chosen folder on the chapter so the standalone Export Cage
-        # button can reuse it without prompting again.
         pair['export_dir'] = export_dir
         bg_core.BakeSessionModel.save(self.root_pairs)
         self.save_final_smooth_states()
@@ -5054,15 +3567,9 @@ class ExportMixin:
                         freeze_lp_normals=self._export_freeze_normals_enabled()):
                     self.log("Suspended viewport isolation for export...", "lightblue")
                     if mode == 'separate':
-                        exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                            base_name, hp_main, lp_main, widgets, parent_window=self, mode='hp', export_dir=export_dir,
-                            smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
-                        )
-                        exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                            base_name, hp_main, lp_main, widgets, parent_window=self, mode='lp', export_dir=export_dir,
-                            smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
-                        )
-                        if exp_hp or exp_lp:
+                        if self._export_requested_chapter_parts(
+                                snapshot, [snapshot], ('hp', 'lp'), export_dir, None,
+                                None, None, None, True):
                             cmds.inViewMessage(amg="Chapter exported: Separate HP and LP", pos='midCenter', fade=True)
                     else:
                         exported_name = bg_final_export.FinalExportProcessor.export_chapter(
@@ -5072,10 +3579,6 @@ class ExportMixin:
                         if exported_name:
                             cmds.inViewMessage(amg="Chapter exported: {}.fbx".format(exported_name), pos='midCenter', fade=True)
 
-                    # No separate Export Cage button anymore: whenever a cage exists
-                    # for this chapter and its "export cage" flag is on,
-                    # it goes out too - always as its own {base}_cage.fbx file.
-                    self.export_chapter_cage_if_enabled(pair, export_dir, snapshot=snapshot)
 
     def batch_export_book(self, mode='separate'):
         if not self.active_root_id:
@@ -5111,15 +3614,9 @@ class ExportMixin:
                         base_name = pair.get('base', 'Chapter_Export')
                         snapshot = self._snapshot_for_pair(snapshots, pair)
                         if mode == 'separate':
-                            exp_hp = bg_final_export.FinalExportProcessor.export_chapter(
-                                base_name, hp_main, lp_main, [], parent_window=self, mode='hp', export_dir=export_dir,
-                                smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
-                            )
-                            exp_lp = bg_final_export.FinalExportProcessor.export_chapter(
-                                base_name, hp_main, lp_main, [], parent_window=self, mode='lp', export_dir=export_dir,
-                                smooth_states=pair.get('final_smooth_states', {}), prepared_chapters=[snapshot]
-                            )
-                            if exp_hp or exp_lp:
+                            if self._export_requested_chapter_parts(
+                                    snapshot, [snapshot], ('hp', 'lp'), export_dir, None,
+                                    None, None, None, True):
                                 success_count += 1
                         else:
                             exported = bg_final_export.FinalExportProcessor.export_chapter(
@@ -5128,10 +3625,8 @@ class ExportMixin:
                             )
                             if exported:
                                 success_count += 1
-                        # Same as the single-chapter export: cage goes out too, as
-                        # its own file, whenever it exists and is enabled.
-                        self.export_chapter_cage_if_enabled(pair, export_dir, snapshot=snapshot)
-        cmds.inViewMessage(amg="Export of book '{}' completed: {} chapters!".format(active_book, success_count), pos='midCenter', fade=True)
+        cmds.inViewMessage(amg="Book '{}': {} of {} chapters fully exported.".format(
+            active_book, success_count, len(book_pairs)), pos='midCenter', fade=True)
 
     def export_by_material(self, scope='active'):
         """Export by material. Per book: if the BOOK name matches one of the LP
@@ -5181,11 +3676,11 @@ class ExportMixin:
         cmds.inViewMessage(amg="Export by material: {} FBX pair(s) written.".format(total), pos='midCenter', fade=True)
 
     def _export_book_by_material(self, book, export_dir, inc_hp=True, inc_lp=True,
-                                 inc_cage=True, snapshots=None,
+                                 snapshots=None,
                                  status_callback=None, file_callback=None,
                                  cancel_check=None, external_hp_obj=True):
         """Export one book by material. If the book name IS a material, merge all
-        chapters into one {book}_HP/LP/cage; otherwise the book is a container so
+        chapters into one {book}_HP/LP; otherwise the book is a container so
         each chapter goes out on its own (named by chapter). ``inc_*`` pick which
         parts to write. Returns how many chapters/files groups were written."""
         book_pairs = self._included_export_pairs(
@@ -5207,33 +3702,10 @@ class ExportMixin:
         file_base = self._sanitize_export_name(book)
 
         if book_is_material:
-            primary = chapters[0]
-            wrote = False
-            if inc_hp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
-                    primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='hp',
-                    export_dir=export_dir, smooth_states=primary['smooth'],
-                    export_name_override=file_base, prepared_chapters=chapters,
-                    status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check,
-                    external_hp_obj=external_hp_obj):
-                wrote = True
-            if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
-                    primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode='lp',
-                    export_dir=export_dir, smooth_states=primary['smooth'],
-                    export_name_override=file_base, prepared_chapters=chapters,
-                    status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check):
-                wrote = True
-            if inc_cage and not (cancel_check and cancel_check()):
-                if self._export_book_cage_merged(
-                        chapters, file_base, export_dir,
-                        status_callback=status_callback,
-                        file_callback=file_callback):
-                    wrote = True
-            if wrote:
-                self.log("Export by material: book '{}' (material) -> {}_*.fbx.".format(book, file_base), "lightgreen")
-                return 1
-            return 0
+            modes = [mode for mode, include in (('hp', inc_hp), ('lp', inc_lp)) if include]
+            return int(self._export_requested_chapter_parts(
+                chapters[0], chapters, modes, export_dir, file_base,
+                status_callback, file_callback, cancel_check, external_hp_obj))
 
         # Container book -> each chapter as its own file (named by chapter).
         done = 0
@@ -5241,7 +3713,7 @@ class ExportMixin:
             if cancel_check and cancel_check():
                 break
             if self._export_chapter_files(
-                    ch['pair'], export_dir, inc_hp, inc_lp, inc_cage,
+                    ch['pair'], export_dir, inc_hp, inc_lp,
                     single=False, snapshot=ch, status_callback=status_callback,
                     file_callback=file_callback, cancel_check=cancel_check,
                     external_hp_obj=external_hp_obj):
@@ -5249,115 +3721,53 @@ class ExportMixin:
         self.log("Export by material: book '{}' (container) -> {} chapter(s).".format(book, done), "lightgreen")
         return done
 
-    def _export_book_cage_merged(self, chapters, file_base, export_dir,
-                                 status_callback=None, file_callback=None):
-        """Merge every chapter's cage into one {file_base}_cage.fbx (used when a
-        book is exported as a single material file)."""
-        cage_meshes = []
-        for ch in chapters:
-            if ch.get('cage_meshes') and not self._validate_cage_export(
-                    ch['pair'], ch['cage_meshes'], ch):
-                return False
-            cage_meshes.extend(ch.get('cage_meshes') or [])
-        if not cage_meshes:
-            return False
-        export_name = "{}_cage".format(file_base)
-        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-        if status_callback:
-            status_callback(bg_l10n.text("Preparing: {name}").format(name=export_name))
-        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
-            if file_callback:
-                file_callback(export_name)
-            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
-            return True
-        else:
-            cmds.warning("Cage export failed for '{}'.".format(file_base))
-            return False
 
-    def _export_chapter_cage(self, pair, export_dir, snapshot=None,
-                             status_callback=None, file_callback=None):
-        """Export the chapter's cage as {base}_cage.fbx (triangulated). Cage
-        inclusion is now decided by the Export panel's Cage checkbox, so this
-        always exports when a cage exists (no per-chapter flag)."""
-        if pair.get('export_excluded', False):
-            return False
-        base_name = pair.get('base', 'Chapter')
-        cage_meshes = (snapshot.get('cage_meshes', []) if snapshot is not None
-                       else bg_cage.CageProcessor.get_chapter_cage_meshes(base_name))
-        if not cage_meshes:
-            return False
-        if not self._validate_cage_export(pair, cage_meshes, snapshot):
-            return False
-        export_name = "{}_cage".format(base_name)
-        export_path = "{}/{}.fbx".format(export_dir.rstrip('/\\'), export_name).replace('\\', '/')
-        if status_callback:
-            status_callback(bg_l10n.text("Preparing: {name}").format(name=export_name))
-        if self._export_meshes_with_lp_triangulation(cage_meshes, export_path):
-            if file_callback:
-                file_callback(export_name)
-            self.log("Cage exported: {}.fbx".format(export_name), "lightgreen")
-            return True
-        cmds.warning("Cage export failed for chapter '{}'.".format(base_name))
-        return False
-
-    def _validate_cage_export(self, pair, cage_meshes, snapshot=None):
-        try:
-            if snapshot is not None:
-                lp_nodes = snapshot.get('lp_all') or []
-            else:
-                _hp, lp_root, _group = self.core.resolve_main_nodes(pair)
-                lp_nodes = bg_final_export.FinalExportProcessor.get_valid_mesh_transforms(lp_root)
-            bg_cage.CageProcessor.validate_export_pairs(lp_nodes, cage_meshes)
-            return True
-        except Exception as exc:
-            cmds.warning(str(exc))
-            self.log(str(exc), "red")
-            return False
-
-    def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp, inc_cage,
+    def _export_chapter_files(self, pair, export_dir, inc_hp, inc_lp,
                               single, snapshot=None, status_callback=None,
                               file_callback=None, cancel_check=None,
                               external_hp_obj=True):
         """Export one chapter's requested parts. ``single`` merges HP+LP into one
         file only when both are included; otherwise HP and LP go to separate
-        files. Returns True if anything was written."""
+        files. Returns True when every requested part was written."""
         if pair.get('export_excluded', False):
             return False
         if snapshot is None:
             snapshot = self._snapshot_for_pair(self._prepare_export_snapshots([pair]), pair)
-        hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
-        if not hp_main or not lp_main:
+        if not snapshot or not snapshot.get('hp') or not snapshot.get('lp'):
             return False
-        base_name = pair.get('base', 'Chapter')
-        smooth = pair.get('final_smooth_states', {})
-        wrote = False
+        modes = [mode for mode, include in (('hp', inc_hp), ('lp', inc_lp)) if include]
         if single and inc_hp and inc_lp and not external_hp_obj:
-            if bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, [], parent_window=self, mode='both',
-                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
-                    status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check,
-                    external_hp_obj=external_hp_obj):
-                wrote = True
-        else:
-            if inc_hp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, [], parent_window=self, mode='hp',
-                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
-                    status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check,
-                    external_hp_obj=external_hp_obj):
-                wrote = True
-            if inc_lp and not (cancel_check and cancel_check()) and bg_final_export.FinalExportProcessor.export_chapter(
-                    base_name, hp_main, lp_main, [], parent_window=self, mode='lp',
-                    export_dir=export_dir, smooth_states=smooth, prepared_chapters=[snapshot],
-                    status_callback=status_callback, file_callback=file_callback,
-                    cancel_check=cancel_check):
-                wrote = True
-        if inc_cage and not (cancel_check and cancel_check()) and self._export_chapter_cage(
-                pair, export_dir, snapshot=snapshot,
-                status_callback=status_callback, file_callback=file_callback):
-            wrote = True
-        return wrote
+            modes = ['both']
+        return self._export_requested_chapter_parts(
+            snapshot, [snapshot], modes, export_dir, None,
+            status_callback, file_callback, cancel_check, external_hp_obj)
+
+    def _export_requested_chapter_parts(self, primary, chapters, modes, export_dir, name_override,
+                                        status_callback, file_callback, cancel_check, external_hp_obj):
+        written = []
+        remaining = []
+        for mode in modes:
+            if cancel_check and cancel_check():
+                remaining.append(mode.upper())
+                continue
+            output = bg_final_export.FinalExportProcessor.export_chapter(
+                primary['base'], primary['hp'], primary['lp'], [], parent_window=self, mode=mode,
+                export_dir=export_dir, smooth_states=primary.get('smooth', {}),
+                export_name_override=name_override, prepared_chapters=chapters,
+                status_callback=status_callback, file_callback=file_callback,
+                cancel_check=cancel_check, external_hp_obj=external_hp_obj)
+            if output:
+                written.append(mode.upper())
+            else:
+                remaining.append(mode.upper())
+
+        if remaining:
+            name = name_override or primary['base']
+            message = "FBX export incomplete for {}. Written: {}. Missing from this run: {}.".format(
+                name, ", ".join(written) or "none", ", ".join(remaining))
+            self.log(message, "orange")
+            cmds.warning(message)
+        return bool(modes) and not remaining
 
     def _scene_name_base(self):
         scene = cmds.file(query=True, sceneName=True) or ""
@@ -5391,7 +3801,7 @@ class ExportMixin:
         return name
 
     def build_export_panel(self, pair):
-        """Docked Export panel (under Cage Settings, Export Settings mode only).
+        """Docked Export panel (under the Table of Contents).
         Replaces the old right-click export menu."""
         panel = QtWidgets.QWidget()
         panel.setProperty("bg_help_id", "export.settings")
@@ -5419,26 +3829,11 @@ class ExportMixin:
             "QComboBox QAbstractItemView { background-color: #223528; color: #eaeaea; selection-background-color: #367046; }")
         outer.addWidget(self.exp_scope)
 
-        _lbl("Target")
-        self.exp_target = QtWidgets.QComboBox()
-        self.exp_target.setProperty("bg_help_id", "export.target")
-        self.exp_target.addItems(["Standard FBX", "Marmoset Toolbag"])
-        outer.addWidget(self.exp_target)
-
         _lbl("Include")
         inc_row = QtWidgets.QHBoxLayout()
         self.exp_inc_hp = QtWidgets.QCheckBox("HP"); self.exp_inc_hp.setChecked(True)
         self.exp_inc_lp = QtWidgets.QCheckBox("LP"); self.exp_inc_lp.setChecked(True)
-        self.exp_inc_cage = QtWidgets.QCheckBox(bg_l10n.text("Cage"))
-        pair = self._active_pair() if callable(getattr(self, '_active_pair', None)) else None
-        cage_enabled = bool((pair or {}).get('cage_settings', {}).get('export_enabled', False))
-        if cage_enabled and pair:
-            cage_enabled = bool(bg_cage.CageProcessor.get_chapter_cage_meshes(
-                pair.get('base', 'Chapter')))
-        self.exp_inc_cage.setChecked(cage_enabled)
-        self._standard_cage_include = cage_enabled
-        self._marmoset_target_active = False
-        for w in (self.exp_inc_hp, self.exp_inc_lp, self.exp_inc_cage):
+        for w in (self.exp_inc_hp, self.exp_inc_lp):
             w.setProperty("bg_help_id", "export.files")
             inc_row.addWidget(w)
         inc_row.addStretch(1)
@@ -5486,10 +3881,7 @@ class ExportMixin:
                 cb.setEnabled(not is_chapter)
                 if is_chapter:
                     cb.setChecked(False)
-            self._update_export_target_controls()
         self.exp_scope.currentIndexChanged.connect(lambda _idx: _update_scope_flags())
-        self.exp_target.currentIndexChanged.connect(
-            lambda _idx: self._update_export_target_controls())
         _update_scope_flags()
 
         self.exp_status = QtWidgets.QLabel("")
@@ -5503,209 +3895,13 @@ class ExportMixin:
         # set with bg_l10n.text() and the panel rebuilds on language change.
         return panel
 
-    def _update_export_target_controls(self):
-        """Keep the Toolbag workflow one-click and prevent incompatible flags."""
-        if not hasattr(self, 'exp_target'):
-            return
-        is_marmoset = self.exp_target.currentIndex() == 1
-        if is_marmoset:
-            if not getattr(self, '_marmoset_target_active', False):
-                self._standard_cage_include = self.exp_inc_cage.isChecked()
-            self.exp_inc_cage.setChecked(False)
-            self.exp_files_sep.setChecked(True)
-            self.exp_bymat.setChecked(False)
-            self.exp_lp_one.setChecked(False)
-        elif getattr(self, '_marmoset_target_active', False):
-            self.exp_inc_cage.setChecked(bool(getattr(self, '_standard_cage_include', False)))
-        self._marmoset_target_active = is_marmoset
-        general_controls = (
-            getattr(self, 'exp_inc_cage', None),
-            getattr(self, 'exp_files_sep', None),
-            getattr(self, 'exp_files_one', None),
-        )
-        for control in general_controls:
-            if control is not None:
-                control.setEnabled(not is_marmoset)
-        self.exp_inc_hp.setEnabled(True)
-        self.exp_inc_lp.setEnabled(True)
-        self.exp_files_one.setEnabled(not is_marmoset)
-        is_chapter = (
-            hasattr(self, 'exp_scope') and self.exp_scope.currentIndex() == 0)
-        for control in (
-                getattr(self, 'exp_bymat', None),
-                getattr(self, 'exp_lp_one', None)):
-            if control is not None:
-                control.setEnabled(not is_marmoset and not is_chapter)
 
-    def _ask_marmoset_plugin_setup(self, status):
-        """Return install, export_only, or cancel from the Toolbag setup dialog."""
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(bg_l10n.text("Marmoset bridge setup"))
-        box.setIcon(QtWidgets.QMessageBox.Question)
-        box.setText(bg_l10n.text("Marmoset bridge install prompt" if
-                                  status["state"] == "missing" else
-                                  "Marmoset bridge update prompt"))
-        box.setInformativeText(status["destination"])
-        install_button = box.addButton(bg_l10n.text("Install bridge"),
-                                       QtWidgets.QMessageBox.AcceptRole)
-        export_button = box.addButton(bg_l10n.text("Export package only"),
-                                      QtWidgets.QMessageBox.ActionRole)
-        box.addButton(bg_l10n.text("Cancel"), QtWidgets.QMessageBox.RejectRole)
-        box.setDefaultButton(install_button)
-        box.exec_() if hasattr(box, 'exec_') else box.exec()
-        if box.clickedButton() == export_button:
-            return "export_only"
-        return "install" if box.clickedButton() == install_button else "cancel"
-
-    def _ensure_marmoset_plugin(self):
-        self._marmoset_bridge_ready = False
-        try:
-            status = bg_marmoset_bridge.toolbag_plugin_status()
-        except Exception as exc:
-            cmds.warning("Marmoset bridge is unavailable: {}".format(exc))
-            return False
-        if status["state"] == "current":
-            self._marmoset_bridge_ready = True
-            return True
-        choice = self._ask_marmoset_plugin_setup(status)
-        if choice == "export_only":
-            self.log("Marmoset package only; bridge not installed or updated.", "lightblue")
-            return True
-        if choice != "install":
-            return False
-        try:
-            plugin_path = bg_marmoset_bridge.install_toolbag_plugin()
-        except Exception as exc:
-            cmds.warning("Could not install Marmoset bridge: {}".format(exc))
-            return False
-        self.log("Marmoset bridge installed: {}".format(plugin_path), "lightblue")
-        self._marmoset_bridge_ready = True
-        return True
-
-    def _export_marmoset_package(self, targets, snapshots, inc_hp=True, inc_lp=True):
-        targets = self._included_export_pairs(targets)
-        if not targets:
-            return cmds.warning(bg_l10n.text("Nothing to export in this scope."))
-        if not self._ensure_marmoset_plugin():
-            return
-        export_dirs = cmds.fileDialog2(
-            fileMode=3, caption=bg_l10n.text("Select Marmoset Package Folder"))
-        if not export_dirs:
-            return
-        export_dir = export_dirs[0]
-        manifest_path = os.path.join(export_dir, bg_marmoset_bridge.MANIFEST_NAME)
-        connection = None
-        if self._marmoset_bridge_ready:
-            try:
-                connection = bg_marmoset_bridge.find_toolbag_project(
-                    manifest_path, cmds.file(query=True, sceneName=True) or "",
-                    process_events=QtWidgets.QApplication.processEvents)
-            except Exception as exc:
-                cmds.warning(str(exc))
-                return
-        import_new = False
-        if connection and connection.get("state") != "matching":
-            choice = self._ask_marmoset_connection(connection)
-            if choice == "cancel":
-                return
-            import_new = choice == "import"
-            if not import_new:
-                connection = None
-        progress = QtWidgets.QProgressDialog(
-            bg_l10n.text("Preparing Marmoset package..."),
-            bg_l10n.text("Cancel"), 0, max(1, len(targets)), self)
-        progress.setWindowModality(QtCore.Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
-        completed = [0]
-
-        def status(label):
-            progress.setLabelText(label)
-            progress.setValue(min(completed[0], len(targets)))
-            completed[0] += 1
-            QtWidgets.QApplication.processEvents()
-
-        try:
-            with self.suspend_subgroup_color_preview():
-                with self.suspend_isolation():
-                    with bg_final_export.FinalExportProcessor.export_session(
-                            freeze_lp_normals=self._export_freeze_normals_enabled()):
-                        manifest = bg_marmoset_bridge.MarmosetPackageExporter.export_package(
-                            targets, snapshots, export_dir,
-                            status_callback=status,
-                            cancel_check=progress.wasCanceled,
-                            inc_hp=inc_hp, inc_lp=inc_lp)
-            if progress.wasCanceled() or not manifest:
-                if hasattr(self, 'exp_status'):
-                    self.exp_status.setText(bg_l10n.text("Export cancelled"))
-                return
-            progress.setValue(max(1, len(targets)))
-            if hasattr(self, 'exp_status'):
-                message = bg_l10n.text("Marmoset package exported: {name}").format(
-                    name=os.path.basename(manifest))
-                if not self._marmoset_bridge_ready:
-                    message += " " + bg_l10n.text("Marmoset bridge not installed warning")
-                self.exp_status.setText(message)
-            cmds.inViewMessage(
-                amg="Marmoset package exported: {}".format(manifest),
-                pos='midCenter', fade=True)
-        except Exception as exc:
-            cmds.warning("Marmoset export failed: {}".format(exc))
-            if hasattr(self, 'exp_status'):
-                self.exp_status.setText(str(exc))
-            return
-        finally:
-            progress.close()
-        if connection:
-            try:
-                bg_marmoset_bridge.sync_toolbag_project(
-                    connection, manifest, import_new=import_new,
-                    process_events=QtWidgets.QApplication.processEvents)
-                if hasattr(self, 'exp_status'):
-                    self.exp_status.setText(
-                        bg_l10n.text("Marmoset meshes updated: {name}").format(
-                            name=os.path.basename(manifest)))
-            except Exception as exc:
-                message = bg_l10n.text("Marmoset sync failed: {error}").format(
-                    error=exc)
-                cmds.warning(message)
-                if hasattr(self, 'exp_status'):
-                    self.exp_status.setText(message)
-
-    def _ask_marmoset_connection(self, connection):
-        messages = {
-            "not_running": "Marmoset is not running. Open Toolbag and Bake Groups Bridge before exporting.",
-            "bridge_unavailable": "Marmoset is running, but the bridge is not responding. Open or restart Bake Groups Bridge in Toolbag.",
-            "other_project": "The exported project is not open in Marmoset. Open its Toolbag scene and its package in Bake Groups Bridge.",
-            "ambiguous": "Several Toolbag sessions are open. Leave only one session with this project open.",
-            "empty": "This package is not loaded in the current Marmoset scene. Import it into this scene?"}
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(bg_l10n.text("Marmoset connection"))
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setText(bg_l10n.text(messages.get(connection.get("state"), messages["bridge_unavailable"])))
-        box.setInformativeText("\n".join(filter(None, (
-            connection.get("scene_path"), connection.get("detail")))))
-        import_button = None
-        if connection.get("state") == "empty":
-            import_button = box.addButton(bg_l10n.text("Import into current scene"),
-                                          QtWidgets.QMessageBox.AcceptRole)
-        export_button = box.addButton(bg_l10n.text("Export package only"),
-                                      QtWidgets.QMessageBox.ActionRole)
-        cancel_button = box.addButton(bg_l10n.text("Cancel"), QtWidgets.QMessageBox.RejectRole)
-        box.setDefaultButton(cancel_button)
-        box.exec_() if hasattr(box, 'exec_') else box.exec()
-        if import_button is not None and box.clickedButton() == import_button:
-            return "import"
-        return "export_only" if box.clickedButton() == export_button else "cancel"
-
-    def _export_preflight(self, targets, inc_hp, inc_lp, inc_cage, snapshots=None):
+    def _export_preflight(self, targets, inc_hp, inc_lp, snapshots=None):
         """One validation pass over the chapters about to be exported. Returns
         (errors, warnings) as localized strings: errors BLOCK the export (broken
         scene), warnings let the artist proceed after confirming. Consolidates
         checks that were scattered/silent (missing roots, undistributed LP, empty
-        chapters, requested-but-missing cage) so the artist sees one clear list
+        chapters) so the artist sees one clear list
         instead of a partial or empty FBX."""
         errors, warnings = [], []
         if snapshots is None:
@@ -5714,7 +3910,7 @@ class ExportMixin:
             name = pair.get('base', '?')
             snapshot = self._snapshot_for_pair(snapshots, pair) or {}
             hp_main, lp_main = snapshot.get('hp'), snapshot.get('lp')
-            if (inc_hp and not hp_main) or ((inc_lp or inc_cage) and not lp_main):
+            if (inc_hp and not hp_main) or (inc_lp and not lp_main):
                 errors.append(bg_l10n.text("Chapter '{name}': HP or LP root group not found.").format(name=name))
                 continue
             loose = snapshot.get('loose_lp') or []
@@ -5724,23 +3920,6 @@ class ExportMixin:
                 warnings.append(bg_l10n.text("Chapter '{name}': no HP meshes to export.").format(name=name))
             if inc_lp and not snapshot.get('lp_meshes_all'):
                 warnings.append(bg_l10n.text("Chapter '{name}': no LP meshes to export.").format(name=name))
-            if inc_cage and not snapshot.get('cage_meshes'):
-                warnings.append(bg_l10n.text("Chapter '{name}': cage included but no cage exists.").format(name=name))
-            elif inc_cage:
-                try:
-                    bg_cage.CageProcessor.validate_export_pairs(
-                        snapshot.get('lp_all') or [], snapshot['cage_meshes'])
-                    # Combined HP+LP export splits LP by its materials. Until
-                    # matching cage splits exist, fail closed for that case.
-                    combined = bool(getattr(self, 'exp_files_one', None) and
-                                    self.exp_files_one.isChecked() and inc_hp and inc_lp)
-                    if combined:
-                        for lp in snapshot.get('lp_all') or []:
-                            if len(bg_final_export.FinalExportProcessor._get_mesh_materials_and_faces(lp)) > 1:
-                                raise ValueError(bg_l10n.text(
-                                    "Cage with multi-material LP requires Separate files."))
-                except Exception as exc:
-                    errors.append("{}: {}".format(name, exc))
         return errors, warnings
 
     def _confirm_export_preflight(self, errors, warnings):
@@ -5775,15 +3954,12 @@ class ExportMixin:
 
     def _export_run(self):
         """Launched by the main Export button. Reads the Export panel settings."""
-        if getattr(self, '_marmoset_export_in_progress', False):
-            return
         if not hasattr(self, 'exp_scope'):
             return self.export_final_group_ui('separate')  # panel not built (fallback)
         inc_hp = self.exp_inc_hp.isChecked()
         inc_lp = self.exp_inc_lp.isChecked()
-        inc_cage = self.exp_inc_cage.isChecked()
-        if not (inc_hp or inc_lp or inc_cage):
-            return cmds.warning("Nothing selected to export (Include HP / LP / Cage).")
+        if not (inc_hp or inc_lp):
+            return cmds.warning("Nothing selected to export (Include HP / LP).")
         single = self.exp_files_one.isChecked()
         scope = self.exp_scope.currentIndex()
         by_mat = self.exp_bymat.isChecked() and scope != 0
@@ -5820,28 +3996,12 @@ class ExportMixin:
         self.save_final_smooth_states()
         snapshots = self._prepare_export_snapshots(targets)
 
-        is_marmoset = (
-            hasattr(self, 'exp_target') and self.exp_target.currentIndex() == 1)
-        if is_marmoset:
-            errors, warnings = self._export_preflight(
-                targets, inc_hp, inc_lp, False, snapshots=snapshots)
-            if ((errors or warnings) and
-                    not self._confirm_export_preflight(errors, warnings)):
-                return
-            if inc_hp:
-                self.disable_preview_smoothing_for_export()
-            self._marmoset_export_in_progress = True
-            try:
-                return self._export_marmoset_package(
-                    targets, snapshots, inc_hp=inc_hp, inc_lp=inc_lp)
-            finally:
-                self._marmoset_export_in_progress = False
 
         # Single preflight before the artist even picks a folder: block on broken
         # scenes, and let them confirm past soft issues (undistributed LP, empty
-        # chapter, missing cage) instead of getting a silent/partial FBX.
+        # chapter) instead of getting a silent/partial FBX.
         errors, warnings = self._export_preflight(
-            targets, inc_hp, inc_lp, inc_cage, snapshots=snapshots)
+            targets, inc_hp, inc_lp, snapshots=snapshots)
         if (errors or warnings) and not self._confirm_export_preflight(errors, warnings):
             return
 
@@ -5852,13 +4012,13 @@ class ExportMixin:
         self.disable_preview_smoothing_for_export()
 
         # 'LP in one file' pulls LP out of the per-chapter/by-material loop into a
-        # single combined file; HP and Cage still follow the other settings.
+        # single combined file; HP still follows the other settings.
         eff_inc_lp = inc_lp and not lp_one
         n = 0
         chapter_file_count = (1 if single and inc_hp and eff_inc_lp
                               else int(bool(inc_hp)) + int(bool(eff_inc_lp)))
         total_files = int(bool(lp_one and inc_lp)) + len(targets) * (
-            chapter_file_count + int(bool(inc_cage)))
+            chapter_file_count)
         total_files = max(1, total_files)
         progress = QtWidgets.QProgressDialog(
             bg_l10n.text("Preparing export..."), bg_l10n.text("Cancel"),
@@ -5911,13 +4071,13 @@ class ExportMixin:
                                     file_callback=file_callback,
                                     cancel_check=cancel_check):
                                 n += 1
-                        if inc_hp or inc_cage or eff_inc_lp:
+                        if inc_hp or eff_inc_lp:
                             if by_mat:
                                 for book in books:
                                     if cancel_check():
                                         break
                                     n += self._export_book_by_material(
-                                        book, export_dir, inc_hp, eff_inc_lp, inc_cage,
+                                        book, export_dir, inc_hp, eff_inc_lp,
                                         snapshots=snapshots,
                                         status_callback=status_callback,
                                         file_callback=file_callback,
@@ -5929,7 +4089,7 @@ class ExportMixin:
                                         break
                                     if self._export_chapter_files(
                                             pair, export_dir, inc_hp, eff_inc_lp,
-                                            inc_cage, single,
+                                            single,
                                             snapshot=self._snapshot_for_pair(snapshots, pair),
                                             status_callback=status_callback,
                                             file_callback=file_callback,
@@ -6090,11 +4250,10 @@ class ExportMixin:
         naming persists. Returns (hp_count, lp_count).
 
         Meshes whose name is ALREADY correct are skipped (no cmds.rename call)
-        - this function is called every time Export Settings / the Cage panel
+        - this function is called every time Export Settings
         is (re)entered, so on an already-finalized chapter (the common case)
         it used to fire a real rename per mesh for nothing every single time,
         which is real, measurable overhead on a production scene."""
-        bg_cage.CageProcessor.migrate_legacy_links(base_name)
         hp_count = 0
         lp_count = 0
         with bg_core.undo_chunk("FinalizeSubgroupNaming"):
@@ -6554,7 +4713,9 @@ class SceneInteractionMixin:
             try:
                 value = float(cmds.getAttr(plug))
             except Exception:
-                continue
+                # A transform channel we cannot inspect is not proof of an
+                # identity transform.  Let the blocker preflight report it.
+                return False
             if abs(value - default) > tolerance:
                 return False
         return True
@@ -6621,6 +4782,9 @@ class SceneInteractionMixin:
             parent = node.rsplit("|", 1)[0] if "|" in node else ""
             if node not in invalid and parent not in affected:
                 continue
+            # Maya's makeIdentity on a parent may propagate through descendant
+            # transforms, including identity channels, so inspect the affected
+            # subtree rather than only channels with non-default values.
             affected.add(node)
 
             try:
@@ -6628,7 +4792,8 @@ class SceneInteractionMixin:
                     blockers.append((node, "referenced"))
                     continue
             except Exception:
-                pass
+                blockers.append((node, "reference status unavailable"))
+                continue
 
             reasons = []
             for attr in transform_attrs:
@@ -6636,6 +4801,7 @@ class SceneInteractionMixin:
                 if not cmds.objExists(plug):
                     continue
                 try:
+                    float(cmds.getAttr(plug))
                     if cmds.getAttr(plug, lock=True):
                         reasons.append("{} locked".format(attr))
                         continue
@@ -6651,25 +4817,125 @@ class SceneInteractionMixin:
 
         return blockers
 
+    def _freeze_transform_state(self, hierarchy_nodes):
+        """Snapshot only the transforms and mesh shapes in affected subtrees."""
+        transform_attrs = (
+            "translateX", "translateY", "translateZ",
+            "rotateX", "rotateY", "rotateZ",
+            "scaleX", "scaleY", "scaleZ",
+            "shearXY", "shearXZ", "shearYZ",
+        )
+        transforms = {}
+        shapes = {}
+        for node in hierarchy_nodes or []:
+            if not cmds.objExists(node):
+                continue
+            transforms[node] = tuple(
+                float(cmds.getAttr("{}.{}".format(node, attr)))
+                for attr in transform_attrs
+                if cmds.objExists("{}.{}".format(node, attr))
+            )
+            for shape in cmds.listRelatives(node, shapes=True, fullPath=True, type="mesh") or []:
+                selection = om.MSelectionList()
+                selection.add(shape)
+                mesh = om.MFnMesh(selection.getDagPath(0))
+                points = tuple(tuple(point) for point in mesh.getPoints(om.MSpace.kObject))
+                normals = tuple(tuple(normal) for normal in mesh.getNormals(om.MSpace.kObject))
+                normal_ids = mesh.getNormalIds()
+                shapes[shape] = (
+                    points,
+                    normals,
+                    tuple(normal_ids[0]),
+                    tuple(normal_ids[1]),
+                    bool(cmds.getAttr(shape + ".opposite")),
+                )
+        return transforms, shapes
+
     def _apply_freeze_transform_hierarchy(self, hierarchy_nodes):
         """Freeze a complete hierarchy parent-first and return changed nodes."""
         fixed = []
+        current_node = ""
+        invalid = self._unfrozen_transforms(hierarchy_nodes)
+        invalid_set = set(invalid)
+        affected = set()
         for node in hierarchy_nodes or []:
-            if not cmds.objExists(node) or self._is_transform_frozen(node):
-                continue
-            cmds.makeIdentity(
-                node,
-                apply=True,
-                translate=True,
-                rotate=True,
-                scale=True,
-                normal=False,
-            )
-            fixed.append(node)
+            parent = node.rsplit("|", 1)[0] if "|" in node else ""
+            if node in invalid_set or parent in affected:
+                affected.add(node)
+        affected_nodes = [node for node in hierarchy_nodes or [] if node in affected]
+        if affected_nodes and not cmds.undoInfo(query=True, state=True):
+            raise RuntimeError(bg_l10n.text(
+                "Maya Undo is disabled; hierarchy freeze was not started"
+            ))
+        before = self._freeze_transform_state(affected_nodes)
+        try:
+            with bg_core.undo_chunk("FreezeTransformations"):
+                for node in hierarchy_nodes or []:
+                    if not cmds.objExists(node) or self._is_transform_frozen(node):
+                        continue
+                    current_node = node
+                    preserve_normals = True
+                    for descendant in hierarchy_nodes or []:
+                        if descendant != node and not descendant.startswith(node + "|"):
+                            continue
+                        try:
+                            scale = cmds.getAttr(descendant + ".scale")[0]
+                            if float(scale[0]) * float(scale[1]) * float(scale[2]) < 0.0:
+                                preserve_normals = False
+                                break
+                        except Exception:
+                            preserve_normals = False
+                            break
+                    cmds.makeIdentity(
+                        node,
+                        apply=True,
+                        translate=True,
+                        rotate=True,
+                        scale=True,
+                        normal=preserve_normals,
+                    )
+                    fixed.append(node)
+        except Exception as exc:
+            # Undo only this just-closed freeze chunk.  When called inside a
+            # larger chunk, verify that the freeze actually changed scene data
+            # before issuing undo so an empty failed command cannot undo an
+            # unrelated action in the parent chunk.
+            changed = bool(fixed)
+            if not changed:
+                try:
+                    changed = self._freeze_transform_state(affected_nodes) != before
+                except Exception:
+                    # If state verification itself fails, prefer a rollback to
+                    # leaving a potentially partial hierarchy mutation behind.
+                    changed = True
+            if changed:
+                try:
+                    cmds.undo()
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        "{}: {}; {}".format(
+                            current_node or "hierarchy",
+                            exc,
+                            bg_l10n.text("Freeze Transformations rollback failed: {error}").format(
+                                error=rollback_exc
+                            ),
+                        )
+                    )
+            raise RuntimeError("{}: {}".format(current_node or "hierarchy", exc))
         return fixed
 
-    def validate_frozen_transforms(self, root_nodes, mesh_roots=None, action_name=""):
+    def validate_frozen_transforms(self, root_nodes, mesh_roots=None, action_name="", confirm=True,
+                                   excluded_paths=()):
         hierarchy_nodes = self._freeze_transform_hierarchy_nodes(root_nodes, mesh_roots)
+        if excluded_paths:
+            # Maya freezes descendants when applying an ancestor transform.
+            affected = set(excluded_paths)
+            for path in excluded_paths:
+                parent = path.rsplit("|", 1)[0]
+                while parent:
+                    affected.add(parent)
+                    parent = parent.rsplit("|", 1)[0]
+            hierarchy_nodes = [node for node in hierarchy_nodes if node not in affected]
         invalid = self._unfrozen_transforms(hierarchy_nodes)
 
         if not invalid:
@@ -6682,25 +4948,26 @@ class SceneInteractionMixin:
 
         message = bg_l10n.text("Freeze Transformations required. Selected invalid root groups or meshes.")
         detail = "{}: {}".format(bg_l10n.text("Invalid transforms"), ", ".join(preview))
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(bg_l10n.text("Freeze Transformations"))
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setText(message)
-        box.setInformativeText("{}\n\n{}".format(detail, bg_l10n.text("Do you want to run Freeze Transformations now?")))
-        yes_btn = box.addButton(bg_l10n.text("Yes"), QtWidgets.QMessageBox.AcceptRole)
-        no_btn = box.addButton(bg_l10n.text("No"), QtWidgets.QMessageBox.RejectRole)
-        box.setDefaultButton(yes_btn)
-        box.exec_()
+        if confirm:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle(bg_l10n.text("Freeze Transformations"))
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setText(message)
+            box.setInformativeText("{}\n\n{}".format(detail, bg_l10n.text("Do you want to run Freeze Transformations now?")))
+            yes_btn = box.addButton(bg_l10n.text("Yes"), QtWidgets.QMessageBox.AcceptRole)
+            no_btn = box.addButton(bg_l10n.text("No"), QtWidgets.QMessageBox.RejectRole)
+            box.setDefaultButton(yes_btn)
+            box.exec_()
 
-        if box.clickedButton() != yes_btn:
-            cmds.warning(message)
-            self.log("{} {}".format(message, detail), "red")
-            if hasattr(self, 'record_user_action'):
-                self.record_user_action(
-                    "Freeze Transformations check failed",
-                    "{} | invalid={}".format(action_name or "Action", len(invalid))
-                )
-            return False
+            if box.clickedButton() != yes_btn:
+                cmds.warning(message)
+                self.log("{} {}".format(message, detail), "red")
+                if hasattr(self, 'record_user_action'):
+                    self.record_user_action(
+                        "Freeze Transformations check failed",
+                        "{} | invalid={}".format(action_name or "Action", len(invalid))
+                    )
+                return False
 
         blockers = self._freeze_transform_blockers(hierarchy_nodes, invalid)
         if blockers:
@@ -6720,8 +4987,7 @@ class SceneInteractionMixin:
             return False
 
         try:
-            with bg_core.undo_chunk("FreezeTransformations"):
-                fixed = self._apply_freeze_transform_hierarchy(hierarchy_nodes)
+            fixed = self._apply_freeze_transform_hierarchy(hierarchy_nodes)
         except Exception as exc:
             cmds.warning(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc))
             self.log(bg_l10n.text("Freeze Transformations failed: {error}").format(error=exc), "red")
@@ -6729,9 +4995,20 @@ class SceneInteractionMixin:
 
         invalid_after = self._unfrozen_transforms(hierarchy_nodes)
         if invalid_after:
+            error = bg_l10n.text("Freeze Transformations did not clear all invalid transforms.")
+            if fixed:
+                try:
+                    cmds.undo()
+                except Exception as exc:
+                    error = "{} {}".format(
+                        error,
+                        bg_l10n.text("Freeze Transformations rollback failed: {error}").format(
+                            error=exc
+                        ),
+                    )
             cmds.select(invalid_after, replace=True)
-            cmds.warning(bg_l10n.text("Freeze Transformations did not clear all invalid transforms."))
-            self.log(bg_l10n.text("Freeze Transformations did not clear all invalid transforms."), "red")
+            cmds.warning(error)
+            self.log(error, "red")
             return False
 
         cmds.select(clear=True)
@@ -6889,26 +5166,9 @@ class SceneInteractionMixin:
         cmds.inViewMessage(amg=message, pos='midCenter', fade=True)
 
     def _get_triangle_face_ratio(self, mesh_transform):
-        try:
-            shapes = cmds.listRelatives(mesh_transform, shapes=True, fullPath=True, type='mesh') or []
-            shapes = [s for s in shapes if not cmds.getAttr(s + ".intermediateObject")]
-            if not shapes:
-                return 0.0, 0, 0
-
-            sel = om.MSelectionList()
-            sel.add(shapes[0])
-            dag_path = sel.getDagPath(0)
-            mesh_fn = om.MFnMesh(dag_path)
-            face_vertex_counts, _ = mesh_fn.getVertices()
-            total_faces = len(face_vertex_counts)
-            if total_faces <= 0:
-                return 0.0, 0, 0
-
-            triangle_faces = sum(1 for count in face_vertex_counts if int(count) == 3)
-            ratio = (triangle_faces / float(total_faces)) * 100.0
-            return ratio, triangle_faces, total_faces
-        except Exception:
-            return 0.0, 0, 0
+        from bg_mesh_check import triangle_counts
+        triangles, faces, _ = triangle_counts(mesh_transform)
+        return (100.0 * triangles / faces if faces else 0.0), triangles, faces
 
     def find_zbrush_meshes(self):
         if not self.active_root_id:
@@ -7016,8 +5276,6 @@ class SceneInteractionMixin:
         records = []
         if hasattr(self, 'lp_material_records_for_node'):
             records = self.lp_material_records_for_node(lp_node, include_faces=True)
-            if not records:
-                records = self.lp_material_records_for_node(lp_node, include_faces=False)
         by_key = {}
         for rec in records or []:
             key = rec.get("key") or rec.get("material")
@@ -7435,6 +5693,76 @@ class SceneInteractionMixin:
             proxy["is_container"] = proxy.get("lp_node") in container_nodes
         return len(container_nodes)
 
+    def _create_by_mat_chapter_surface(self, bucket, checkpoint):
+        # An in-memory mesh combines only faces assigned to this chapter.
+        # World-space vertices keep proximity tests correct under any transform.
+        points = om.MPointArray()
+        counts = om.MIntArray()
+        indices = om.MIntArray()
+        for node, faces in bucket["lp_meshes"]:
+            checkpoint()
+            shapes = cmds.listRelatives(node, shapes=True, fullPath=True,
+                                        type="mesh", noIntermediate=True) or []
+            for shape in shapes:
+                checkpoint()
+                selection = om.MSelectionList()
+                selection.add(shape)
+                dag = selection.getDagPath(0)
+                mesh = om.MFnMesh(dag)
+                face_counts, face_indices = mesh.getVertices()
+                offset = len(points)
+                for point in mesh.getPoints(om.MSpace.kWorld):
+                    points.append(point)
+                cursor = 0
+                for face_id, count in enumerate(face_counts):
+                    if face_id % 2048 == 0:
+                        checkpoint()
+                    if faces is None or face_id in faces:
+                        counts.append(count)
+                        for index in face_indices[cursor:cursor + count]:
+                            indices.append(offset + index)
+                    cursor += count
+                # Material face indices refer to the shape used by the LP scanner.
+                if faces is not None:
+                    break
+        if not counts:
+            return None
+        owner = om.MFnMeshData().create()
+        mesh = om.MFnMesh().create(points, counts, indices, parent=owner)
+        surface = om.MMeshIntersector()
+        surface.create(mesh)
+        return surface, owner
+
+    def _create_by_mat_surface_owner(self, hp_data, chapter_surfaces, checkpoint):
+        samples = hp_data.get("sample_points")
+        if not samples:
+            return None, float("inf")
+        diag = max(hp_data["diag"], 1e-6)
+        points = [om.MPoint(*sample) for sample in samples]
+        ranked = []
+        for bucket, (surface, _owner) in chapter_surfaces:
+            checkpoint()
+            try:
+                distances = sorted(point.distanceTo(om.MPoint(surface.getClosestPoint(point).point))
+                                   for point in points)
+            except RuntimeError:
+                continue
+            mean = sum(distances) / len(distances)
+            upper = distances[3 * (len(distances) - 1) // 4]
+            ranked.append((mean, upper, bucket))
+        if not ranked:
+            return None, float("inf")
+        ranked.sort(key=lambda item: item[:2])
+        mean, upper, bucket = ranked[0]
+        if mean > diag * 0.25 or upper > diag * 0.35:
+            return None, mean
+        if len(ranked) > 1:
+            other_mean, other_upper, _ = ranked[1]
+            if (mean > other_mean * 0.28 or upper > other_upper * 0.65 or
+                    other_mean - mean < diag * 0.015):
+                return None, mean
+        return bucket, mean
+
     def _create_by_mat_hp_owner_score(self, hp_data, proxy, scene_diag):
         lp_data = proxy.get("data") or {}
         inter = self._create_by_mat_intersection_volume(hp_data, lp_data)
@@ -7524,35 +5852,100 @@ class SceneInteractionMixin:
             "overlap_child": overlap_child
         }
 
-    def _create_by_mat_avg_sample_distance(self, source_data, target_data, max_source=96, max_target=128):
-        source_points = source_data.get("sample_points") or self._create_by_mat_bbox_points(source_data)
-        target_points = target_data.get("sample_points") or self._create_by_mat_bbox_points(target_data)
-        if not source_points or not target_points:
-            return 1e18
-        if len(source_points) > max_source:
-            step = max(1, int(math.ceil(len(source_points) / float(max_source))))
-            source_points = source_points[::step][:max_source]
-        if len(target_points) > max_target:
-            step = max(1, int(math.ceil(len(target_points) / float(max_target))))
-            target_points = target_points[::step][:max_target]
-        total = 0.0
-        count = 0
+    def _create_by_mat_find_surface_support(self, child_data, stable_parents, checkpoint, surfaces):
+        diag = child_data["diag"]
+        if diag <= 0:
+            return None
+        limit = diag * 0.20
+        candidates = []
+        for _node, parent in stable_parents:
+            checkpoint()
+            if parent["source"] != "lp_surface":
+                continue
+            data = parent["data"]
+            if data["diag"] <= diag * 1.25:
+                continue
+            gap = self._create_by_mat_bbox_gap_distance(child_data, data)
+            if gap <= limit:
+                sample_distance = self._create_by_mat_point_sample_distance(child_data, data)
+                candidates.append((sample_distance, gap, parent))
+
+        best_by_chapter = {}
+        for _, _, parent in sorted(candidates, key=lambda item: item[:2])[:12]:
+            distance, _coverage = self._create_by_mat_lp_surface_evidence(
+                child_data, parent["data"], checkpoint, surfaces)
+            if distance <= limit:
+                bucket = parent["bucket"]
+                name = bucket["base"]
+                previous = best_by_chapter.get(name)
+                if previous is None or distance < previous[0]:
+                    best_by_chapter[name] = distance, bucket
+        ranked = sorted(best_by_chapter.values(), key=lambda item: item[0])
+        if not ranked:
+            return None
+        distance, bucket = ranked[0]
+        if len(ranked) > 1 and ranked[1][0] - distance < diag * 0.015:
+            return None
+        return bucket
+
+    def _create_by_mat_lp_surface_evidence(self, lp_data, hp_data, checkpoint=None, surfaces=None,
+                                           require_coverage=False):
+        points = lp_data.get("sample_points") or []
+        if not points:
+            return float("inf"), 0.0
+        limit = max(float(lp_data.get("diag", 0.0)) * 0.05, 1e-6)
         try:
-            for src in source_points:
-                best_sq = 1e36
-                sx, sy, sz = src[0], src[1], src[2]
-                for dst in target_points:
-                    dx = sx - dst[0]
-                    dy = sy - dst[1]
-                    dz = sz - dst[2]
-                    dist_sq = dx * dx + dy * dy + dz * dz
-                    if dist_sq < best_sq:
-                        best_sq = dist_sq
-                total += math.sqrt(max(best_sq, 0.0))
-                count += 1
-            return total / float(max(count, 1))
-        except Exception:
-            return 1e18
+            if surfaces is None:
+                surfaces = OrderedDict()
+            name = hp_data["name"]
+            if name not in surfaces:
+                selection = om.MSelectionList()
+                selection.add(name)
+                dag = selection.getDagPath(0)
+                if dag.hasFn(om.MFn.kTransform):
+                    dag.extendToShape()
+                matrix = dag.inclusiveMatrix()
+                axes = [axis * matrix for axis in
+                        (om.MVector(1, 0, 0), om.MVector(0, 1, 0), om.MVector(0, 0, 1))]
+                lengths = [axis * axis for axis in axes]
+                tolerance = max(lengths) * 1e-10
+                # Object-space nearest points preserve world distances under
+                # similarity transforms. Keep world queries for scale/shear.
+                if (min(lengths) > 0 and max(lengths) - min(lengths) <= tolerance and
+                        all(abs(axes[i] * axes[j]) <= tolerance for i, j in ((0, 1), (0, 2), (1, 2)))):
+                    try:
+                        surface = om.MMeshIntersector()
+                        surface.create(dag.node())
+                        surfaces[name] = (surface, matrix, matrix.inverse())
+                    except (RuntimeError, ValueError, TypeError):
+                        pass
+                if name not in surfaces:
+                    surfaces[name] = (om.MFnMesh(dag), None, None)
+                if len(surfaces) > 16:
+                    surfaces.popitem(last=False)
+            surfaces.move_to_end(name)
+            surface, matrix, inverse = surfaces[name]
+            step = max(1, int(math.ceil(len(points) / 96.0)))
+            samples = points[::step]
+            total = 0.0
+            near = 0
+            allowed_misses = len(samples) // 4
+            for index, coords in enumerate(samples, 1):
+                if checkpoint:
+                    checkpoint()
+                point = om.MPoint(*coords)
+                if inverse is None:
+                    closest, _face = surface.getClosestPoint(point, om.MSpace.kWorld)
+                else:
+                    closest = om.MPoint(surface.getClosestPoint(point * inverse).point) * matrix
+                distance = point.distanceTo(closest)
+                total += distance
+                near += distance <= limit
+                if require_coverage and index - near > allowed_misses:
+                    return float("inf"), 0.0
+            return total / len(samples), near / float(len(samples))
+        except (RuntimeError, ValueError, TypeError, KeyError):
+            return float("inf"), 0.0
 
     def _create_by_mat_lp_hp_audit_quick_score(self, proxy, hp_data, scene_diag):
         lp_data = proxy.get("data") or {}
@@ -7579,7 +5972,8 @@ class SceneInteractionMixin:
             score -= 220.0
         return score
 
-    def _create_by_mat_lp_hp_audit_score(self, proxy, hp_data, scene_diag):
+    def _create_by_mat_lp_hp_audit_score(self, proxy, hp_data, scene_diag, checkpoint=None, surfaces=None,
+                                         require_coverage=False):
         lp_data = proxy.get("data") or {}
         inter = self._create_by_mat_intersection_volume(lp_data, hp_data)
         bbox_gap = self._create_by_mat_bbox_gap_distance(lp_data, hp_data)
@@ -7588,14 +5982,15 @@ class SceneInteractionMixin:
             hp_diag_pre = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
             if bbox_gap > max(lp_diag_pre * 0.55, hp_diag_pre * 0.85, scene_diag * 0.003):
                 return None
-        avg_dist = self._create_by_mat_avg_sample_distance(lp_data, hp_data)
+        avg_dist, coverage = self._create_by_mat_lp_surface_evidence(
+            lp_data, hp_data, checkpoint, surfaces, require_coverage)
         lp_vol = max(float(lp_data.get("volume", 0.0) or 0.0), 0.000001)
         hp_vol = max(float(hp_data.get("volume", 0.0) or 0.0), 0.000001)
         lp_diag = max(float(lp_data.get("diag", 0.0) or 0.0), 0.000001)
         hp_diag = max(float(hp_data.get("diag", 0.0) or 0.0), 0.000001)
         overlap_lp = inter / lp_vol
         overlap_hp = inter / hp_vol
-        near_limit = max(lp_diag * 0.12, hp_diag * 0.08, scene_diag * 0.001, 0.000001)
+        near_limit = max(lp_diag * 0.12, 0.000001)
         avg_norm = avg_dist / near_limit
         gap_norm = bbox_gap / max(lp_diag * 0.20, hp_diag * 0.20, scene_diag * 0.001, 0.000001)
         score = overlap_lp * 1200.0 + overlap_hp * 260.0
@@ -7608,38 +6003,32 @@ class SceneInteractionMixin:
         if proxy.get("is_container"):
             score -= 320.0
 
-        strong = False
-        if not proxy.get("is_container"):
-            strong = (
-                overlap_lp >= 0.16 or
-                (overlap_lp >= 0.055 and avg_norm <= 1.25) or
-                (avg_norm <= 0.62 and bbox_gap <= max(lp_diag * 0.10, hp_diag * 0.10, scene_diag * 0.0005))
-            )
-        else:
-            strong = overlap_lp >= 0.35 and avg_norm <= 1.0
+        strong = coverage >= 0.75 and avg_norm <= 0.62
         return {
             "score": score,
             "strong": strong,
             "overlap_lp": overlap_lp,
             "overlap_hp": overlap_hp,
             "avg_distance": avg_dist,
+            "coverage": coverage,
             "bbox_gap": bbox_gap,
             "proxy": proxy
         }
 
-    def _create_by_mat_best_bucket_lp_audit_score(self, bucket, hp_data, scene_diag):
+    def _create_by_mat_best_bucket_lp_audit_score(self, bucket, hp_data, scene_diag, checkpoint, surfaces):
         if not bucket:
             return 0.0
         best_score = 0.0
         quick_candidates = []
         for proxy in bucket.get("lp_proxies", []) or []:
+            checkpoint()
             quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
             if quick is None:
                 continue
             quick_candidates.append((quick, proxy))
         quick_candidates.sort(key=lambda item: item[0], reverse=True)
         for _quick, proxy in quick_candidates[:16]:
-            result = self._create_by_mat_lp_hp_audit_score(proxy, hp_data, scene_diag)
+            result = self._create_by_mat_lp_hp_audit_score(proxy, hp_data, scene_diag, checkpoint, surfaces)
             if result:
                 best_score = max(best_score, float(result.get("score", 0.0) or 0.0))
         return best_score
@@ -7666,17 +6055,49 @@ class SceneInteractionMixin:
         progress.show()
         QtWidgets.QApplication.processEvents()
 
+        class MaterialAnalysisCanceled(Exception):
+            pass
+
+        last_update = 0.0
+        status = None
+        surfaces = OrderedDict()
+
+        def checkpoint():
+            nonlocal last_update
+            now = time.monotonic()
+            if now - last_update >= 0.08:
+                last_update = now
+                if status:
+                    label, value = status
+                    progress.setLabelText(label)
+                    progress.setValue(value)
+                QtWidgets.QApplication.processEvents()
+            if progress.wasCanceled():
+                self.log("Create by Mat canceled.", "orange")
+                raise MaterialAnalysisCanceled
+
+        def set_status(label, value):
+            nonlocal status
+            status = label, value
+            checkpoint()
+
+        def source_meshes(root):
+            shapes = cmds.listRelatives(root, allDescendents=True, fullPath=True,
+                                        type="mesh", noIntermediate=True) or []
+            return sorted({node for shape in shapes
+                           for node in cmds.listRelatives(shape, parent=True, fullPath=True) or []
+                           if node != root})
+
         try:
             def _create_root_pairs_by_material_body():
-                with bg_core.undo_chunk("CreateByMaterial"):
+                with bg_core.undo_chunk("CreateByMaterial"), contextlib.suppress(MaterialAnalysisCanceled):
                     progress.setLabelText(bg_l10n.text("Preparing source meshes..."))
                     progress.setValue(5)
                     QtWidgets.QApplication.processEvents()
 
-                    hp_meshes = self.prepare_meshes(hp_source, flatten=True)
-                    lp_meshes = self.prepare_meshes(lp_source, flatten=True)
-                    hp_meshes = [m for m in hp_meshes if m and cmds.objExists(m)]
-                    lp_meshes = [m for m in lp_meshes if m and cmds.objExists(m)]
+                    hp_meshes = source_meshes(hp_source)
+                    lp_meshes = source_meshes(lp_source)
+                    mesh_uuids = {node: cmds.ls(node, uuid=True)[0] for node in hp_meshes + lp_meshes}
 
                     if not lp_meshes:
                         self.log("Create by Mat: no LP meshes found.", "red")
@@ -7697,18 +6118,38 @@ class SceneInteractionMixin:
                         QtWidgets.QApplication.processEvents()
 
                         signature, labels = self._create_by_mat_material_signature(lp_node)
-                        bucket = buckets_by_signature.setdefault(signature, {
-                            "labels": labels,
-                            "lp_meshes": [],
-                            "lp_proxies": [],
-                            "hp_meshes": []
-                        })
-                        bucket["lp_meshes"].append(lp_node)
                         proxies = self._create_by_mat_lp_proxy_records(lp_node, signature, labels)
-                        for proxy in proxies:
-                            proxy["bucket"] = bucket
-                            bucket["lp_proxies"].append(proxy)
-                            all_lp_proxies.append(proxy)
+                        pieces = {}
+                        if len(signature) > 1:
+                            for record in self.lp_material_records_for_node(lp_node, include_faces=True):
+                                pieces.setdefault(record["key"], set()).update(record["faces"])
+                            all_faces = set(range(cmds.polyEvaluate(lp_node, face=True)))
+                            unassigned = all_faces.difference(*pieces.values())
+                            if unassigned:
+                                pieces[None] = unassigned
+                            proxy_keys = {proxy["material_key"] for proxy in proxies}
+                            if not set(pieces).issubset(proxy_keys):
+                                self.log("Create by Mat: could not resolve face regions for {}.".format(lp_node), "red")
+                                return
+                        else:
+                            pieces[signature[0]] = None
+
+                        material_labels = dict(zip(signature, labels))
+                        for key, faces in pieces.items():
+                            bucket = buckets_by_signature.setdefault((key,), {
+                                "labels": [material_labels.get(key, "No_Material")],
+                                "lp_meshes": [],
+                                "lp_proxies": [],
+                                "hp_meshes": [],
+                                "hp_copies": []
+                            })
+                            bucket["lp_meshes"].append((lp_node, faces))
+                            for proxy in proxies:
+                                if faces is not None and proxy["material_key"] != key:
+                                    continue
+                                proxy["bucket"] = bucket
+                                bucket["lp_proxies"].append(proxy)
+                                all_lp_proxies.append(proxy)
 
                     if not buckets_by_signature:
                         self.log("Create by Mat: LP materials were not detected.", "red")
@@ -7751,6 +6192,20 @@ class SceneInteractionMixin:
                     else:
                         median_hp_diag = scene_diag
 
+                    progress.setLabelText(bg_l10n.text("Indexing LP chapter surfaces..."))
+                    progress.setValue(32)
+                    chapter_surfaces = []
+                    for bucket in ordered_buckets:
+                        checkpoint()
+                        try:
+                            surface = self._create_by_mat_chapter_surface(bucket, checkpoint)
+                        except (RuntimeError, ValueError, TypeError):
+                            surface = None
+                        if surface is None:
+                            chapter_surfaces.clear()
+                            break
+                        chapter_surfaces.append((bucket, surface))
+
                     progress.setLabelText(bg_l10n.text("Resolving HP ownership from LP chapters..."))
                     progress.setValue(35)
                     QtWidgets.QApplication.processEvents()
@@ -7760,6 +6215,7 @@ class SceneInteractionMixin:
                     review_examples = []
                     hp_records = {}
                     direct_count = 0
+                    surface_direct_count = 0
                     container_direct_count = 0
                     total_hp = max(len(hp_meshes), 1)
                     for index, hp_node in enumerate(hp_meshes):
@@ -7771,6 +6227,17 @@ class SceneInteractionMixin:
 
                         hp_data = self._create_by_mat_mesh_data(hp_node)
                         if not hp_data:
+                            review_hp_meshes.append(hp_node)
+                            continue
+                        surface_bucket, lp_distance = self._create_by_mat_surface_owner(
+                            hp_data, chapter_surfaces, checkpoint)
+                        if surface_bucket:
+                            hp_records[hp_node] = {
+                                "data": hp_data, "bucket": surface_bucket, "score": 0.0,
+                                "strong": True, "source": "lp_surface"
+                            }
+                            direct_count += 1
+                            surface_direct_count += 1
                             continue
                         quick_scored = []
                         for proxy in all_lp_proxies:
@@ -7783,7 +6250,8 @@ class SceneInteractionMixin:
                             "score": 0.0,
                             "strong": False,
                             "source": "unassigned",
-                            "has_overlap": False
+                            "has_overlap": False,
+                            "lp_distance": lp_distance
                         }
                         if not quick_scored:
                             continue
@@ -7839,8 +6307,24 @@ class SceneInteractionMixin:
                             progress.setValue(58 + int((index / float(total_records)) * 12))
                             QtWidgets.QApplication.processEvents()
 
+                        if rec.get("source") == "lp_surface":
+                            continue
                         hp_data = rec.get("data") or {}
                         hp_diag = float(hp_data.get("diag", 0.0) or 0.0)
+                        # Nearby HP supports may pass through the target's own
+                        # surface. Preserve the LP match when it is already tight.
+                        support_bucket = None
+                        if rec["lp_distance"] > hp_diag * 0.05:
+                            support_bucket = self._create_by_mat_find_surface_support(
+                                hp_data, stable_parents, checkpoint, surfaces)
+                        if support_bucket is not None:
+                            old_bucket = rec["bucket"]
+                            rec.update(bucket=support_bucket, source="hp_surface_support", strong=False)
+                            if old_bucket is None:
+                                floater_assigned += 1
+                            elif old_bucket is not support_bucket:
+                                floater_reassigned += 1
+                            continue
                         if rec.get("strong") and rec.get("source") == "lp" and hp_diag >= median_hp_diag * 0.70:
                             continue
 
@@ -7895,44 +6379,56 @@ class SceneInteractionMixin:
                     lp_audit_candidates = 0
                     lp_audit_assigned = 0
                     lp_audit_reassigned = 0
-                    lp_audit_container_conflicts = 0
                     audit_best_by_hp = {}
                     audit_proxies = sorted(
-                        [proxy for proxy in all_lp_proxies if proxy.get("bucket") is not None],
-                        key=lambda proxy: (
-                            1 if proxy.get("is_container") else 0,
-                            float((proxy.get("data") or {}).get("volume", 0.0) or 0.0)
-                        )
+                        [proxy for proxy in all_lp_proxies if proxy.get("bucket") is not None
+                         and not proxy.get("is_container")],
+                        key=lambda proxy: float((proxy.get("data") or {}).get("volume", 0.0) or 0.0)
                     )
                     total_audit = max(len(audit_proxies), 1)
 
+                    # Only HP within the coverage tolerance can pass this
+                    # audit. Index the broadest scene axis once for all LPs.
+                    axis = max(range(3), key=lambda i: (
+                        max((rec["data"]["max"][i] for rec in hp_records.values()), default=0.0) -
+                        min((rec["data"]["min"][i] for rec in hp_records.values()), default=0.0)))
+                    hp_items = [(order, (node, rec)) for order, (node, rec) in enumerate(hp_records.items())
+                                if rec.get("source") not in ("lp_surface", "hp_surface_support")]
+                    by_min = sorted(hp_items, key=lambda item: item[1][1]["data"]["min"][axis])
+                    by_max = sorted(hp_items, key=lambda item: item[1][1]["data"]["max"][axis])
+                    minima = [rec["data"]["min"][axis] for _, (_, rec) in by_min]
+                    maxima = [rec["data"]["max"][axis] for _, (_, rec) in by_max]
+
                     for index, proxy in enumerate(audit_proxies):
-                        if progress.wasCanceled():
-                            self.log("Create by Mat canceled.", "orange")
-                            return
-                        if index % max(1, total_audit // 20) == 0:
-                            progress.setValue(70 + int((index / float(total_audit)) * 10))
-                            QtWidgets.QApplication.processEvents()
+                        name = proxy["lp_node"].split('|')[-1]
+                        value = 70 + 7 * index // total_audit
+                        set_status(bg_l10n.text("Checking LP {}/{}: {}").format(index + 1, total_audit, name), value)
 
                         target_bucket = proxy.get("bucket")
                         if target_bucket is None:
                             continue
                         lp_audit_checked += 1
+                        lp_data = proxy["data"]
+                        limit = max(lp_data["diag"] * 0.05, 1e-6)
+                        end = bisect_right(minima, lp_data["max"][axis] + limit)
+                        start = bisect_left(maxima, lp_data["min"][axis] - limit)
+                        possible = by_min[:end] if end <= len(by_max) - start else by_max[start:]
                         quick_candidates = []
-                        for hp_node, rec in hp_records.items():
-                            if rec.get("bucket") is target_bucket:
+                        for order, (hp_node, rec) in possible:
+                            checkpoint()
+                            hp_data = rec["data"]
+                            if (rec.get("bucket") is target_bucket or
+                                    self._create_by_mat_bbox_gap_distance(lp_data, hp_data) > limit):
                                 continue
-                            hp_data = rec.get("data") or {}
                             quick = self._create_by_mat_lp_hp_audit_quick_score(proxy, hp_data, scene_diag)
-                            if quick is None:
-                                continue
-                            quick_candidates.append((quick, hp_node, rec))
-                        if not quick_candidates:
-                            continue
-                        quick_candidates.sort(key=lambda item: item[0], reverse=True)
-
-                        for _quick, hp_node, rec in quick_candidates[:24]:
-                            result = self._create_by_mat_lp_hp_audit_score(proxy, rec.get("data") or {}, scene_diag)
+                            if quick is not None:
+                                quick_candidates.append((quick, -order, hp_node, rec))
+                        finalists = nlargest(24, quick_candidates, key=lambda item: item[:2])
+                        for rank, (_, _, hp_node, rec) in enumerate(finalists, 1):
+                            set_status(bg_l10n.text("Checking LP {}/{}: {} | HP candidate {}/{}").format(
+                                index + 1, total_audit, name, rank, len(finalists)), value)
+                            result = self._create_by_mat_lp_hp_audit_score(
+                                proxy, rec["data"], scene_diag, checkpoint, surfaces, require_coverage=True)
                             if not result or not result.get("strong"):
                                 continue
                             lp_audit_candidates += 1
@@ -7941,12 +6437,13 @@ class SceneInteractionMixin:
                             if current is None or result_score > float(current.get("score", 0.0) or 0.0):
                                 audit_best_by_hp[hp_node] = {
                                     "score": result_score,
-                                    "target_bucket": target_bucket,
-                                    "proxy": proxy,
-                                    "result": result
+                                    "target_bucket": target_bucket
                                 }
 
-                    for hp_node, candidate in audit_best_by_hp.items():
+                    audit_total = len(audit_best_by_hp)
+                    for index, (hp_node, candidate) in enumerate(audit_best_by_hp.items()):
+                        set_status(bg_l10n.text("Verifying HP ownership {}/{}: {}").format(
+                            index + 1, audit_total, hp_node.split('|')[-1]), 77 + 3 * index // audit_total)
                         rec = hp_records.get(hp_node)
                         if not rec:
                             continue
@@ -7955,24 +6452,13 @@ class SceneInteractionMixin:
                         if target_bucket is None or current_bucket is target_bucket:
                             continue
 
-                        target_proxy = candidate.get("proxy") or {}
                         candidate_score = float(candidate.get("score", 0.0) or 0.0)
-                        current_score = self._create_by_mat_best_bucket_lp_audit_score(current_bucket, rec.get("data") or {}, scene_diag)
-
-                        if target_proxy.get("is_container"):
-                            lp_audit_container_conflicts += 1
-                            continue
-
-                        source = rec.get("source")
-                        needs_repair = (
-                            current_bucket is None or
-                            source in ("container", "unassigned") or
-                            not rec.get("strong") or
-                            candidate_score >= current_score + 85.0 or
-                            (current_score <= 1.0 and candidate_score >= 260.0)
-                        )
-                        if not needs_repair:
-                            continue
+                        if rec.get("strong") and rec.get("source") not in ("container", "unassigned"):
+                            current_score = self._create_by_mat_best_bucket_lp_audit_score(
+                                current_bucket, rec["data"], scene_diag, checkpoint, surfaces)
+                            if (candidate_score < current_score + 85.0 and
+                                    not (current_score <= 1.0 and candidate_score >= 260.0)):
+                                continue
 
                         old_bucket = current_bucket
                         rec["bucket"] = target_bucket
@@ -7991,8 +6477,51 @@ class SceneInteractionMixin:
                             if len(review_examples) < 8:
                                 review_examples.append("{} -> no LP owner".format(hp_node.split('|')[-1]))
                             continue
-                        bucket.setdefault("hp_meshes", []).append(hp_node)
+                        bucket["hp_meshes"].append(hp_node)
 
+                    def covers_region(proxy, hp_data):
+                        checkpoint()
+                        data = proxy["data"]
+                        limit = max(float(data.get("diag", 0.0)) * 0.05, 1e-6)
+                        if self._create_by_mat_bbox_gap_distance(data, hp_data) > limit:
+                            return False
+                        return self._create_by_mat_lp_surface_evidence(
+                            data, hp_data, checkpoint, surfaces, require_coverage=True)[1] >= 0.75
+
+                    split_proxies = {}
+                    for proxy in all_lp_proxies:
+                        if proxy["signature_size"] > 1:
+                            split_proxies.setdefault(proxy["lp_node"], []).append(proxy)
+                    shared_total = sum(len(bucket["hp_meshes"]) for bucket in ordered_buckets
+                                       if any(faces is not None for _, faces in bucket["lp_meshes"]))
+                    shared_index = 0
+                    for bucket in ordered_buckets:
+                        sibling_regions = [
+                            proxy for node, faces in bucket["lp_meshes"] if faces is not None
+                            for proxy in split_proxies.get(node, [])
+                        ]
+                        if not sibling_regions:
+                            continue
+                        own_regions = [proxy for proxy in sibling_regions if proxy["bucket"] is bucket]
+                        for hp_node in bucket["hp_meshes"]:
+                            set_status(bg_l10n.text("Checking shared HP {}/{}: {}").format(
+                                shared_index + 1, shared_total, hp_node.split('|')[-1]),
+                                80 + 2 * shared_index // shared_total)
+                            shared_index += 1
+                            hp_data = hp_records[hp_node]["data"]
+                            supported_nodes = {
+                                proxy["lp_node"] for proxy in own_regions
+                                if covers_region(proxy, hp_data)
+                            }
+                            for proxy in sibling_regions:
+                                target = proxy["bucket"]
+                                if target is bucket or proxy["lp_node"] not in supported_nodes:
+                                    continue
+                                if covers_region(proxy, hp_data):
+                                    if hp_node not in target["hp_copies"]:
+                                        target["hp_copies"].append(hp_node)
+
+                    surfaces.clear()
                     if review_hp_meshes:
                         review_base = self._create_by_mat_safe_base("Review_Unmatched", used_bases)
                         review_bucket = {
@@ -8012,26 +6541,40 @@ class SceneInteractionMixin:
                     progress.setValue(82)
                     QtWidgets.QApplication.processEvents()
 
-                    total_buckets = max(len(ordered_buckets), 1)
-                    for index, bucket in enumerate(ordered_buckets):
-                        if progress.wasCanceled():
-                            self.log("Create by Mat canceled.", "orange")
-                            return
-                        progress.setValue(82 + int((index / float(total_buckets)) * 15))
-                        QtWidgets.QApplication.processEvents()
-
+                    if progress.wasCanceled():
+                        self.log("Create by Mat canceled.", "orange")
+                        return
+                    progress.setCancelButton(None)
+                    self.prepare_meshes(hp_source, flatten=True)
+                    self.prepare_meshes(lp_source, flatten=True)
+                    current_paths = {node: cmds.ls(uid, long=True)[0] for node, uid in mesh_uuids.items()}
+                    placements = []
+                    split_sources = set()
+                    for bucket in ordered_buckets:
                         base = bucket["base"]
                         hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP, parent=hp_source)
                         lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP, parent=lp_source)
                         hp_root = (cmds.ls(hp_root, long=True) or [hp_root])[0]
                         lp_root = (cmds.ls(lp_root, long=True) or [lp_root])[0]
 
-                        lp_to_move = [node for node in bucket.get("lp_meshes", []) if node and cmds.objExists(node)]
-                        hp_to_move = [node for node in bucket.get("hp_meshes", []) if node and cmds.objExists(node)]
-                        if lp_to_move:
-                            cmds.parent(lp_to_move, lp_root, absolute=True)
-                        if hp_to_move:
-                            cmds.parent(hp_to_move, hp_root, absolute=True)
+                        lp_to_move = []
+                        for source_node, faces in bucket["lp_meshes"]:
+                            node = current_paths[source_node]
+                            if faces is None:
+                                lp_to_move.append(node)
+                                continue
+                            copy = bg_final_export.FinalExportProcessor._duplicate_under_temp_root(node, lp_root)
+                            faces_to_delete = [
+                                "{}.f[{}]".format(copy, face)
+                                for face in range(cmds.polyEvaluate(copy, face=True)) if face not in faces
+                            ]
+                            if faces_to_delete:
+                                cmds.delete(faces_to_delete)
+                            split_sources.add(node)
+                        for node in bucket.get("hp_copies", []):
+                            bg_final_export.FinalExportProcessor._duplicate_under_temp_root(current_paths[node], hp_root)
+                        hp_to_move = [current_paths[node] for node in bucket["hp_meshes"]]
+                        placements.append((lp_to_move, lp_root, hp_to_move, hp_root))
 
                         pair = {
                             "id": str(uuid.uuid4()),
@@ -8043,6 +6586,14 @@ class SceneInteractionMixin:
                             "final_smooth_states": {}
                         }
                         new_pairs.append(pair)
+
+                    for lp_nodes, lp_root, hp_nodes, hp_root in placements:
+                        if lp_nodes:
+                            _parent_preserving_equal_frame(lp_nodes, lp_root)
+                        if hp_nodes:
+                            _parent_preserving_equal_frame(hp_nodes, hp_root)
+                    if split_sources:
+                        cmds.delete(sorted(split_sources))
 
                     self.root_pairs.extend(new_pairs)
                     if hasattr(self.core, 'root_pairs'):
@@ -8076,11 +6627,11 @@ class SceneInteractionMixin:
                         ),
                         "lightblue"
                     )
+                    self.log("Create by Mat: {} HP mesh(es) matched by LP chapter surfaces.".format(
+                        surface_direct_count), "lightblue")
                     self.log(
-                        "Create by Mat LP audit: checked={}, candidates={}, container_conflicts={}.".format(
-                            lp_audit_checked,
-                            lp_audit_candidates,
-                            lp_audit_container_conflicts
+                        "Create by Mat LP audit: checked={}, candidates={}.".format(
+                            lp_audit_checked, lp_audit_candidates
                         ),
                         "lightblue"
                     )
@@ -8093,7 +6644,7 @@ class SceneInteractionMixin:
                     if hasattr(self, 'record_user_action'):
                         self.record_user_action(
                             "Create by Mat",
-                            "chapters={} | book={} | direct_hp={} | container_hp={} | floater_assigned={} | floater_reassigned={} | lp_audit_assigned={} | lp_audit_reassigned={} | lp_audit_checked={} | lp_audit_candidates={} | lp_audit_container_conflicts={} | low_confidence_hp={} | review_hp={}".format(
+                            "chapters={} | book={} | direct_hp={} | container_hp={} | floater_assigned={} | floater_reassigned={} | lp_audit_assigned={} | lp_audit_reassigned={} | lp_audit_checked={} | lp_audit_candidates={} | low_confidence_hp={} | review_hp={}".format(
                                 len(new_pairs),
                                 book_name,
                                 direct_count,
@@ -8104,7 +6655,6 @@ class SceneInteractionMixin:
                                 lp_audit_reassigned,
                                 lp_audit_checked,
                                 lp_audit_candidates,
-                                lp_audit_container_conflicts,
                                 low_confidence,
                                 len(review_hp_meshes)
                             )
@@ -8123,7 +6673,7 @@ class SceneInteractionMixin:
             return 0
         keys = set()
         for mesh_node in self.mesh_transform_nodes_under(lp_node):
-            for rec in self.lp_material_records_for_node(mesh_node, include_faces=False):
+            for rec in self.lp_material_records_for_node(mesh_node, include_faces=True):
                 key = rec.get("key")
                 if key:
                     keys.add(key)
@@ -8149,10 +6699,7 @@ class SceneInteractionMixin:
         return re.sub(r'[^A-Za-z0-9_\-]+', '_', str(name)).strip('_') or "Export"
 
     def _material_split_slots(self, pair):
-        """For a multi-material chapter distributed by the artist into M01/M02...
-        subgroups, return {slot: {'hp': [groups], 'lp': [groups]}}. Returns None
-        when the chapter is NOT splittable: fewer than 2 material slots, or ANY LP
-        mesh carries more than one material (can't be cleanly separated)."""
+        """Resolve populated HP/LP slots with one distinct LP material per slot."""
         if not pair:
             return None
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
@@ -8169,10 +6716,26 @@ class SceneInteractionMixin:
                 slots.setdefault(slot, {'hp': [], 'lp': []})[key].append(g)
         if len(slots) < 2:
             return None
-        # Block if any LP mesh is multi-material (several materials on one mesh).
-        for mesh in self.mesh_transform_nodes_under(lp_main):
-            if len(self.lp_material_records_for_node(mesh, include_faces=False)) > 1:
+        seen_materials = set()
+        for groups in slots.values():
+            hp_meshes = [mesh for group in groups['hp'] for mesh in self.mesh_transform_nodes_under(group)]
+            lp_meshes = [mesh for group in groups['lp'] for mesh in self.mesh_transform_nodes_under(group)]
+            if not hp_meshes or not lp_meshes:
                 return None
+            slot_materials = {}
+            for mesh in lp_meshes:
+                records = self.lp_material_records_for_node(mesh, include_faces=True)
+                if not records:
+                    return None
+                for record in records:
+                    slot_materials[record["key"]] = record.get("material") or record["key"]
+            if len(slot_materials) != 1:
+                return None
+            material_key, material_name = next(iter(slot_materials.items()))
+            if material_key in seen_materials:
+                return None
+            seen_materials.add(material_key)
+            groups["material"] = material_name
         return slots
 
     def split_chapter_by_material(self, pair_id):
@@ -8184,8 +6747,8 @@ class SceneInteractionMixin:
             return
         slots = self._material_split_slots(pair)
         if not slots:
-            return cmds.warning("This chapter cannot be split by material "
-                                "(needs >=2 material slots and no multi-material LP mesh).")
+            return cmds.warning("Split by Material requires at least two populated HP/LP slots "
+                                "with one distinct LP material per slot.")
         hp_main, lp_main, _ = self.core.resolve_main_nodes(pair)
 
         with bg_core.undo_chunk("SplitByMaterial"):
@@ -8194,17 +6757,8 @@ class SceneInteractionMixin:
             new_pairs = []
             for slot in sorted(slots.keys()):
                 groups = slots[slot]
-                # Material name = the material sitting on this slot's LP meshes.
-                matname = slot
-                for lp_sub in groups['lp']:
-                    for mesh in self.mesh_transform_nodes_under(lp_sub):
-                        recs = self.lp_material_records_for_node(mesh, include_faces=False)
-                        if recs:
-                            matname = recs[0].get('material') or recs[0].get('key') or slot
-                            break
-                    if matname != slot:
-                        break
-                base = self._create_by_mat_safe_base(self._clean_material_book_name(matname), used_bases)
+                base = self._create_by_mat_safe_base(
+                    self._clean_material_book_name(groups["material"]), used_bases)
 
                 hp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_HP)
                 lp_root = cmds.group(em=True, name=base + bg_core.BakeConfig.SUFFIX_LP)
@@ -8382,7 +6936,7 @@ class SceneInteractionMixin:
                 to_move = [t for t in mesh_transforms if cmds.listRelatives(t, parent=True, fullPath=True)[0] != root_node]
                 if to_move:
                     try:
-                        cmds.parent(to_move, root_node, absolute=True)
+                        _parent_preserving_equal_frame(to_move, root_node)
                     except:
                         pass
                 all_desc = cmds.listRelatives(root_node, allDescendents=True, fullPath=True, type='transform') or []
@@ -8525,6 +7079,14 @@ class SceneInteractionMixin:
                             pass
                     final_selection.append((cmds.ls(new_name, long=True) or [new_name])[0])
 
+                # polySeparate can leave the source transform as a shell container.
+                # Remove it only after all parts have been moved out.
+                if cmds.objExists(obj) and not cmds.listRelatives(obj, children=True):
+                    try:
+                        cmds.delete(obj)
+                    except RuntimeError as exc:
+                        cmds.warning("Could not remove empty transform {}: {}".format(obj, exc))
+
         cache = getattr(self, '_combined_mesh_check_cache', None)
         if isinstance(cache, dict):
             cache.clear()
@@ -8659,6 +7221,8 @@ class SceneInteractionMixin:
 # ============================================================================
 class TOCMixin:
     """Methods for the right panel table of contents (books, chapters, visibility)."""
+
+    ISOLATED_CHAPTER_ROLE = QtCore.Qt.UserRole + 1
 
     def _add_eye_widget(self, tree_item, is_vis, callback, column=1):
         eye_btn = QtWidgets.QPushButton()
@@ -8803,8 +7367,10 @@ class TOCMixin:
                 pair_item = QtWidgets.QTreeWidgetItem()
                 pair_item.setText(0, text)
                 pair_item.setData(0, QtCore.Qt.UserRole, p['id'])
-                if ("PAIR", p['id']) in selected_keys:
-                    pair_item.setSelected(True)
+                isolated = bool(hp_node and lp_node and self.active_root_id == p['id']
+                                and getattr(self, 'is_isolated', False))
+                for column in (0, 1):
+                    pair_item.setData(column, self.ISOLATED_CHAPTER_ROLE, isolated)
                 if p.get('export_excluded', False):
                     pair_item.setForeground(0, QtGui.QColor("#ffd54f"))
                     pair_item.setToolTip(0, bg_l10n.text("Excluded from export"))
@@ -8817,6 +7383,8 @@ class TOCMixin:
                     font.setBold(True)
                     pair_item.setFont(0, font)
                 parent_item.addChild(pair_item)
+                if ("PAIR", p['id']) in selected_keys:
+                    pair_item.setSelected(True)
                 is_vis = True
                 if hp_node and cmds.objExists(hp_node):
                     is_vis = cmds.getAttr(hp_node + ".visibility")
@@ -9510,69 +8078,59 @@ class TOCMixin:
         if not items:
             return
         clicked_pair = self._toc_pair_from_item(clicked_item)
-        menu = QtWidgets.QMenu()
-        menu.setStyleSheet("QMenu { background-color: #242424; color: #ddd; border: 1px solid #444; } QMenu::item:selected { background-color: #3e3e3e; }")
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(bg_core.BakeConfig.STYLE_CONTEXT_MENU)
+        help_only = self._help_mode
 
-        act_sel = QAction("Select Meshes", self)
-        act_sel.triggered.connect(self.select_toc_items)
-        menu.addAction(act_sel)
+        def add_command(parent, label, topic, command):
+            action = parent.addAction(label)
+            action.setProperty("guideTopic", topic)
+            if help_only:
+                action.triggered.connect(lambda checked=False: self._open_menu_help(menu, topic))
+            else:
+                action.triggered.connect(lambda checked=False: command())
+            return action
 
+        add_command(menu, "Select Meshes", "toc.meshes", self.select_toc_items)
         if clicked_pair:
+            pair_id = clicked_pair.get('id')
             excluded = bool(clicked_pair.get('export_excluded', False))
-            action_text = "Include in export" if excluded else "Exclude from export"
-            act_export = QAction(action_text, self)
-            act_export.triggered.connect(
-                lambda checked=False, p_id=clicked_pair.get('id'), value=not excluded:
-                self.run_undoable_bg_action(
-                    "Chapter Export Exclusion", self.set_chapter_export_excluded, p_id, value))
-            menu.addAction(act_export)
-
-            act_move_mesh = QAction("Move Mesh to", self)
-            act_move_mesh.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Move Mesh to Chapter", self.move_selected_meshes_to_chapter, p_id))
-            menu.addAction(act_move_mesh)
-
-            act_rename_chapter = QAction("Rename Chapter", self)
-            act_rename_chapter.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Rename Chapter", self.rename_toc_chapter, p_id))
-            menu.addAction(act_rename_chapter)
-
-            act_find_lost = QAction("Find Lost (beta)", self)
-            act_find_lost.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Find Lost", self.find_lost_meshes_from_selection, p_id))
-            menu.addAction(act_find_lost)
-
-            # Only for a multi-material chapter the artist already distributed into
-            # M01/M02... subgroups (and with no multi-material LP mesh).
+            add_command(menu, "Include in export" if excluded else "Exclude from export", "toc.export",
+                        lambda: self.run_undoable_bg_action(
+                            "Chapter Export Exclusion", self.set_chapter_export_excluded, pair_id, not excluded))
+            add_command(menu, "Move Mesh to", "toc.meshes", lambda: self.run_undoable_bg_action(
+                "Move Mesh to Chapter", self.move_selected_meshes_to_chapter, pair_id))
+            add_command(menu, "Rename Chapter", "toc.edit", lambda: self.run_undoable_bg_action(
+                "Rename Chapter", self.rename_toc_chapter, pair_id))
+            add_command(menu, "Find Lost (beta)", "toc.find_lost", lambda: self.run_undoable_bg_action(
+                "Find Lost", self.find_lost_meshes_from_selection, pair_id))
             if self._material_split_slots(clicked_pair):
-                act_split = QAction("Split by materials", self)
-                _f = act_split.font(); _f.setBold(True); act_split.setFont(_f)
-                act_split.triggered.connect(lambda checked=False, p_id=clicked_pair.get('id'): self.run_undoable_bg_action("Split by Material", self.split_chapter_by_material, p_id))
-                menu.addAction(act_split)
-
+                action = add_command(menu, "Split by materials", "toc.split", lambda: self.run_undoable_bg_action(
+                    "Split by Material", self.split_chapter_by_material, pair_id))
+                font = action.font()
+                font.setBold(True)
+                action.setFont(font)
             menu.addSeparator()
 
-        act_group = QAction("Group into Book (Ctrl+G)", self)
-        act_group.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Group into Book", self.group_selected_into_book))
-        menu.addAction(act_group)
-
-        existing_books = sorted(list(set([p.get('book') for p in self.root_pairs if p.get('book')])))
+        add_command(menu, "Group into Book (Ctrl+G)", "toc.book", lambda: self.run_undoable_bg_action(
+            "Group into Book", self.group_selected_into_book))
+        existing_books = sorted({pair["book"] for pair in self.root_pairs if pair.get("book")})
         if existing_books:
             add_to_menu = menu.addMenu("Add to")
-            add_to_menu.setStyleSheet("QMenu { background-color: #242424; color: #ddd; border: 1px solid #444; } QMenu::item:selected { background-color: #3e3e3e; }")
-            for b_name in existing_books:
-                action = QAction(b_name, self)
-                action.triggered.connect(lambda checked=False, b=b_name: self.run_undoable_bg_action("Add to Book", self.add_selected_to_existing_book, b))
-                add_to_menu.addAction(action)
-
-        act_ungroup = QAction("Extract from the book", self)
-        act_ungroup.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Extract from Book", self.ungroup_toc_items))
-        menu.addAction(act_ungroup)
-
+            for name in existing_books:
+                add_command(add_to_menu, name, "toc.book", lambda book=name: self.run_undoable_bg_action(
+                    "Add to Book", self.add_selected_to_existing_book, book))
+        add_command(menu, "Extract from the book", "toc.book", lambda: self.run_undoable_bg_action(
+            "Extract from Book", self.ungroup_toc_items))
         menu.addSeparator()
-        act_del = QAction("Delete Selection", self)
-        act_del.triggered.connect(lambda checked=False: self.run_undoable_bg_action("Delete TOC Selection", self.delete_toc_items))
-        menu.addAction(act_del)
+        add_command(menu, "Delete Selection", "toc.edit", lambda: self.run_undoable_bg_action(
+            "Delete TOC Selection", self.delete_toc_items))
 
         bg_l10n.localize_menu(menu)
-        menu.exec_(self.toc_tree.viewport().mapToGlobal(pos))
+        try:
+            menu.exec_(self.toc_tree.viewport().mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
 
     def ungroup_toc_items(self):
         items = self.toc_tree.selectedItems()

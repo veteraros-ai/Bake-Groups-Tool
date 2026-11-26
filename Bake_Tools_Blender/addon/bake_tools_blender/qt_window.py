@@ -38,7 +38,7 @@ from .dependencies import enable_pyside6
 from .qt_window_manager import window_manager as _qt_window_manager
 from . import localization as i18n
 from .progress import cancel_task, set_listener
-from .color_preview import PALETTE
+from . import color_preview
 
 
 QtCore, QtGui, QtWidgets = enable_pyside6()
@@ -50,7 +50,7 @@ _HELP_TOPICS = {
     "Algorithm": "hp.algorithm", "Analyze HP": "hp.analyze",
     "Assign LP": "lp.assign", "Find Sim": "hp.find_similar",
     "Find All": "hp.find_similar", "Find ZBrush": "hp.zbrush",
-    "Check Before Analyze": "hp.check", "HP Visible": "hp.visibility",
+    "Mesh Check": "hp.check", "HP Visible": "hp.visibility",
     "LP Visible": "lp.visibility", "Groups Vis": "groups.visibility",
     "Export Settings": "export.settings", "Smooth View": "export.smooth",
     "Export": "export.run", "LP Triangle": "export.settings",
@@ -59,6 +59,30 @@ _HELP_TOPICS = {
     "Lock subgroup": "groups.row", "Unlock subgroup": "groups.row",
     "Language": "guide.language", "About": "guide.language",
     "Help": "guide.help",
+}
+
+
+_MENU_HELP_TOPICS = {
+    "hp.color": ("Color HP palette", "Select Color"),
+    "groups.create": ("Add subgroup",),
+    "groups.row": ("Rename Subgroup", "Rename subgroup", "Rename Final Group",
+                   "Select subgroup meshes", "Select All Subgroups"),
+    "groups.search": ("Optimize subgroups (delete empty)", "Delete empty groups",
+                      "Group search by mesh", "Group search by mesh (Ctrl+Shift+Z)", "Find group by mesh"),
+    "groups.visibility": ("Show all groups", "Hide all groups", "Isolate active group", "Groups Vis"),
+    "hp.check": ("Skip selected meshes", "Skip check", "Restore check", "Restore skipped meshes", "Remove"),
+    "hp.check.transforms": ("Apply Transforms", "Freeze Transformations"),
+    "hp.check.duplicates": ("Remove Extra Copies",),
+    "hp.zbrush": ("Add to ZBrush Layer", "Add to ZBrush layer…"),
+    "hp.prepare.separate": ("Separate",),
+    "hp.find_similar": ("Find Sim", "Find All"),
+    "chapter.create": ("Split by materials", "Split by Material"),
+    "toc.find_lost": ("Find Lost (beta)",),
+    "toc.menu": ("Select Meshes", "Move Mesh to", "Rename Chapter", "Group into Book",
+                 "Extract from Book", "Extract from the book", "Delete Chapter"),
+    "toc": ("Rename Book", "Ungroup Book", "Select all chapters"),
+    "guide.language": ("English", "Russian", "Chinese", "Japanese"),
+    "guide.log": ("Save Support Package", "Save Debug Log", "Clear Log"),
 }
 
 
@@ -144,7 +168,8 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         # Maya tracks these per UI session, not in the scene file.  A chapter
         # is considered checked only after the complete preflight chain ends.
         self._mesh_checked_pair_ids = set()
-        self._combined_check_skipped_pair_ids = set()
+        self._mesh_check_panel_pair = None
+        self._mesh_check_callback = None
         self._final_selected_ids = set()
         self._final_rows = {}
         self._final_rubber = None
@@ -748,19 +773,13 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         row = self._compact(QtWidgets.QHBoxLayout(group), (3, 3, 3, 3), 2)
         self.combine_button = self._tool("Combine.png", "Combine", "combine", "COMBINE")
         self.separate_button = self._tool("Separate.png", "Separate", "separate", "SEPARATE")
-        self.find_zbrush_button = self._tool(
-            "Find_ZBRUSH.png", "Find ZBrush", "findZbrush", "FIND_ZBRUSH"
-        )
-        self.find_zbrush_button.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.find_zbrush_button.customContextMenuRequested.connect(self._show_find_zbrush_context_menu)
         self.check_mesh_button = self._tool(
-            "Cheking_Icon.png", "Check Before Analyze", "check", "CHECK"
+            "Cheking_Icon.png", "Mesh Check", "check", "CHECK"
         )
         self.check_mesh_button.clicked.disconnect()
-        self.check_mesh_button.clicked.connect(self._run_mesh_check)
+        self.check_mesh_button.clicked.connect(lambda: self._run_mesh_check())
         row.addWidget(self.combine_button)
         row.addWidget(self.separate_button)
-        row.addWidget(self.find_zbrush_button)
         row.addWidget(self.check_mesh_button)
         checks = self._compact(QtWidgets.QVBoxLayout(), (0, 0, 0, 0), 0)
         self.color_hp = QtWidgets.QCheckBox("Color HP")
@@ -773,232 +792,95 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         row.addLayout(checks)
         parent.addWidget(group)
 
-    def _show_find_zbrush_context_menu(self, point):
-        menu = QtWidgets.QMenu(self)
-        panel = QtWidgets.QWidget(menu)
-        layout = self._compact(QtWidgets.QVBoxLayout(panel), (8, 6, 8, 6), 4)
-        threshold = self.controller.zbrush_threshold()
-        label = QtWidgets.QLabel(self._tr("Triangular faces: {}%").format(threshold))
-        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        slider.setRange(1, 100)
-        slider.setValue(threshold)
-        slider.setMinimumWidth(180)
-        slider.valueChanged.connect(
-            lambda value: label.setText(self._tr("Triangular faces: {}%").format(value))
-        )
-        slider.sliderReleased.connect(
-            lambda: self._setting("zbrush_triangle_threshold", slider.value())
-        )
-        layout.addWidget(label)
-        layout.addWidget(slider)
-        widget_action = QtWidgets.QWidgetAction(menu)
-        widget_action.setDefaultWidget(panel)
-        menu.addAction(widget_action)
-        menu.addSeparator()
-        find_action = menu.addAction("Find ZBrush now")
-        add_action = menu.addAction("Add selected meshes to ZBrush layer")
-        select_action = menu.addAction("Select meshes added to ZBrush layer")
-        find_action.triggered.connect(lambda: self.controller.action("FIND_ZBRUSH"))
-        add_action.triggered.connect(lambda: self.controller.action("ZBRUSH_ADD_SELECTED"))
-        select_action.triggered.connect(lambda: self.controller.action("ZBRUSH_SELECT_LAYER"))
-        self._popup_menu(menu, self.find_zbrush_button.mapToGlobal(point))
-
     def _run_mesh_check(self, on_complete=None):
+        self.check_tabs.setCurrentWidget(self.check_panel)
         if not self.controller.action("CHECK"):
             return
-        report, issue_count = self.controller.mesh_check_result()
-        payload = self.controller.mesh_check_payload()
-        payload["report"] = report
-        payload["issue_count"] = issue_count
-        self._show_transform_check(payload, on_complete)
+        self._show_mesh_check(self.controller.mesh_check_payload(), on_complete)
 
-    def _finish_mesh_check(self, payload, on_complete=None):
+    def _show_mesh_check(self, payload, on_complete=None):
+        self.check_tree.clear()
         pair_id = str(payload.get("pair_id") or "")
-        if pair_id:
+        stages = (
+            ("transforms", "Unapplied transforms", "TRANSFORMS", "Apply Transforms", "CHECK_APPLY_TRANSFORMS"),
+            ("zbrush", "Possible ZBrush Meshes", "ZBRUSH", "Add to ZBrush Layer", "CHECK_ADD_ZBRUSH"),
+            ("duplicates", "Duplicates", "DUPLICATES", "Remove Extra Copies", "CHECK_REMOVE_DUPLICATES"),
+            ("combined", "Disconnected geometry", "COMBINED", "Separate", "CHECK_SEPARATE_COMBINED"),
+            ("empty", "Empty mesh objects", "EMPTY", "Remove", "CHECK_REMOVE_EMPTY"),
+        )
+        actions = QtCore.Qt.ItemDataRole.UserRole
+        tab_color = "#a4d8ac"
+        for key, label, category, fix_label, fix in stages:
+            rows = payload.get(key, ())
+            status = "Issues found" if rows else "No issues found"
+            section = QtWidgets.QTreeWidgetItem(self.check_tree, [f"{self._tr(label)} ({len(rows)})"])
+            color = "#ff9e96" if key == "transforms" and rows else "#f2c780" if rows else "#a4d8ac"
+            if rows and (key == "transforms" or tab_color != "#ff9e96"):
+                tab_color = color
+            section.setForeground(0, QtGui.QBrush(QtGui.QColor(color)))
+            section.setToolTip(0, self._tr(status))
+            if rows:
+                section.setData(0, actions, ["CHECK_SELECT_" + category, fix_label, fix])
+            for row in rows:
+                names = row if isinstance(row, (list, tuple)) else [row]
+                item = QtWidgets.QTreeWidgetItem(section, [", ".join(names)])
+                item.setToolTip(0, "\n".join(names))
+                item.setData(0, actions, list(names))
+            section.setExpanded(bool(rows))
+        indicator = QtGui.QPixmap(8, 8)
+        indicator.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(indicator)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor(tab_color))
+        painter.drawEllipse(0, 0, 8, 8)
+        painter.end()
+        self.check_tabs.setTabIcon(1, QtGui.QIcon(indicator))
+        self._mesh_check_callback = on_complete
+        self._mesh_check_panel_pair = pair_id
+        self.check_continue.setVisible(bool(on_complete))
+        if pair_id and not payload.get("transforms"):
             self._mesh_checked_pair_ids.add(pair_id)
-        if on_complete:
-            on_complete()
+        elif pair_id:
+            self._mesh_checked_pair_ids.discard(pair_id)
+
+    def _select_mesh_check_row(self, item, _column):
+        if not item.parent() or not self._mesh_check_is_current():
             return
-        issue_count = int(payload.get("issue_count") or 0)
-        text = (
-            self._tr("Mesh Check completed. Review the actions in the Log.")
-            if issue_count else self._tr("Mesh Check completed. No issues found.")
-        )
-        box = QtWidgets.QMessageBox(
-            QtWidgets.QMessageBox.Icon.Information,
-            self._tr("Mesh Check"), text, parent=self,
-        )
-        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-        self._open_nonblocking(box)
+        from .object_repository import ObjectRepository
+        names = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        objects = [obj for name in names if (obj := bpy.data.objects.get(name)) is not None
+                   and obj.name in bpy.context.view_layer.objects]
+        ObjectRepository.select_objects(bpy.context, objects)
 
-    def _show_transform_check(self, payload, on_complete=None):
-        names = tuple(payload.get("transforms") or ())
-        if not names:
-            self._show_duplicate_check(payload, on_complete)
+    def _mesh_check_is_current(self):
+        return bool(self._snapshot and self._mesh_check_panel_pair == self._snapshot.active_pair_id)
+
+    def _mesh_check_menu(self, point):
+        item = self.check_tree.itemAt(point)
+        if not item or not self._mesh_check_is_current():
             return
-        shown = list(names[:12])
-        if len(names) > 12:
-            shown.append("... +{}".format(len(names) - 12))
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(self._tr("Apply Transformations"))
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setText(self._tr("Objects with unapplied Location, Rotation or Scale were found."))
-        box.setInformativeText("{}\n\n{}".format(
-            self._tr("Apply transformations now without changing visible mesh geometry, select the objects for inspection, or skip this warning."),
-            "\n".join(shown),
-        ))
-        select_button = box.addButton(self._tr("Select"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        apply_button = box.addButton(self._tr("Apply Transforms"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        skip_button = box.addButton(self._tr("Skip"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        box.setDefaultButton(apply_button)
-
-        def finished(_result):
-            clicked = box.clickedButton()
-            if clicked == select_button:
-                self._defer_dialog_action(
-                    lambda: self.controller.action("CHECK_SELECT_TRANSFORMS")
-                )
-            elif clicked == apply_button:
-                def apply_and_continue():
-                    if self.controller.action("CHECK_APPLY_TRANSFORMS"):
-                        self._show_duplicate_check(payload, on_complete)
-                self._defer_dialog_action(apply_and_continue)
-            elif clicked == skip_button:
-                self._defer_dialog_action(
-                    lambda: self._show_duplicate_check(payload, on_complete)
-                )
-        box.finished.connect(finished)
-        self._open_nonblocking(box)
-
-    def _show_duplicate_check(self, payload, on_complete=None):
-        groups = tuple(payload.get("duplicates") or ())
-        if not groups:
-            self._show_zbrush_check(payload, on_complete)
+        section = item.parent() or item
+        actions = section.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if not actions:
             return
-        preview = []
-        for index, names in enumerate(groups[:4], 1):
-            shown = list(names[:6])
-            if len(names) > 6:
-                shown.append("... +{}".format(len(names) - 6))
-            preview.append("{} {}: {}".format(self._tr("Group"), index, ", ".join(shown)))
-        if len(groups) > 4:
-            preview.append("... +{}".format(len(groups) - 4))
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(self._tr("Duplicate Meshes Found"))
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setText(self._tr("Duplicate meshes were found before Analyze HP."))
-        box.setInformativeText("{}\n\n{}".format(
-            self._tr("Resolve duplicates before running Analyze HP. Select the found meshes, remove extra copies, or skip this warning and continue."),
-            "\n".join(preview),
-        ))
-        select_button = box.addButton(self._tr("Select"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        remove_button = box.addButton(self._tr("Remove Extra Copies"), QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
-        skip_button = box.addButton(self._tr("Skip"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.setDefaultButton(select_button)
+        select, fix_label, fix = actions
+        menu = QtWidgets.QMenu(self)
+        menu.addAction(self._tr("Select"), lambda: self._select_mesh_check_row(item, 0)
+                       if item.parent() else self.controller.action(select))
+        if not item.parent():
+            menu.addAction(self._tr(fix_label), lambda: self._confirm(
+                self._tr("Mesh Check"), self._tr(fix_label) + "?",
+                lambda: self._fix_mesh_check(fix)))
+        self._popup_menu(menu, self.check_tree.viewport().mapToGlobal(point))
 
-        def finished(_result):
-            clicked = box.clickedButton()
-            if clicked == select_button:
-                self._defer_dialog_action(
-                    lambda: self.controller.action("CHECK_SELECT_DUPLICATES")
-                )
-            elif clicked == remove_button:
-                def remove_and_continue():
-                    self.controller.action("CHECK_REMOVE_DUPLICATES")
-                    self._show_zbrush_check(payload, on_complete)
-                self._defer_dialog_action(remove_and_continue)
-            elif clicked == skip_button:
-                self._defer_dialog_action(
-                    lambda: self._show_zbrush_check(payload, on_complete)
-                )
-        box.finished.connect(finished)
-        self._open_nonblocking(box)
+    def _fix_mesh_check(self, action):
+        if self._mesh_check_is_current() and self.controller.action(action):
+            self._run_mesh_check(self._mesh_check_callback)
 
-    def _show_zbrush_check(self, payload, on_complete=None):
-        names = tuple(payload.get("zbrush") or ())
-        if not names:
-            self._show_combined_check(payload, on_complete)
-            return
-        shown = list(names[:12])
-        if len(names) > 12:
-            shown.append("... +{}".format(len(names) - 12))
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(self._tr("Possible ZBrush Meshes"))
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setText(self._tr("Possible ZBrush meshes were found before Analyze HP."))
-        box.setInformativeText("{}\n\n{}".format(
-            self._tr("Add these meshes to the BakeTools ZBrush layer, select them for inspection, or skip this warning and continue."),
-            "\n".join(shown),
-        ))
-        select_button = box.addButton(self._tr("Select"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        add_button = box.addButton(self._tr("Add to ZBrush Layer"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        skip_button = box.addButton(self._tr("Skip"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.setDefaultButton(add_button)
-
-        def finished(_result):
-            clicked = box.clickedButton()
-            if clicked == select_button:
-                self._defer_dialog_action(
-                    lambda: self.controller.action("CHECK_SELECT_ZBRUSH")
-                )
-            elif clicked == add_button:
-                def add_and_continue():
-                    self.controller.action("CHECK_ADD_ZBRUSH")
-                    self._show_combined_check(payload, on_complete)
-                self._defer_dialog_action(add_and_continue)
-            elif clicked == skip_button:
-                self._defer_dialog_action(
-                    lambda: self._show_combined_check(payload, on_complete)
-                )
-        box.finished.connect(finished)
-        self._open_nonblocking(box)
-
-    def _show_combined_check(self, payload, on_complete=None):
-        names = tuple(payload.get("combined") or ())
-        pair_id = str(payload.get("pair_id") or "")
-        if not names or pair_id in self._combined_check_skipped_pair_ids:
-            self._finish_mesh_check(payload, on_complete)
-            return
-        shown = list(names[:12])
-        if len(names) > 12:
-            shown.append("... +{}".format(len(names) - 12))
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(self._tr("Combined Meshes Found"))
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setText(self._tr("Combined mesh candidates were found before Analyze HP."))
-        box.setInformativeText("{}\n\n{}".format(
-            self._tr("These meshes may need to be separated before analysis. Select them, separate them now, or skip this warning and continue."),
-            "\n".join(shown),
-        ))
-        select_button = box.addButton(self._tr("Select"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        separate_button = box.addButton(self._tr("Separate"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        skip_chapter = box.addButton(self._tr("Skip This Chapter"), QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        skip_button = box.addButton(self._tr("Skip"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.setDefaultButton(select_button)
-
-        def finished(_result):
-            clicked = box.clickedButton()
-            if clicked == select_button:
-                self._defer_dialog_action(
-                    lambda: self.controller.action("CHECK_SELECT_COMBINED")
-                )
-            elif clicked == separate_button:
-                def separate_and_finish():
-                    self.controller.action("CHECK_SEPARATE_COMBINED")
-                    self._finish_mesh_check(payload, on_complete)
-                self._defer_dialog_action(separate_and_finish)
-            elif clicked == skip_chapter:
-                def skip_chapter_and_finish():
-                    if pair_id:
-                        self._combined_check_skipped_pair_ids.add(pair_id)
-                    self._finish_mesh_check(payload, on_complete)
-                self._defer_dialog_action(skip_chapter_and_finish)
-            elif clicked == skip_button:
-                self._defer_dialog_action(
-                    lambda: self._finish_mesh_check(payload, on_complete)
-                )
-        box.finished.connect(finished)
-        self._open_nonblocking(box)
+    def _continue_mesh_check(self):
+        if self._mesh_check_is_current() and self._mesh_check_callback:
+            self._mesh_check_callback()
 
     def _request_analyze_hp(self):
         pair_id = str(self._snapshot.active_pair_id if self._snapshot else "")
@@ -1114,7 +996,58 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self.subgroup_body.customContextMenuRequested.connect(
             lambda pos: self._show_subgroup_menu(self.subgroup_body.mapToGlobal(pos), "")
         )
-        parent.addWidget(self.subgroup_scroll, 1)
+        self.check_tabs = QtWidgets.QTabWidget()
+        self.check_tabs.setObjectName("groupsCheckTabs")
+        self.check_tabs.setDocumentMode(True)
+        self.check_tabs.tabBar().setExpanding(True)
+        self.check_tabs.setIconSize(QtCore.QSize(8, 8))
+        self.check_tabs.setStyleSheet("""
+            QTabWidget#groupsCheckTabs::pane {
+                background: #242424;
+                border: 1px solid #414141;
+                top: -1px;
+            }
+            QTabWidget#groupsCheckTabs QTabBar::tab {
+                background: #2b2b2b;
+                color: #c9c9c9;
+                border: 1px solid #414141;
+                padding: 3px 8px;
+            }
+            QTabWidget#groupsCheckTabs QTabBar::tab:hover {
+                background: #393939;
+                color: #eeeeee;
+            }
+            QTabWidget#groupsCheckTabs QTabBar::tab:selected {
+                background: #424242;
+                color: #ffffff;
+                border-bottom-color: #8a8a8a;
+            }
+        """)
+        self.check_tabs.addTab(self.subgroup_scroll, self._tr("Groups"))
+        self.check_panel = QtWidgets.QWidget()
+        self.check_panel.setProperty("bt_help_topic", "hp.check")
+        self.subgroup_scroll.setProperty("bt_help_topic", "groups.tab")
+        check_layout = self._compact(QtWidgets.QVBoxLayout(self.check_panel), (3, 3, 3, 3), 3)
+        self.check_tree = QtWidgets.QTreeWidget()
+        self.check_tree.setHeaderHidden(True)
+        self.check_tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.check_tree.customContextMenuRequested.connect(self._mesh_check_menu)
+        self.check_tree.itemDoubleClicked.connect(self._select_mesh_check_row)
+        check_layout.addWidget(self.check_tree)
+        threshold = QtWidgets.QSpinBox()
+        threshold.setRange(1, 100)
+        threshold.setSuffix("%")
+        threshold.setValue(self.controller.zbrush_threshold())
+        threshold.valueChanged.connect(lambda value: self._setting("zbrush_triangle_threshold", value))
+        threshold_row = QtWidgets.QFormLayout()
+        threshold_row.addRow(self._tr("ZBrush triangle threshold"), threshold)
+        check_layout.addLayout(threshold_row)
+        check_layout.addWidget(self._button("Check Now", lambda: self._run_mesh_check()))
+        self.check_continue = self._button("Analyze HP", self._continue_mesh_check)
+        self.check_continue.hide()
+        check_layout.addWidget(self.check_continue)
+        self.check_tabs.addTab(self.check_panel, self._tr("Mesh Check"))
+        parent.addWidget(self.check_tabs, 1)
 
     def _build_bottom_actions(self, parent):
         self.normal_actions = QtWidgets.QWidget()
@@ -1588,6 +1521,14 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         self.find_button.style().unpolish(self.find_button); self.find_button.style().polish(self.find_button)
         self._refresh_export_controls(snapshot)
         self._refresh_mode(snapshot.final_view, snapshot.cage_wire)
+        self.check_tabs.setTabText(0, self._tr("Groups"))
+        self.check_tabs.setTabText(1, self._tr("Mesh Check"))
+        if self._mesh_check_panel_pair is not None and self._mesh_check_panel_pair != snapshot.active_pair_id:
+            self.check_tree.clear()
+            self.check_tabs.setTabIcon(1, QtGui.QIcon())
+            self.check_continue.hide()
+            self._mesh_check_panel_pair = None
+            self._mesh_check_callback = None
         subgroup_sig = (snapshot.active_pair_id, snapshot.active_subgroup, snapshot.final_view,
                         active.subgroups if active else ())
         if force or self._section_signatures.get("subgroups") != subgroup_sig:
@@ -1622,6 +1563,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
     def _refresh_mode(self, final_view, cage_wire):
         self.normal_actions.setVisible(not final_view); self.final_actions.setVisible(final_view)
         self.subgroups_title.setVisible(not final_view)
+        self.check_tabs.setTabVisible(1, not final_view)
         self.matcher_panel.setVisible(False)
         self.cage_panel.setVisible(final_view); self.export_panel.setVisible(final_view)
         self.cage_display.setIcon(QtGui.QIcon(_asset_path("Cage_Solid_Gray.png" if cage_wire else "Cage_Wireframe.png")))
@@ -1824,6 +1766,11 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
                 self.cancel_help_mode()
                 QtCore.QTimer.singleShot(0, lambda value=topic: self.show_guide(value))
                 return True
+            if isinstance(watched, QtWidgets.QMenu):
+                return self._help_menu_event(watched, event)
+            if (event_type == QtCore.QEvent.ContextMenu and
+                    isinstance(watched, QtWidgets.QWidget) and self.isAncestorOf(watched)):
+                self._help_menu_origin = self._help_topic_for(watched)
             if (event_type == QtCore.QEvent.Type.MouseButtonPress and
                     event.button() == QtCore.Qt.MouseButton.LeftButton and
                     isinstance(watched, QtWidgets.QWidget)):
@@ -1831,7 +1778,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
                 while widget is not None and widget is not self:
                     widget = widget.parentWidget()
                 if widget is self:
-                    self._help_pending_topic = self._help_topic_for(watched)
+                    self._help_pending_topic = self._help_clicked_topic(watched, event)
                     self._help_release_pending = True
                     return True
         if watched is self.subgroup_body and self._snapshot and self._snapshot.final_view:
@@ -1865,6 +1812,53 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
                 return True
         return super().eventFilter(watched, event)
 
+    def _help_menu_event(self, menu, event):
+        owner = menu.parentWidget()
+        while owner is not None and owner is not self:
+            owner = owner.parentWidget()
+        if owner is None:
+            return False
+        event_type = event.type()
+        if event_type in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease):
+            if event.button() != QtCore.Qt.LeftButton:
+                return False
+            position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            action = menu.actionAt(position)
+        elif event_type == QtCore.QEvent.KeyPress and event.key() in (
+            QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Space
+        ):
+            action = menu.activeAction()
+        else:
+            # Mnemonics must not execute commands while Help is armed.
+            return event_type == QtCore.QEvent.KeyPress and bool(event.text().strip())
+        if action is None or action.isSeparator() or action.menu() is not None:
+            return False
+        # Consume the activation before QMenu can emit triggered().
+        if event_type == QtCore.QEvent.MouseButtonPress:
+            return True
+        label = action.text().split("\t", 1)[0].replace("&", "").strip()
+        topic = action.property("guideTopic")
+        if not topic:
+            translate = self._tr
+            topic = next((key for key, labels in _MENU_HELP_TOPICS.items()
+                          if any(label in (name, translate(name)) for name in labels)),
+                         self._help_menu_origin)
+        root = menu
+        while isinstance(root.parentWidget(), QtWidgets.QMenu):
+            root = root.parentWidget()
+        self.cancel_help_mode()
+        root.close()
+        QtCore.QTimer.singleShot(0, lambda: self.show_guide(topic))
+        return True
+
+    def _help_clicked_topic(self, widget, event):
+        if widget is self.check_tabs.tabBar():
+            position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            index = widget.tabAt(position)
+            if index >= 0:
+                return "groups.tab" if index == 0 else "hp.check"
+        return self._help_topic_for(widget)
+
     def _help_topic_for(self, widget):
         while isinstance(widget, QtWidgets.QWidget):
             topic = widget.property("bt_help_topic")
@@ -1880,6 +1874,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             self.cancel_help_mode()
             return
         self._help_mode = True
+        self._help_menu_origin = "overview"
         self.help_button.setText("?  " + self._tr("Help"))
         app = QtWidgets.QApplication.instance()
         if app is not None:
@@ -1923,13 +1918,7 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
         return True
 
     def _subgroup_rgb(self, subgroup):
-        if subgroup.custom_color is not None:
-            return tuple(float(value) for value in subgroup.custom_color)
-        index = max(0, int(subgroup.color_index))
-        base = PALETTE[index % len(PALETTE)]
-        shade_pass = index // len(PALETTE)
-        shade = 1.0 if shade_pass == 0 else max(0.38, 0.62 ** shade_pass)
-        return tuple(channel * shade for channel in base)
+        return color_preview.subgroup_rgb(subgroup, subgroup.custom_color)
 
     @staticmethod
     def _rgba(rgb, alpha):
@@ -2091,7 +2080,145 @@ class BakeToolsWindow(QtWidgets.QMainWindow):
             menu.addAction("Optimize subgroups (delete empty)", lambda: self.controller.action("OPTIMIZE_GROUPS"))
             menu.addAction("Group search by mesh", lambda: self.controller.action("FIND_SUBGROUP")); menu.addSeparator()
             menu.addAction("Delete", lambda: self._confirm_delete_subgroup(subgroup_id, "subgroup"))
+        menu.addAction(self._tr("Color HP palette"), self._edit_hp_palette)
         self._popup_menu(menu, global_pos)
+
+    def _edit_hp_palette(self):
+        for window in self._open_dialogs:
+            if window.objectName() == "hpPaletteDialog":
+                window.raise_()
+                window.activateWindow()
+                return
+        tr = self._tr
+        settings = color_preview.load_palette_settings()
+        presets = settings.setdefault("presets", {})
+        original = color_preview.get_palette()
+        colors, overrides = list(original[0]), dict(original[1])
+        state = self.controller.store.settings()
+        pair = next((item for item in state.pairs if item.item_id == state.active_pair_id), None) if state else None
+        if pair:
+            color_preview.ensure_pair_color_indices(pair)
+        groups = [(group.name, group.color_index,
+                   tuple(group.custom_color) if group.use_custom_color else None)
+                  for group in pair.subgroups] if pair else []
+        dialog = QtWidgets.QDialog(self)
+        dialog.setObjectName("hpPaletteDialog")
+        dialog.setWindowTitle(tr("Color HP palette"))
+        dialog.resize(420, 520)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        selector = QtWidgets.QComboBox()
+        selector.addItems([tr("Current colors"), tr("Factory palette"), *sorted(presets)])
+        layout.addWidget(selector)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+        name = QtWidgets.QLineEdit()
+        name.setPlaceholderText(tr("New preset name (optional)"))
+        layout.addWidget(name)
+        default = QtWidgets.QCheckBox(tr("Use as default on next launch"))
+        layout.addWidget(default)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def preview(palette, custom):
+            color_preview.set_palette(palette, custom)
+            current = self.controller.store.settings()
+            if current:
+                active = next((item for item in current.pairs if item.item_id == current.active_pair_id), None)
+                color_preview.refresh_color_preview(current, active)
+            self.refresh_from_store(force=True)
+
+        def choose(rgb, apply_color):
+            picker = QtWidgets.QColorDialog(QtGui.QColor.fromRgbF(*rgb), dialog)
+
+            def changed(value):
+                if value.isValid() and dialog in self._open_dialogs:
+                    apply_color([value.redF(), value.greenF(), value.blueF()])
+                    preview(colors, overrides)
+                    redraw()
+
+            picker.colorSelected.connect(changed)
+            self._open_nonblocking(picker)
+
+        def redraw():
+            page = QtWidgets.QWidget()
+            grid = QtWidgets.QGridLayout(page)
+            grid.setColumnStretch(2, 1)
+
+            def row(slot, rgb, label, apply_color):
+                index = grid.rowCount() if grid.count() else 0
+                q = QtGui.QColor.fromRgbF(*rgb)
+                button = QtWidgets.QPushButton(q.name().upper())
+                ink = "black" if q.lightnessF() > .55 else "white"
+                button.setStyleSheet(f"background-color: {q.name()}; color: {ink};")
+                button.clicked.connect(lambda checked=False: choose(rgb, apply_color))
+                grid.addWidget(QtWidgets.QLabel(slot), index, 0)
+                grid.addWidget(button, index, 1)
+                group_label = QtWidgets.QLabel(label)
+                group_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+                group_label.setWordWrap(True)
+                grid.addWidget(group_label, index, 2)
+
+            for slot, rgb in enumerate(colors):
+                direct = []
+                separate = []
+                for group, index, custom in groups:
+                    if index % len(colors) != slot:
+                        continue
+                    custom = overrides.get(group, custom)
+                    if custom is None and index < len(colors):
+                        direct.append(group)
+                    else:
+                        separate.append((group, custom or color_preview.indexed_rgb(index, colors)))
+                row(str(slot + 1), rgb, ", ".join(direct), partial(colors.__setitem__, slot))
+                for group, shade in separate:
+                    row("", shade, group, partial(overrides.__setitem__, group))
+            grid.setRowStretch(grid.rowCount(), 1)
+            position = scroll.verticalScrollBar().value()
+            old = scroll.takeWidget()
+            if old:
+                old.deleteLater()
+            scroll.setWidget(page)
+            scroll.verticalScrollBar().setValue(position)
+
+        def load(index):
+            overrides.clear()
+            if index == 0:
+                colors[:] = original[0]
+                overrides.update(original[1])
+            elif index == 1:
+                colors[:] = color_preview.PALETTE
+            else:
+                preset = presets[selector.currentText()]
+                colors[:] = preset["colors"]
+                overrides.update(preset["overrides"])
+            preview(colors, overrides)
+            redraw()
+
+        def accept():
+            preset_name = name.text().strip()
+            if preset_name and selector.findText(preset_name) >= 0:
+                self._warning(tr("Color HP palette"), tr("Choose a unique preset name"))
+                return
+            palette = {"colors": colors, "overrides": overrides}
+            if preset_name:
+                presets[preset_name] = palette
+            if default.isChecked():
+                settings["default"] = palette
+            if preset_name or default.isChecked():
+                try:
+                    color_preview.save_palette_settings(settings)
+                except OSError as exc:
+                    self._warning(tr("Color HP palette"), str(exc))
+                    return
+            dialog.accept()
+
+        selector.currentIndexChanged.connect(load)
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.rejected.connect(lambda: preview(*original))
+        redraw()
+        self._open_nonblocking(dialog)
 
     def _show_final_subgroup_menu(self, global_pos, subgroup_id):
         menu = QtWidgets.QMenu(self)

@@ -263,9 +263,10 @@ def separate_selected(context, state, progress=None):
         bpy.ops.object.mode_set(mode="OBJECT")
         if "FINISHED" not in result:
             continue
-        parts = [obj for obj in context.selected_objects if obj.type == "MESH"]
+        parts = [obj for obj in context.selected_objects if obj.type == "MESH" and len(obj.data.vertices)]
         if len(parts) < 2:
             continue
+        empty_source = not len(source.data.vertices) and not source.children
         parts.sort(key=lambda obj: (obj != source, obj.name.lower()))
         separated_sources += 1
         for index, part in enumerate(parts, 1):
@@ -274,6 +275,8 @@ def separate_selected(context, state, progress=None):
         _ensure_membership_for_results(state, records, parts)
         if was_zbrush:
             mark_zbrush_objects(context, state, parts)
+        if empty_source:
+            bpy.data.objects.remove(source, do_unlink=True)
         final.extend(parts)
         if progress:
             progress.update(int((source_index + 1) * 100 / max(1, len(sources))), "Separating: {}".format(base_name))
@@ -304,6 +307,7 @@ class MeshCheckResult:
     duplicate_groups: tuple[tuple, ...]
     zbrush_candidates: tuple
     combined_meshes: tuple
+    empty_objects: tuple = ()
 
     @property
     def issue_count(self):
@@ -316,6 +320,7 @@ class MeshCheckResult:
             "duplicates": [[obj.name for obj in group] for group in self.duplicate_groups],
             "zbrush": [obj.name for obj in self.zbrush_candidates],
             "combined": [obj.name for obj in self.combined_meshes],
+            "empty": [obj.name for obj in self.empty_objects],
             "issues": [obj.name for obj in self.issue_objects],
         }
 
@@ -559,9 +564,11 @@ def check_active_pair(context, state, pair, progress=None):
         obj for obj, info in facts.items() if info.meaningful_components >= 2
     )
 
+    empty_objects = tuple(obj for obj in objects if _empty_mesh_object(obj))
+
     issues = []
     issue_seen = set()
-    for obj in list(transform_objects) + [item for group in duplicate_groups for item in group] + list(zbrush_candidates) + list(combined):
+    for obj in list(transform_objects) + [item for group in duplicate_groups for item in group] + list(zbrush_candidates) + list(combined) + list(empty_objects):
         key = obj.as_pointer()
         if key not in issue_seen:
             issue_seen.add(key)
@@ -609,6 +616,7 @@ def check_active_pair(context, state, pair, progress=None):
         duplicate_groups=duplicate_groups,
         zbrush_candidates=zbrush_candidates,
         combined_meshes=combined,
+        empty_objects=empty_objects,
     )
 
 
@@ -643,6 +651,8 @@ def select_check_category(context, state, pair, category):
         names = [name for group in payload.get("duplicates", ()) for name in group]
     elif category == "ZBRUSH":
         names = payload.get("zbrush", ())
+    elif category == "EMPTY":
+        names = payload.get("empty", ())
     elif category == "COMBINED":
         names = payload.get("combined", ())
     else:
@@ -650,6 +660,25 @@ def select_check_category(context, state, pair, category):
     return ObjectRepository.select_objects(
         context, _objects_from_names(context, names, mesh_only=(category != "TRANSFORMS"))
     )
+
+
+def _empty_mesh_object(obj):
+    return (obj.type == "MESH" and obj.data is not None and not obj.data.vertices
+            and not obj.children and not obj.modifiers and obj.library is None
+            and obj.override_library is None)
+
+
+def remove_check_empty_objects(context, state, pair):
+    payload = decode_check_payload(state, pair)
+    scoped = {obj for side in ("HP", "LP") for obj in ObjectRepository.meshes_under_root(pair, side)}
+    removed = 0
+    for obj in _objects_from_names(context, payload.get("empty", ())):
+        if obj in scoped and _empty_mesh_object(obj):
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+    _prune_project_refs(state)
+    ObjectRepository.sync_counts(pair)
+    return removed
 
 
 def remove_duplicate_copies(context, state, pair):

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import print_function, division, absolute_import
 
 import time
@@ -7,6 +7,10 @@ import re
 import traceback
 
 import bg_core
+try:
+    from bg_shape_match import ShapeMatcher
+except ImportError:
+    ShapeMatcher = None
 try:
     import bg_math_core_runtime as bg_math_core
     HAS_MATH_CORE = True
@@ -24,6 +28,9 @@ except ImportError:
     from PySide2 import QtCore
 
 
+DEFAULT_BOLT_ELONGATION = 2.5
+
+
 class HPGroupingWorker(QtCore.QThread):
     progress_value = QtCore.Signal(int)
     progress_text = QtCore.Signal(str)
@@ -34,13 +41,16 @@ class HPGroupingWorker(QtCore.QThread):
     def __init__(self, hp_data, lp_data, hp_verts_cache, lp_verts_cache, hp_holes_cache,
                  threshold_pct, group_limit, custom_clusters_dict=None, 
                  locked_names=None, strategy=1, use_symmetry=True,
-                 bolt_elongation=2.5, bolt_symmetry=0.8, wire_elongation=6.0, # wire_elongation СѓРІРµР»РёС‡РµРЅ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ
+                 bolt_elongation=DEFAULT_BOLT_ELONGATION, bolt_symmetry=0.8, wire_elongation=6.0,
                  compound_link_enabled=True,
                  compound_link_verts=8, compound_link_dist_pct=0.1,
                  detect_floaters=True, floater_radius=0.3,
-                 hp_surface_cache=None, lp_surface_cache=None):
+                 hp_surface_cache=None, lp_surface_cache=None, hp_supports=None):
         super(HPGroupingWorker, self).__init__()
         self.hp_data = hp_data
+        # Opt-in snapshots for scene comparisons; ordinary analysis keeps no copies.
+        self.capture_diagnostics = False
+        self.diagnostics = {}
         self.lp_data = lp_data 
         
         self.hp_verts_cache = hp_verts_cache
@@ -48,6 +58,7 @@ class HPGroupingWorker(QtCore.QThread):
         self.hp_holes_cache = hp_holes_cache
         self.hp_surface_cache = hp_surface_cache or {}
         self.lp_surface_cache = lp_surface_cache or {}
+        self.hp_supports = hp_supports or {}
         
         self.threshold_pct = threshold_pct / 100.0
         self.threshold_delta = self.threshold_pct - 0.15
@@ -104,8 +115,20 @@ class HPGroupingWorker(QtCore.QThread):
         logs = []
         self.debug_lines = []
         self.summary_lines = []
+        self.diagnostics = {}
         groups = {}
+        def _capture_groups(stage):
+            if self.capture_diagnostics:
+                self.diagnostics[stage] = {
+                    name: [m.get('uuid') or m.get('name') for m in members]
+                    for name, members in groups.items()
+                }
         linked_mesh_names = set()
+
+        # ShapeMatcher retains only compact features and its cache is scoped to
+        # this analysis run. Keep it independent from the optional native core.
+        hp_shape_matcher = ShapeMatcher(self.hp_verts_cache) if ShapeMatcher else None
+        lp_shape_matcher = ShapeMatcher(self.lp_verts_cache) if ShapeMatcher else None
 
         strategy_name = ["Spatial Volume Match", "Vertex Proximity", "Topology Fingerprint"][self.strategy] if self.strategy in (0, 1, 2) else str(self.strategy)
 
@@ -192,7 +215,10 @@ class HPGroupingWorker(QtCore.QThread):
             self.compound_link_dist_pct,
             self.group_limit
         ))
+        _debug("Shape thresholds: bolt_elongation={}, bolt_symmetry={}, wire_elongation={}.".format(
+            self.bolt_elongation, self.bolt_symmetry, self.wire_elongation))
         _debug("Input: {} HP mesh(es), {} LP mesh(es).".format(len(self.hp_data), len(self.lp_data)))
+        _debug("Strict point-cloud matcher: {}.".format("enabled" if hp_shape_matcher and lp_shape_matcher else "unavailable"))
         lp_material_slots = sorted(set([
             info.get("material_slot") for info in self.lp_data.values()
             if info.get("material_slot")
@@ -222,7 +248,7 @@ class HPGroupingWorker(QtCore.QThread):
             uid = hp_info.get('uuid')
             if uid and uid in self.manual_uuid_set:
                 continue
-            if hp_info.get("is_zbrush", False) or "ZBrush" in hp_name or "zbrush" in hp_name.lower():
+            if hp_info.get("is_zbrush", "_zbrush" in hp_name.lower()):
                 match = re.search(r'(.+?)_high', hp_name, re.IGNORECASE)
                 if match:
                     root_name = match.group(1)
@@ -354,7 +380,7 @@ class HPGroupingWorker(QtCore.QThread):
                 nearest_lp = min(sorted_lp_names, key=lambda lp: _center_dist(hp_info, self.lp_data[lp]))
                 nearest_info = self.lp_data[nearest_lp]
                 lp_diag = max(nearest_info.get('diag', nearest_info.get('radius', 1.0) * 2.0), 0.001)
-                is_zb = hp_info.get('is_zbrush', False) or 'zbrush' in hp_name.lower()
+                is_zb = hp_info.get('is_zbrush', '_zbrush' in hp_name.lower())
                 if is_zb:
                     max_dist = max(min(hp_diag, lp_diag) * 2.0, hp_diag * 1.25, 0.001) * self.match_tolerance_scale
                 else:
@@ -391,7 +417,7 @@ class HPGroupingWorker(QtCore.QThread):
 
         def _is_zbrush_hp(hp_name):
             hp_info = self.hp_data.get(hp_name, {})
-            return hp_info.get('is_zbrush', False) or 'zbrush' in hp_name.lower()
+            return hp_info.get('is_zbrush', '_zbrush' in hp_name.lower())
 
         def _flat_to_points(flat_verts):
             points = []
@@ -962,7 +988,7 @@ class HPGroupingWorker(QtCore.QThread):
 
                     hp_diag = hp_info.get("diag", 1.0)
                     lp_diag = best_lp_info.get("diag", 1.0)
-                    is_zb = hp_info.get('is_zbrush', False) or 'zbrush' in hp_name.lower()
+                    is_zb = hp_info.get('is_zbrush', '_zbrush' in hp_name.lower())
                     threshold = ((hp_diag * (1.25 if is_zb else 0.5)) + (lp_diag * (0.75 if is_zb else 0.25))) * self.match_tolerance_scale
 
                     if avg_dist <= threshold:
@@ -979,7 +1005,7 @@ class HPGroupingWorker(QtCore.QThread):
             # Fallback for ZBrush or missing/too sparse vertex cache: accept the chosen candidate.
             if not assigned_to_lp:
                 hp_info = self.hp_data[hp_name]
-                is_zb = hp_info.get('is_zbrush', False) or 'zbrush' in hp_name.lower()
+                is_zb = hp_info.get('is_zbrush', '_zbrush' in hp_name.lower())
                 if (not HAS_MATH_CORE) or (not hp_verts) or is_zb:
                     assigned_to_lp = True
                     validation += " | accepted by fallback"
@@ -1556,7 +1582,8 @@ class HPGroupingWorker(QtCore.QThread):
                         continue
                 
                     for potential_floater in sorted(weak_floater_candidates, key=_short_name):
-                        if potential_floater == parent_hp or potential_floater in floaters_assigned:
+                        if (potential_floater == parent_hp or potential_floater in floaters_assigned
+                                or self.hp_supports.get(potential_floater)):
                             continue
                         
                         floater_verts = self.hp_verts_cache.get(potential_floater, [])
@@ -1729,7 +1756,7 @@ class HPGroupingWorker(QtCore.QThread):
                                 score += 45.0
                                 score += surface_decal_coverage * 65.0
                                 score += surface_decal_bbox_fraction * 20.0
-                            if parent_info.get("is_zbrush", False) or "zbrush" in str(parent_hp).lower():
+                            if parent_info.get("is_zbrush", "_zbrush" in str(parent_hp).lower()):
                                 score += 10.0
 
                             _add_floater_candidate(potential_floater, {
@@ -1971,42 +1998,55 @@ class HPGroupingWorker(QtCore.QThread):
                 if _lp_union(anchor, lp_name):
                     lp_uv_links += 1
 
-        for i in range(len(sorted_lp_names)):
-            lp1 = sorted_lp_names[i]
-            m1 = self.lp_data[lp1]
-            h1 = m1.get("hash", "empty")
-            uv1 = m1.get("uv_signature", "empty")
-            for j in range(i + 1, len(sorted_lp_names)):
-                lp2 = sorted_lp_names[j]
-                if _lp_find(lp1) == _lp_find(lp2):
-                    continue
-                m2 = self.lp_data[lp2]
-                h2 = m2.get("hash", "empty")
-                uv2 = m2.get("uv_signature", "empty")
-                topology_match = (
-                    m1.get("vtx", -1) == m2.get("vtx", -2)
-                    and m1.get("edges", -1) == m2.get("edges", -2)
-                )
-                has_strong_signature = (
-                    bool(h1 and h1 != "empty")
-                    or bool(h2 and h2 != "empty")
-                    or bool(uv1 and uv1 != "empty")
-                    or bool(uv2 and uv2 != "empty")
-                )
+        lp_topology_buckets = {}
+        for lp_name in sorted_lp_names:
+            lp_info = self.lp_data[lp_name]
+            topology = (lp_info.get("vtx", -1), lp_info.get("edges", -1))
+            lp_topology_buckets.setdefault(topology, []).append(lp_name)
 
-                if topology_match and not has_strong_signature:
-                    if not bg_core.MathUtils.is_overlapping(m1, m2):
-                        if _lp_union(lp1, lp2):
-                            lp_topology_links += 1
-                    continue
+        for topology in sorted(lp_topology_buckets, key=lambda value: (str(value[0]), str(value[1]))):
+            topology_names = lp_topology_buckets[topology]
+            for i in range(len(topology_names)):
+                lp1 = topology_names[i]
+                m1 = self.lp_data[lp1]
+                h1 = m1.get("hash", "empty")
+                uv1 = m1.get("uv_signature", "empty")
+                for j in range(i + 1, len(topology_names)):
+                    lp2 = topology_names[j]
+                    if _lp_find(lp1) == _lp_find(lp2):
+                        continue
+                    m2 = self.lp_data[lp2]
+                    h2 = m2.get("hash", "empty")
+                    uv2 = m2.get("uv_signature", "empty")
+                    topology_match = (
+                        m1.get("vtx", -1) == m2.get("vtx", -2)
+                        and m1.get("edges", -1) == m2.get("edges", -2)
+                    )
+                    if not topology_match:
+                        continue
+                    has_strong_signature = (
+                        bool(h1 and h1 != "empty")
+                        or bool(h2 and h2 != "empty")
+                        or bool(uv1 and uv1 != "empty")
+                        or bool(uv2 and uv2 != "empty")
+                    )
 
-                if self.use_symmetry and HAS_MATH_CORE and hasattr(bg_math_core, 'are_symmetric'):
-                    if m1.get("vtx", -1) == m2.get("vtx", -2):
-                        v1 = self.lp_verts_cache.get(lp1, [])
-                        v2 = self.lp_verts_cache.get(lp2, [])
-                        if v1 and v2 and bg_math_core.are_symmetric(v1, v2, tolerance=0.01):
+                    if not has_strong_signature:
+                        if not bg_core.MathUtils.is_overlapping(m1, m2):
                             if _lp_union(lp1, lp2):
-                                lp_symmetry_links += 1
+                                lp_topology_links += 1
+                        continue
+
+                    # LP shell/material ownership remains authoritative. Do not
+                    # spend a geometry comparison on incompatible known slots.
+                    if not _lp_material_compatible(lp1, lp2):
+                        continue
+                    if lp_shape_matcher and self.use_symmetry and lp_shape_matcher.matches(
+                            lp1, lp2, allow_reflection=True):
+                        if _lp_union(lp1, lp2):
+                            lp_symmetry_links += 1
+                            _debug("LP_MIRROR_FAMILY: {} <-> {} | reason=strict_point_cloud_geometry".format(
+                                _short_name(lp1), _short_name(lp2)))
 
         lp_clusters_by_root = {}
         lp_order = dict((lp_name, idx) for idx, lp_name in enumerate(sorted_lp_names))
@@ -2111,6 +2151,15 @@ class HPGroupingWorker(QtCore.QThread):
             )
             linked_mesh_names.update([m['name'] for m in owned_hps if m.get('name')])
 
+        if self.capture_diagnostics:
+            self.diagnostics['lp_items'] = {
+                str(i): [m.get('uuid') or m.get('name') for m in item]
+                for i, item in enumerate(named_clusters)
+            }
+            self.diagnostics['lp_claims'] = {
+                self.hp_data[name].get('uuid') or name: dict(claim)
+                for name, claim in hp_claims.items() if name in self.hp_data
+            }
         _debug("Step 3: LP similarity clustering.")
         _debug("  LP clusters={} | LP-guided HP cluster items={} | HP items left for later packing={}.".format(
             len(lp_clusters), len(named_clusters), len(unlinked_meshes)
@@ -2214,6 +2263,14 @@ class HPGroupingWorker(QtCore.QThread):
             avg_diag = sum(diags) / float(len(diags))
             if avg_diag <= (medium_threshold * 1.15):
                 bolt_vtx_values.add(vtx)
+        if self.capture_diagnostics:
+            self.diagnostics['size_thresholds'] = dict(small=small_threshold,
+                medium=medium_threshold, large=large_threshold)
+            self.diagnostics['mesh_features'] = {
+                m.get('uuid') or m.get('name'): {key: m.get(key) for key in
+                    ('name', 'diag', 'vtx', 'bbox_vol', 'bbox', 'is_zbrush')}
+                for m in all_meshes_list
+            }
         _debug("Step 4: size thresholds.")
         _debug("  median_scene_diag={:.6f} | q95={:.6f} | outlier_limit={:.6f} | valid_diag_count={} | upper_shelf_diag(q95)={:.6f}".format(
             median_scene_diag, raw_q95, outlier_diag_limit, len(valid_diags), upper_shelf_diag
@@ -2268,9 +2325,24 @@ class HPGroupingWorker(QtCore.QThread):
 
             return volume_match
 
+        def _hp_shape_merge_eligible(mesh_info):
+            name = mesh_info.get("name")
+            short_name = _short_name(name) if name else None
+            uid = mesh_info.get("uuid")
+            if mesh_info.get("is_zbrush", False):
+                return False
+            if name and ("zbrush" in str(name).lower()):
+                return False
+            if name in self.locked_names or short_name in self.locked_names:
+                return False
+            if uid and uid in self.manual_uuid_set:
+                return False
+            return True
+
         def compute_clusters_fast(mesh_list):
             clusters = []
             processed = set()
+            ordinary_cluster_records = []
 
             hash_buckets = {}
             for i, m in enumerate(mesh_list):
@@ -2306,7 +2378,85 @@ class HPGroupingWorker(QtCore.QThread):
                             processed.add(j)
 
                     if current_cluster:
-                        clusters.append(current_cluster)
+                        ordinary_cluster_records.append({
+                            "bucket_hash": h_key,
+                            "meshes": current_cluster,
+                        })
+
+            # The ordinary hash pass above remains the fast path. Only compare
+            # representatives sharing topology and a nearby cached invariant
+            # RMS feature, so unrelated mesh populations never become an
+            # all-pairs point-cloud workload.
+            hp_shape_candidate_pairs = 0
+            hp_shape_geometry_tests = 0
+            hp_shape_overlap_rejects = 0
+            hp_shape_merge_links = 0
+            if hp_shape_matcher and len(ordinary_cluster_records) > 1:
+                feature_buckets = {}
+                for record in sorted(
+                        ordinary_cluster_records,
+                        key=lambda item: _short_name(item["meshes"][0].get("name", ""))):
+                    representative = record["meshes"][0]
+                    if not all(_hp_shape_merge_eligible(mesh) for mesh in record["meshes"]):
+                        continue
+                    topology = (representative.get("vtx", -1), representative.get("edges", -1))
+                    if topology[0] < 0 or topology[1] < 0:
+                        continue
+                    rep_name = representative.get("name")
+                    signature = hp_shape_matcher.signature(rep_name)
+                    if not signature:
+                        continue
+                    try:
+                        # Below this scale the absolute matching tolerance is
+                        # significant: keep tiny clouds in one candidate bin.
+                        rms = max(float(signature[1]), 1e-3)
+                        feature_bin = int(math.floor(math.log(rms) * 128.0))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    topology_bins = feature_buckets.setdefault(topology, {})
+                    candidate_records = []
+                    for neighbor_bin in (feature_bin - 1, feature_bin, feature_bin + 1):
+                        candidate_records.extend(topology_bins.get(neighbor_bin, []))
+                    seen_candidate_ids = set()
+                    for candidate in candidate_records:
+                        candidate_id = id(candidate)
+                        if candidate_id in seen_candidate_ids:
+                            continue
+                        seen_candidate_ids.add(candidate_id)
+                        if candidate["bucket_hash"] == record["bucket_hash"]:
+                            continue
+                        hp_shape_candidate_pairs += 1
+                        candidate_name = candidate["meshes"][0].get("name")
+                        hp_shape_geometry_tests += 1
+                        if not hp_shape_matcher.matches(
+                                candidate_name, rep_name,
+                                allow_reflection=self.use_symmetry):
+                            continue
+                        overlaps = any(
+                            bg_core.MathUtils.is_overlapping(incoming, existing)
+                            for incoming in record["meshes"]
+                            for existing in candidate["meshes"]
+                        )
+                        if overlaps:
+                            hp_shape_overlap_rejects += 1
+                            continue
+
+                        candidate["meshes"].extend(record["meshes"])
+                        record["merged_into"] = candidate
+                        hp_shape_merge_links += 1
+                        _debug("HP_SHAPE_LINK: {} <-> {} | reason=strict_point_cloud_geometry".format(
+                            _short_name(candidate_name), _short_name(rep_name)))
+                        break
+                    else:
+                        topology_bins.setdefault(feature_bin, []).append(record)
+
+            for record in ordinary_cluster_records:
+                if record["meshes"] and not record.get("merged_into"):
+                    clusters.append(record["meshes"])
+            _debug("  HP_SHAPE_CLUSTER_PASS: ordinary_clusters={} | topology_feature_candidates={} | geometry_tests={} | overlap_rejects={} | merged_links={}.".format(
+                len(ordinary_cluster_records) - hp_shape_merge_links, hp_shape_candidate_pairs,
+                hp_shape_geometry_tests, hp_shape_overlap_rejects, hp_shape_merge_links
+            ))
 
             zb_indices = hash_buckets.get("__zbrush__", [])
             for idx_i in zb_indices:
@@ -2583,6 +2733,24 @@ class HPGroupingWorker(QtCore.QThread):
         def point_distance(a, b):
             return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
+        def _mesh_diag(info):
+            return float(info.get("diag", info.get("radius", 0.0) * 2.0) or 0.0)
+
+        def _is_large_part(info):
+            return _mesh_diag(info) > medium_threshold
+
+        def _large_bounds_overlap(a, b):
+            # Vertex proximity alone misses crossing faces on sparse structural meshes.
+            if not (_is_large_part(a) and _is_large_part(b)):
+                return False
+            box_a, box_b = a["bbox"], b["bbox"]
+            smaller_volume = min(a.get("bbox_vol", 0.0), b.get("bbox_vol", 0.0))
+            if smaller_volume <= 0.0:
+                return False
+            overlap = math.prod(max(0.0, min(box_a[i + 3], box_b[i + 3]) -
+                                    max(box_a[i], box_b[i])) for i in range(3))
+            return overlap >= smaller_volume * 0.30
+
         def check_collision(m1, m2):
             bb1 = m1.get("bbox", [0, 0, 0, 0, 0, 0])
             bb2 = m2.get("bbox", [0, 0, 0, 0, 0, 0])
@@ -2592,6 +2760,8 @@ class HPGroupingWorker(QtCore.QThread):
                 bb1[5] < bb2[2] or bb1[2] > bb2[5]):
                 return False
 
+            if _large_bounds_overlap(m1, m2):
+                return True
             if HAS_MATH_CORE:
                 v1 = self.hp_verts_cache.get(m1.get("name"), [])
                 v2 = self.hp_verts_cache.get(m2.get("name"), [])
@@ -2600,9 +2770,66 @@ class HPGroupingWorker(QtCore.QThread):
 
             return bg_core.MathUtils.is_overlapping(m1, m2)
 
+        def _has_individual_lp(info):
+            claim = hp_claims.get(info.get("name"), {})
+            owner = claim.get("owner_lp")
+            return bool(owner and claim.get("evidence", {}).get("coverage", 0.0) >= 0.65)
+
+        def _independent_assembly_conflict(a, b):
+            owner_a = hp_claims[a["name"]]["owner_lp"]
+            owner_b = hp_claims[b["name"]]["owner_lp"]
+            if _lp_base_name(owner_a) == _lp_base_name(owner_b):
+                return False
+            if check_collision(a, b):
+                return True
+            aa, bb = a["bbox"], b["bbox"]
+            overlap = math.prod(max(0.0, min(aa[i + 3], bb[i + 3]) - max(aa[i], bb[i]))
+                                for i in range(3))
+            return 0 < overlap and overlap >= 0.15 * min(a["bbox_vol"], b["bbox_vol"])
+
+        def _large_part_conflict(left, right):
+            return any(check_collision(a, b) for a in left if _is_large_part(a)
+                       for b in right if _is_large_part(b))
+
+        def _separate_colliding_large_parts(item):
+            # Split automatic LP/shape items before packing. Small details stay
+            # with the closest compatible component of their original item.
+            if _get_item_meta(item).get("source") not in ("lp", "shape"):
+                return [item]
+            large = [m for m in item if _is_large_part(m)]
+            if len(large) < 2:
+                return [item]
+            claims = [hp_claims.get(m["name"], {}) for m in large]
+            owner = claims[0].get("owner_lp")
+            if (owner and self.lp_data[owner].get("continuous_surface") and all(
+                    claim.get("owner_lp") == owner and claim.get("evidence", {}).get("accepted")
+                    and not claim.get("ambiguous") for claim in claims)):
+                return [item]
+            parts = []
+            for mesh in sorted(large, key=_mesh_diag, reverse=True):
+                target = next((part for part in parts if not _large_part_conflict([mesh], part)), None)
+                if target is None:
+                    parts.append([mesh])
+                else:
+                    target.append(mesh)
+            if len(parts) == 1:
+                return [item]
+            for mesh in item:
+                if not _is_large_part(mesh):
+                    target = min(parts, key=lambda part: min(_center_dist(mesh, other) for other in part))
+                    target.append(mesh)
+            for part in parts:
+                _set_normal_split_meta(part)
+            _debug("  LARGE_ITEM_SPLIT: {} meshes -> {} compatible items.".format(len(item), len(parts)))
+            return parts
+
+        peer_confirmed_assembly_members = set()
+
         def _step6_7_categorize_and_pack():
             self.progress_value.emit(66)
             self.progress_text.emit("Step 6: Categorizing cluster metrics...")
+            if self.capture_diagnostics:
+                self.diagnostics['classification_items'] = []
 
             # --- STEP 6: CATEGORIZATION ---
             def get_cluster_metrics(item):
@@ -2626,6 +2853,9 @@ class HPGroupingWorker(QtCore.QThread):
 
                 cube_side = equiv_vol ** (1.0 / 3.0) if equiv_vol > 0 else 0.001
                 cluster_diag = math.sqrt(3) * cube_side
+                if total_vol < 1e-6:
+                    # Flat surfaces have zero bbox volume, not zero physical size.
+                    cluster_diag = max((m.get("diag", 0) for m in item), default=cluster_diag)
                 return total_vol, cluster_diag
 
             def is_zbrush_cluster(cluster):
@@ -2659,10 +2889,16 @@ class HPGroupingWorker(QtCore.QThread):
                         return True
                 return False
 
-            for item_idx, item in enumerate(all_items):
+            packing_items = []
+            for item in all_items:
+                if self.is_cancelled:
+                    return True
+                packing_items.extend(_separate_colliding_large_parts(item))
+
+            for item_idx, item in enumerate(packing_items):
                 if self.is_cancelled: return True
-                if item_idx % max(1, len(all_items) // 25) == 0:
-                    self.progress_value.emit(66 + int((item_idx / float(max(len(all_items), 1))) * 10))
+                if item_idx % max(1, len(packing_items) // 25) == 0:
+                    self.progress_value.emit(66 + int((item_idx / float(max(len(packing_items), 1))) * 10))
             
                 true_vol, cluster_diag = get_cluster_metrics(item)
                 is_hard_custom = _item_is_hard_custom(item)
@@ -2677,11 +2913,6 @@ class HPGroupingWorker(QtCore.QThread):
                         len(item),
                         ", ".join(_short_name(m.get("name")) for m in item if m.get("name"))
                     ))
-            
-                if true_vol < 1e-6 and not is_hard_custom:
-                    target_list = bolt_items
-                    target_list.append(item)
-                    continue
             
                 max_single_diag = max([m.get("diag", m.get("radius", 0) * 2) for m in item] or [0])
             
@@ -2738,10 +2969,20 @@ class HPGroupingWorker(QtCore.QThread):
                     and bolt_like_count > 0
                     and (
                         (all_parts_bolt_like and cluster_diag <= (medium_threshold * 1.35))
-                        or (partial_bolt_like and cluster_diag <= medium_threshold)
+                        or (partial_bolt_like and bolt_like_count * 2 > len(item)
+                            and cluster_diag <= medium_threshold)
                     )
                     and max_single_diag <= large_threshold
                 )
+                if self.capture_diagnostics:
+                    self.diagnostics['classification_items'].append(dict(
+                        uuids=[m.get('uuid') or m.get('name') for m in item],
+                        meta=dict(_get_item_meta(item)), cluster_diag=cluster_diag,
+                        max_single_diag=max_single_diag, volume=true_vol,
+                        bolt_like_votes=bolt_like_count, bolt_shape_votes=bolt_shape_count,
+                        valid_shape_votes=valid_shape_count, wire_votes=wire_like_count,
+                        hard_custom=is_hard_custom, zbrush=is_zb,
+                        mixed_bolt=is_mixed_bolt_item, bolt_shape=is_bolt_shape, wire=is_wire_shape))
 
                 if len(item) > 1 or is_wire_shape or is_bolt_shape or is_mixed_bolt_item:
                     _debug(
@@ -2869,6 +3110,17 @@ class HPGroupingWorker(QtCore.QThread):
                 q.sort(key=lambda x: get_cluster_metrics(x)[0], reverse=True)
 
             _debug("Step 6: size/category buckets.")
+            if self.capture_diagnostics:
+                self.diagnostics['categories'] = {
+                    name: [m.get('uuid') or m.get('name') for item in items for m in item]
+                    for name, items in (
+                        ('Huge', huge_items), ('Large', large_items), ('Medium', medium_items),
+                        ('Small', small_items), ('Bolts', bolt_items), ('ZBrush_Huge', huge_zb),
+                        ('ZBrush_Large', large_zb), ('ZBrush_Medium', medium_zb),
+                        ('ZBrush_Small', small_zb), ('ZBrush_Bolts', bolt_zb))
+                }
+                for m in all_meshes_list:
+                    self.diagnostics['mesh_features'][m.get('uuid') or m.get('name')]['shape'] = get_shape_metrics(m)
             _debug("  normal: huge={}, large={}, medium={}, small={}, bolts={}".format(
                 len(huge_items), len(large_items), len(medium_items), len(small_items), len(bolt_items)
             ))
@@ -3090,6 +3342,7 @@ class HPGroupingWorker(QtCore.QThread):
                             existing_medium_indices = [
                                 idx for idx, b_name in enumerate(bucket_names)
                                 if b_name.startswith(item_prefix + ".")
+                                and not _large_part_conflict(item, buckets[idx])
                             ]
                             if existing_medium_indices:
                                 item_center = bbox_center(item_bbox(item))
@@ -3138,6 +3391,7 @@ class HPGroupingWorker(QtCore.QThread):
                             all_medium_indices = [
                                 idx for idx, b_name in enumerate(bucket_names)
                                 if b_name.startswith(item_prefix + ".")
+                                and not _large_part_conflict(item, buckets[idx])
                             ]
                             # Medium groups are helper buckets, not strict collision cages.
                             # After two buckets exist, avoid spawning Medium.003+ and fold
@@ -3201,12 +3455,12 @@ class HPGroupingWorker(QtCore.QThread):
                             ))
 
             pack_queue(huge_zb, "ZBrush_Huge", True)
+            pack_queue(huge_items, "Huge", False)
             pack_queue(large_zb, "ZBrush_Large", True)
+            pack_queue(large_items, "Large", False)
+
             pack_queue(medium_zb, "ZBrush_Medium", True)
             pack_queue(small_zb, "ZBrush_Small", True)
-        
-            pack_queue(huge_items, "Huge", False)
-            pack_queue(large_items, "Large", False)
             pack_queue(medium_items, "Medium", False)
             pack_queue(small_items, "Small", False)
 
@@ -3226,12 +3480,69 @@ class HPGroupingWorker(QtCore.QThread):
             def _add_bolt_groups(items, prefix):
                 by_prefix = {}
                 for item in items:
-                    by_prefix.setdefault(_item_group_prefix(prefix, item), []).extend(item)
-                for item_prefix in sorted(by_prefix.keys()):
-                    groups[_unique_group_name("{}.001".format(item_prefix))] = by_prefix[item_prefix]
+                    item_prefix = _item_group_prefix(prefix, item)
+                    buckets = by_prefix.setdefault(item_prefix, [])
+                    # Keep each LP assembly intact and check it against independent
+                    # assemblies before sharing a Bolts subgroup.
+                    structural = [m for m in item if _has_individual_lp(m)]
+                    for members, anchors in buckets:
+                        if not any(_independent_assembly_conflict(a, b) for a in structural for b in anchors):
+                            members.extend(item)
+                            anchors.extend(structural)
+                            break
+                    else:
+                        buckets.append((list(item), structural))
+                for item_prefix, buckets in sorted(by_prefix.items()):
+                    for index, (members, _) in enumerate(buckets, 1):
+                        groups[_unique_group_name("{}.{:03d}".format(item_prefix, index))] = members
 
             if bolt_items:
-                _add_bolt_groups(bolt_items, "Bolts")
+                normal_peers = {}
+                for group_name, members in groups.items():
+                    if "ZBrush" in group_name or any(m.get("uuid") in gt_hard_uuids for m in members):
+                        continue
+                    for mesh in members:
+                        if _hp_shape_merge_eligible(mesh):
+                            key = (mesh.get("vtx"), mesh.get("edges"))
+                            normal_peers.setdefault(key, []).append((group_name, mesh))
+
+                remaining_bolts = []
+                for item in bolt_items:
+                    if self.is_cancelled:
+                        return True
+                    if len(item) < 2 or _get_item_meta(item).get("source") != "lp":
+                        remaining_bolts.append(item)
+                        continue
+                    slots = _item_material_slots(item)
+                    votes = {}
+                    for mesh in item:
+                        key = (mesh.get("vtx"), mesh.get("edges"))
+                        if not all(key) or not _hp_shape_merge_eligible(mesh):
+                            continue
+                        for group_name, peer in normal_peers.get(key, ()):
+                            peer_slot = _claim_material_slot(peer["name"])
+                            if peer_slot and slots and peer_slot not in slots:
+                                continue
+                            if key in votes.get(group_name, ()):
+                                continue
+                            signature = mesh.get("hash")
+                            if (signature and signature != "empty" and signature == peer.get("hash")
+                                    or hp_shape_matcher and hp_shape_matcher.matches(
+                                        mesh["name"], peer["name"], allow_reflection=self.use_symmetry)):
+                                votes.setdefault(group_name, set()).add(key)
+                    ranked = sorted((len(types), group_name) for group_name, types in votes.items()
+                                    if len(types) >= 2 and len(types) * 2 > len(item))
+                    if ranked and (len(ranked) == 1 or ranked[-1][0] > ranked[-2][0]):
+                        group_name = ranked[-1][1]
+                        group_slots = _item_material_slots(groups[group_name])
+                        if (not slots or not group_slots or slots == group_slots) and not _has_collision_with_bucket(
+                                item, groups[group_name]):
+                            groups[group_name].extend(item)
+                            peer_confirmed_assembly_members.update(m["name"] for m in item)
+                            _debug("  BOLT_ASSEMBLY_PEERS: {} -> {}".format(_item_label(item), group_name))
+                            continue
+                    remaining_bolts.append(item)
+                _add_bolt_groups(remaining_bolts, "Bolts")
             
             if bolt_zb:
                 _add_bolt_groups(bolt_zb, "ZBrush_Bolts")
@@ -3246,6 +3557,7 @@ class HPGroupingWorker(QtCore.QThread):
 
         if _step6_7_categorize_and_pack():
             return
+        _capture_groups('initial_packing')
         self.progress_value.emit(96)
         self.progress_text.emit("Step 7.5: Validating LP ownership...")
 
@@ -3345,7 +3657,7 @@ class HPGroupingWorker(QtCore.QThread):
                         moving.append(hp_info)
                     else:
                         keep.append(hp_info)
-                if not moving:
+                if not moving or _large_part_conflict(moving, groups[target_group]):
                     continue
                 groups[source_group] = keep
                 groups[target_group].extend(moving)
@@ -3372,12 +3684,6 @@ class HPGroupingWorker(QtCore.QThread):
         ))
         if ownership_repair_moves:
             logs.append("LP ownership repair: moved {} HP mesh(es) between groups after packing.".format(ownership_repair_moves))
-        if unowned_hp_names:
-            logs.append("[Warning] {} HP mesh(es) have no reliable LP owner after Analyze HP. See debug log.".format(len(unowned_hp_names)))
-
-        matched_count = len(self.hp_data) - len(unassigned_hps)
-        logs.append("Matched {} objects via Broad/Narrow phase.".format(matched_count))
-        logs.append("Total groups created: {} (Limit: {})".format(len(groups), self.group_limit))
 
         self.progress_value.emit(97)
 
@@ -3583,6 +3889,7 @@ class HPGroupingWorker(QtCore.QThread):
                 has_collision
                 and source_is_zb
                 and is_zbrush_detail
+                and not _large_part_conflict(groups[source_group], groups[target_group])
                 and (macro or source_lacks_lp_context)
                 and source_diag <= target_diag * 0.55
                 and source_vol <= target_vol * 0.45
@@ -3678,6 +3985,7 @@ class HPGroupingWorker(QtCore.QThread):
                 ))
             return merge_count
 
+        _capture_groups('before_final_clustering')
         non_exempt_group_count = len([k for k in groups.keys() if not _is_limit_exempt_group(k)])
         if self.group_limit > 0 and non_exempt_group_count > self.group_limit:
             logs.append("[Optimization] The number of non-bolt groups ({}) has exceeded the specified limit ({}).".format(non_exempt_group_count, self.group_limit))
@@ -3687,12 +3995,15 @@ class HPGroupingWorker(QtCore.QThread):
                 self.group_limit
             ))
             strict_merges = _run_final_group_clustering(self.group_limit, mode="strict")
+            _capture_groups('after_strict')
             relaxed_merges = 0
             if len(_non_exempt_group_names()) > self.group_limit:
                 relaxed_merges = _run_final_group_clustering(self.group_limit, mode="relaxed")
+            _capture_groups('after_relaxed')
             macro_merges = 0
             if len(_non_exempt_group_names()) > self.group_limit:
                 macro_merges = _run_final_group_clustering(self.group_limit, mode="macro")
+            _capture_groups('before_polish')
             # Polish is an extra cleanup pass, not a mandate to crush the scene
             # far below HP Max Groups. Let it work only when the initial overflow
             # was meaningful, and cap how far it can go below the user target.
@@ -3724,6 +4035,333 @@ class HPGroupingWorker(QtCore.QThread):
                 final_non_exempt_count
             ))
 
+        def _repair_repeated_details():
+            """Use similar, seated HP details to resolve weak LP ownership."""
+            if not HAS_MATH_CORE or not self.lp_data:
+                return 0
+
+            hp_groups, hp_infos, _, _ = _build_group_maps()
+            anchors = {}
+            peers_by_topology = {}
+            eligible_groups = {name for name in groups
+                               if name not in self.locked_names and not _group_is_zbrush_like(name)
+                               and not _group_has_hard_custom(name)}
+
+            def _eligible(info, group_name):
+                return (group_name in eligible_groups and _hp_shape_merge_eligible(info)
+                        and not _is_protected_hp_info(info))
+
+            def _topology(info):
+                return info.get("vtx", 0), info.get("edges", 0)
+
+            def _has_own_scale(info, owner):
+                hp_diag, lp_diag = _mesh_diag(info), _mesh_diag(self.lp_data[owner])
+                return min(hp_diag, lp_diag) >= max(hp_diag, lp_diag, 0.001) * 0.35
+
+            for hp_name, group_name in hp_groups.items():
+                info = hp_infos[hp_name]
+                claim = hp_claims.get(hp_name, {})
+                owner = claim.get("owner_lp")
+                if not owner or not _eligible(info, group_name):
+                    continue
+                topology = _topology(info)
+                if all(topology):
+                    peers_by_topology.setdefault(topology, []).append(hp_name)
+                # An actual HP counterpart establishes the LP's local bake
+                # group. Weak details and floaters cannot establish one.
+                if (claim.get("source") in ("lp", "compound") and
+                        not claim.get("ambiguous") and claim.get("score", 0.0) >= 45.0 and
+                        _has_own_scale(info, owner)):
+                    anchors.setdefault((_lp_base_name(owner), group_name), []).append(info)
+
+            contact_cache = {}
+
+            def _contact(hp_name, owner_base, group_name):
+                key = (hp_name, owner_base, group_name)
+                if key in contact_cache:
+                    return contact_cache[key]
+                info = hp_infos[hp_name]
+                diag = _mesh_diag(info)
+                tolerance = max(diag * 0.22, self.collision_tolerance)
+                box = info["bbox"]
+                proxy = self.hp_surface_cache.get(hp_name, {})
+                best = 0.0
+                for candidate in anchors.get((owner_base, group_name), ()):
+                    if self.is_cancelled:
+                        break
+                    if _mesh_diag(candidate) < diag * 2.5:
+                        continue
+                    other_box = candidate["bbox"]
+                    if any(box[i] > other_box[i + 3] + tolerance or
+                           other_box[i] > box[i + 3] + tolerance for i in range(3)):
+                        continue
+                    parent_name = candidate["name"]
+                    parent_proxy = self.hp_surface_cache.get(parent_name, {})
+                    if proxy and parent_proxy and hasattr(bg_math_core, "calculate_surface_match"):
+                        metrics = bg_math_core.calculate_surface_match(
+                            proxy["samples"], proxy["triangles"],
+                            parent_proxy["samples"], parent_proxy["triangles"], tolerance)
+                        coverage = metrics["hp_coverage"]
+                        if coverage >= 0.12:
+                            best = max(best, coverage)
+                            continue
+                    verts = self.hp_verts_cache.get(hp_name, ())
+                    parent_verts = self.hp_verts_cache.get(parent_name, ())
+                    if verts and parent_verts and bg_math_core.check_mesh_collision(
+                            verts, parent_verts, tolerance):
+                        best = max(best, 0.15)
+                contact_cache[key] = best
+                return best
+
+            proposals = []
+            for hp_name, source_group in sorted(hp_groups.items()):
+                if self.is_cancelled:
+                    return 0
+                info = hp_infos[hp_name]
+                diag = _mesh_diag(info)
+                if not 0.0 < diag <= medium_threshold or not _eligible(info, source_group):
+                    continue
+                claim = hp_claims.get(hp_name, {})
+                current_owner = claim.get("owner_lp")
+                current_base = _lp_base_name(current_owner) if current_owner else None
+                if current_owner:
+                    strong_claim = not claim.get("ambiguous") and (
+                        claim.get("evidence", {}).get("accepted") or claim.get("score", 0.0) >= 60.0)
+                    if claim.get("source") == "floater" or (strong_claim and _has_own_scale(info, current_owner)):
+                        continue
+                slot = _claim_material_slot(hp_name)
+                candidate_slots = {_lp_material_slot(lp) for lp in hp_candidates.get(hp_name, ())}
+                candidates = []
+                for peer in peers_by_topology.get(_topology(info), ()):
+                    if peer == hp_name:
+                        continue
+                    peer_info = hp_infos[peer]
+                    if abs(_mesh_diag(peer_info) - diag) > diag * 0.20:
+                        continue
+                    peer_owner = hp_claims[peer]["owner_lp"]
+                    peer_slot = _lp_material_slot(peer_owner)
+                    if ((slot and peer_slot != slot) or
+                            (lp_material_slots and not slot and peer_slot not in candidate_slots)):
+                        continue
+                    peer_group = hp_groups[peer]
+                    peer_base = _lp_base_name(peer_owner)
+                    if (peer_base, peer_group) not in anchors:
+                        continue
+                    candidates.append((_center_dist(info, peer_info), peer, peer_owner, peer_base, peer_group))
+
+                ranked = {}
+                for distance, peer, peer_owner, peer_base, peer_group in sorted(candidates)[:24]:
+                    contact = _contact(hp_name, peer_base, peer_group)
+                    if not contact or not _contact(peer, peer_base, peer_group):
+                        continue
+                    signature = info.get("hash")
+                    same_hash = bool(signature and signature != "empty" and signature == hp_infos[peer].get("hash"))
+                    if not same_hash and not (hp_shape_matcher and hp_shape_matcher.matches(
+                            hp_name, peer, allow_reflection=self.use_symmetry)):
+                        continue
+                    evidence = _surface_match_evidence(hp_name, peer_owner) or {}
+                    score = contact + 0.20 / (1.0 + distance / (diag * 8.0))
+                    if evidence.get("accepted"):
+                        score += 0.15
+                    choice = (score, peer_group, peer, peer_owner, evidence)
+                    previous = ranked.get(peer_base)
+                    if previous is None or score > previous[0]:
+                        ranked[peer_base] = choice
+
+                if not ranked:
+                    continue
+                score, target_group, peer, owner, evidence = max(ranked.values(), key=lambda row: row[0])
+                if target_group == source_group:
+                    continue
+                target_base = _lp_base_name(owner)
+                runner_score = max((row[0] for base, row in ranked.items() if base != target_base), default=0.0)
+                current_support = _contact(hp_name, current_base, source_group) if current_base else 0.0
+                if current_base != target_base and claim.get("evidence", {}).get("accepted"):
+                    current_support += 0.15
+                if score < max(runner_score, current_support) + 0.10:
+                    continue
+                proposals.append((hp_name, source_group, target_group, peer, owner, evidence))
+
+            moved = 0
+            pending = {row[0] for row in proposals}
+            for hp_name, source_group, target_group, peer, owner, evidence in proposals:
+                if self.is_cancelled:
+                    return moved
+                if peer in pending:
+                    continue
+                info = hp_infos[hp_name]
+                owner_base = _lp_base_name(owner)
+                # Contact with the larger host is expected. Do not add a
+                # collision with another detail or a different LP's mesh.
+                host_names = {m["name"] for m in anchors[(owner_base, target_group)]
+                              if _mesh_diag(m) >= _mesh_diag(info) * 2.5}
+                if any(other["name"] not in host_names and check_collision(info, other)
+                       for other in groups[target_group]):
+                    continue
+                groups[source_group].remove(info)
+                groups[target_group].append(info)
+                hp_claims[hp_name] = dict(
+                    hp_claims.get(hp_name, {}), owner_lp=owner, driver_hp=peer,
+                    material_slot=_lp_material_slot(owner),
+                    material_name=self.lp_data[owner].get("material_name"),
+                    source="hp_peer", reason="similar HP detail on the same LP host",
+                    evidence=evidence, ambiguous=False,
+                    confidence=float(evidence.get("confidence", 0.0)),
+                    score=max(60.0, float(evidence.get("confidence", 0.0))))
+                unassigned_hps.discard(hp_name)
+                if self.capture_diagnostics:
+                    self.diagnostics["lp_claims"][info.get("uuid") or hp_name] = dict(hp_claims[hp_name])
+                moved += 1
+                _debug("  HP_PEER_MOVE: HP='{}' | peer='{}' | LP='{}' | '{}' -> '{}'.".format(
+                    _short_name(hp_name), _short_name(peer), _short_name(owner), source_group, target_group))
+
+            for group_name in list(groups):
+                if not groups[group_name]:
+                    del groups[group_name]
+            return moved
+
+        def _attach_supported_details():
+            if not self.hp_supports:
+                return 0
+            hp_groups, hp_infos, _, _ = _build_group_maps()
+            protected = {group for group in groups
+                         if _group_has_hard_custom(group) or group in self.locked_names}
+            resolved = {}
+            moves = []
+            seated_peers = {}
+            for peer, supports in self.hp_supports.items():
+                if peer not in hp_groups or not _hp_shape_merge_eligible(hp_infos[peer]):
+                    continue
+                info = hp_infos[peer]
+                key = (info.get("vtx"), info.get("edges"))
+                if not all(key):
+                    continue
+                for parent, gap in supports:
+                    if gap <= 0.08 and hp_groups.get(parent) == hp_groups[peer]:
+                        seated_peers.setdefault((parent, key), []).append(peer)
+
+            def _nearby_peer_bonus(name, parent):
+                info = hp_infos[name]
+                key = (info.get("vtx"), info.get("edges"))
+                radius = _mesh_diag(info) * 8.0
+                votes = 0
+                for peer in seated_peers.get((parent, key), ()):
+                    if peer == name or _center_dist(info, hp_infos[peer]) > radius:
+                        continue
+                    signature = info.get("hash")
+                    same_hash = signature and signature != "empty" and signature == hp_infos[peer].get("hash")
+                    if same_hash or (hp_shape_matcher and hp_shape_matcher.matches(
+                            name, peer, allow_reflection=self.use_symmetry)):
+                        votes += 1
+                        if votes == 2:
+                            break
+                return votes * 0.028
+
+            # A panel can itself float above a body surface while carrying
+            # inset details and screws. Resolve larger hosts before their details.
+            for name in sorted(hp_groups, key=lambda n: (-_mesh_diag(hp_infos[n]), n)):
+                if self.is_cancelled:
+                    return 0
+                info = hp_infos[name]
+                source_group = hp_groups[name]
+                if source_group in protected:
+                    continue
+                claim = hp_claims.get(name, {})
+                owner = claim.get("owner_lp")
+                hp_diag = _mesh_diag(info)
+                lp_diag = _mesh_diag(self.lp_data[owner]) if owner else 0.0
+                scale_ratio = min(hp_diag, lp_diag) / max(hp_diag, lp_diag, 1e-6)
+                comparable = bool(owner and scale_ratio >= 0.40)
+                if owner and claim.get("score", 0.0) >= 45.0 and not claim.get("ambiguous"):
+                    if comparable or not self.hp_holes_cache.get(name):
+                        resolved[name] = (owner, source_group)
+                if not _hp_shape_merge_eligible(info) or _is_protected_hp_info(info):
+                    continue
+                evidence = claim.get("evidence", {})
+                reciprocal_fit = (scale_ratio >= 0.90 and evidence.get("lp_name") == owner and
+                                  max(evidence.get("hp_to_lp_distance", float("inf")),
+                                      evidence.get("lp_to_hp_distance", float("inf"))) <= hp_diag * 0.12)
+                if (name in peer_confirmed_assembly_members or reciprocal_fit or
+                        (comparable and evidence.get("accepted") and (
+                            scale_ratio >= 0.65 or evidence.get("coverage", 0.0) >= 0.65))):
+                    continue
+
+                choices = {}
+                slot = _claim_material_slot(name)
+                candidate_slots = {_lp_material_slot(lp) for lp in hp_candidates.get(name, ())}
+                for parent, distance in self.hp_supports.get(name, ()):
+                    if parent not in resolved:
+                        continue
+                    host_owner, group = resolved[parent]
+                    weak_lp_surface = (evidence and evidence.get("hp_coverage", 1.0) < 0.50
+                                       and evidence.get("lp_coverage", 1.0) < 0.15)
+                    max_gap = 0.12 if weak_lp_surface else 0.06
+                    if comparable and (distance > max_gap or (
+                            not self.hp_holes_cache.get(name)
+                            or (evidence.get("accepted") and
+                                _lp_base_name(owner) != _lp_base_name(host_owner)))):
+                        continue
+                    host_slot = _lp_material_slot(host_owner)
+                    if ((slot and host_slot != slot) or
+                            (lp_material_slots and not slot and host_slot not in candidate_slots)):
+                        continue
+                    context = (_lp_base_name(host_owner), group)
+                    # Prefer the local mounting part over a broad backing
+                    # surface when both are comparably close to the rim.
+                    local_scale = hp_diag / max(_mesh_diag(hp_infos[parent]), hp_diag, 1e-6)
+                    peer_bonus = _nearby_peer_bonus(name, parent) if distance <= 0.12 else 0.0
+                    choice = (distance - 0.16 * local_scale - peer_bonus, parent, host_owner, group)
+                    if context not in choices or choice < choices[context]:
+                        choices[context] = choice
+                ranked = sorted(choices.values())
+                if not ranked or (len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 0.025):
+                    continue
+                _, parent, host_owner, group = ranked[0]
+                resolved[name] = (host_owner, group)
+                moves.append((name, source_group, group, parent, host_owner))
+
+            moved = 0
+            for name, source_group, group, parent, owner in moves:
+                info = hp_infos[name]
+                if group != source_group:
+                    groups[source_group].remove(info)
+                    groups[group].append(info)
+                    moved += 1
+                    _debug("  HP_SURFACE_ATTACH: HP='{}' | support='{}' | LP='{}' | '{}' -> '{}'.".format(
+                        _short_name(name), _short_name(parent), _short_name(owner), source_group, group))
+                if hp_claims.get(name, {}).get("owner_lp") != owner or group != source_group:
+                    hp_claims[name] = dict(
+                        hp_claims.get(name, {}), owner_lp=owner, driver_hp=parent,
+                        material_slot=_lp_material_slot(owner),
+                        material_name=self.lp_data[owner].get("material_name"),
+                        source="hp_support", reason="opening or detail seated on HP support",
+                        evidence={}, ambiguous=False, confidence=0.0, score=60.0)
+                    unassigned_hps.discard(name)
+                    if self.capture_diagnostics:
+                        self.diagnostics["lp_claims"][info.get("uuid") or name] = dict(hp_claims[name])
+            for group in [name for name, members in groups.items() if not members]:
+                del groups[group]
+            return moved
+
+        self.progress_text.emit("Step 9: Refining repeated HP details...")
+        peer_moves = _repair_repeated_details()
+        if self.is_cancelled:
+            return
+        if peer_moves:
+            logs.append("HP detail matching: moved {} mesh(es) using similar HP on the same LP.".format(peer_moves))
+        supported_moves = _attach_supported_details()
+        if self.is_cancelled:
+            return
+        if supported_moves:
+            logs.append("HP surface matching: attached {} detail mesh(es) to their HP support.".format(supported_moves))
+        matched_count = len(self.hp_data) - len(unassigned_hps)
+        unowned_count = sum(name in unassigned_hps for name in unowned_hp_names)
+        if unowned_count:
+            logs.append("[Warning] {} HP mesh(es) have no reliable LP owner after Analyze HP. See debug log.".format(unowned_count))
+        logs.append("Matched {} objects after LP ownership and HP detail matching.".format(matched_count))
+        logs.append("Total groups created: {} (Limit: {})".format(len(groups), self.group_limit))
+
+        _capture_groups('final')
         _debug("Step 7: final packed groups.")
         for group_name in sorted(groups.keys()):
             meshes = groups[group_name]

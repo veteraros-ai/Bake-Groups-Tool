@@ -61,9 +61,9 @@ TOPICS = (
     ("hp.find_similar", "Find Sim", "Найти похожие",
      "Finds meshes similar to the selected mesh. Use it to inspect repeated fasteners and their subgroup settings.",
      "Находит меши, похожие на выделенный. Полезно для проверки повторяющегося крепежа и его настроек."),
-    ("hp.zbrush", "Find ZBrush", "Найти ZBrush",
-     "Marks high-poly meshes already detailed in ZBrush so the export path does not subdivide them again.",
-     "Помечает детализированные в ZBrush HP-меши, чтобы экспорт не сглаживал их повторно."),
+    ("hp.zbrush", "ZBrush candidates", "Кандидаты ZBrush",
+     "Review detailed HP meshes in the ZBrush candidates section of Mesh Check.",
+     "Проверьте детализированные HP-меши в разделе кандидатов ZBrush во вкладке Mesh Check."),
     ("hp.visibility", "HP visibility", "Видимость HP",
      "Shows or hides the high-poly geometry of the active chapter.",
      "Показывает или скрывает HP-геометрию активной главы."),
@@ -164,6 +164,15 @@ def _upgrade_document(saved, language):
     if not version:
         return saved, False
     if saved.get("manual_version", 0) < version:
+        # Refresh the shipped board, including retired topics and illustrations.
+        # Keep unrelated anchored notes from the previous current schema.
+        if saved.get("manual_version", 0) >= 5:
+            known = {entry.get('anchor') for entry in bundled['items']}
+            notes = [entry for entry in saved.get('items', [])
+                     if entry.get('anchor') and entry['anchor'] not in known
+                     and entry['anchor'] != 'export.target'
+                     and not re.search(r'cage|marmoset|toolbag', json.dumps(entry), re.I)]
+            bundled['items'].extend(notes)
         return bundled, True
 
     # Refresh shipped content without resetting unrelated saved layout/notes.
@@ -383,12 +392,6 @@ class GuideWindow(QtWidgets.QMainWindow):
         self.pin_action.setCheckable(True)
         self.pin_action.toggled.connect(self.set_stay_on_top)
         bar.addAction(self.pin_action)
-        old_manual = os.path.join(os.path.dirname(__file__), "Manual", "Manual.pur")
-        if os.path.isfile(old_manual):
-            legacy_action = QAction("Old manual / Старый мануал", self)
-            legacy_action.triggered.connect(lambda checked=False, p=old_manual:
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(p))))
-            bar.addAction(legacy_action)
         self.edit_action = QAction("Edit / Правка", self)
         self.edit_action.setCheckable(True)
         self.edit_action.toggled.connect(self.set_edit_mode)
@@ -643,7 +646,8 @@ class GuideWindow(QtWidgets.QMainWindow):
                 os.fsync(stream.fileno())
             if os.path.isfile(self.path):
                 if self._migration_pending:
-                    archive = self.path + ".pre_manual_v5.json"
+                    archive = self.path + ".pre_manual_v{}.json".format(
+                        self.document_data.get('manual_version', 0))
                     if not os.path.exists(archive):
                         shutil.copy2(self.path, archive)
                 shutil.copy2(self.path, self.path + ".bak")

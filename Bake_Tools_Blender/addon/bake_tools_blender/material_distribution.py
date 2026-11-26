@@ -8,10 +8,14 @@ scope on every material-created chapter instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 import math
 import re
 
+import bmesh
 import bpy
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 
 from . import native_core
 
@@ -31,6 +35,7 @@ class MaterialBucket:
     label: str
     lp_objects: tuple
     hp_objects: tuple
+    lp_regions: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +84,8 @@ def target_objects(root):
 
 
 def target_meshes(root):
-    return tuple(obj for obj in target_objects(root) if obj.type == "MESH")
+    return tuple(obj for obj in target_objects(root)
+                 if obj.type == "MESH" and not obj.get("_bake_tools_lp_material_region"))
 
 
 def used_material_names(obj):
@@ -534,6 +540,81 @@ def _mark_container_proxies(proxies):
     return len(containers)
 
 
+def _chapter_surface(bucket, depsgraph, progress):
+    vertices, faces = [], []
+    for obj, material in bucket["lp"]:
+        if progress:
+            progress.check_cancelled()
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=False, depsgraph=depsgraph)
+        try:
+            offset = len(vertices)
+            matrix = evaluated.matrix_world
+            vertices.extend(matrix @ vertex.co for vertex in mesh.vertices)
+            materials = tuple(mesh.materials)
+            faces.extend(tuple(offset + i for i in face.vertices) for face in mesh.polygons
+                         if material is None or _material_name(materials, face.material_index) == material)
+        finally:
+            evaluated.to_mesh_clear()
+    return BVHTree.FromPolygons(vertices, faces) if faces else None
+
+
+def create_lp_material_region(context, source, material):
+    """Create a scoped LP piece while preserving the original source object."""
+    evaluated = source.evaluated_get(context.evaluated_depsgraph_get())
+    mesh = bpy.data.meshes.new_from_object(evaluated, preserve_all_data_layers=True,
+                                          depsgraph=context.evaluated_depsgraph_get())
+    bm = bmesh.new()
+    piece = None
+    try:
+        bm.from_mesh(mesh)
+        materials = tuple(mesh.materials)
+        keep = {vert for face in bm.faces
+                if _material_name(materials, face.material_index) == material for vert in face.verts}
+        bmesh.ops.delete(bm, geom=[face for face in bm.faces
+                                  if _material_name(materials, face.material_index) != material], context="FACES_ONLY")
+        bmesh.ops.delete(bm, geom=[vert for vert in bm.verts if vert not in keep], context="VERTS")
+        bm.to_mesh(mesh)
+        mesh.update()
+        piece = bpy.data.objects.new(f"{source.name}_{clean_material_name(material)}", mesh)
+        piece["_bake_tools_lp_material_region"] = True
+        context.collection.objects.link(piece)
+        piece.matrix_world = evaluated.matrix_world.copy()
+        return piece
+    except Exception:
+        if piece is not None:
+            bpy.data.objects.remove(piece, do_unlink=True)
+        if not mesh.users:
+            bpy.data.meshes.remove(mesh)
+        raise
+    finally:
+        bm.free()
+
+
+def _surface_owner(data, surfaces):
+    points = [Vector(point) for point in data.get("sample_points", ())]
+    if not points:
+        return None
+    ranked = []
+    for bucket, surface in surfaces:
+        distances = sorted(result[3] for point in points
+                           if (result := surface.find_nearest(point))[3] is not None)
+        if len(distances) == len(points):
+            ranked.append((sum(distances) / len(distances), distances[3 * (len(distances) - 1) // 4], bucket))
+    ranked.sort(key=lambda entry: entry[:2])
+    if not ranked:
+        return None
+    mean, upper, bucket = ranked[0]
+    diag = max(data["diag"], 1e-6)
+    if mean > diag * .25 or upper > diag * .35:
+        return None
+    if len(ranked) > 1:
+        other_mean, other_upper, _ = ranked[1]
+        if mean > other_mean * .28 or upper > other_upper * .65 or other_mean - mean < diag * .015:
+            return None
+    return bucket
+
+
 def analyze_material_distribution(hp_root, lp_root, progress=None, context=None):
     """Port Maya's full Create-by-Material HP ownership/audit pipeline."""
     context = context or bpy.context
@@ -547,14 +628,17 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
         signature, labels, proxies = _lp_proxy_records(obj, depsgraph)
         if not signature:
             continue
-        bucket = buckets_by_signature.setdefault(signature, {
-            "signature": signature, "labels": labels, "lp": [], "hp": [], "lp_proxies": [],
-        })
-        bucket["lp"].append(obj)
-        for proxy in proxies:
-            proxy["bucket"] = bucket
-            bucket["lp_proxies"].append(proxy)
-            all_proxies.append(proxy)
+        for material, label in zip(signature, labels):
+            key = (material,)
+            bucket = buckets_by_signature.setdefault(key, {
+                "signature": key, "labels": (label,), "lp": [], "hp": [], "lp_proxies": [],
+            })
+            bucket["lp"].append((obj, material if len(signature) > 1 else None))
+            for proxy in proxies:
+                if proxy["material_key"] == material:
+                    proxy["bucket"] = bucket
+                    bucket["lp_proxies"].append(proxy)
+                    all_proxies.append(proxy)
     if not buckets_by_signature:
         return MaterialDistributionResult((), MaterialDistributionDiagnostics())
 
@@ -577,6 +661,15 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
                 "data": data, "bucket": None, "score": 0.0, "strong": False,
                 "source": "unassigned", "has_overlap": False,
             }
+    surfaces = []
+    for bucket in buckets:
+        _progress(progress, 34, "Indexing LP chapter surface: {}".format(bucket["label"]))
+        surface = _chapter_surface(bucket, depsgraph, progress)
+        if surface is not None:
+            surfaces.append((bucket, surface))
+    if len(surfaces) != len(buckets):
+        surfaces.clear()
+
     scene_diag = _median(
         [proxy["data"]["diag"] for proxy in all_proxies]
         + [record["data"]["diag"] for record in hp_records.values()]
@@ -588,6 +681,11 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
     direct_count = container_direct_count = low_confidence = 0
     for index, (obj, record) in enumerate(hp_records.items()):
         _progress(progress, 35 + int(index * 22 / max(len(hp_records), 1)), "Resolving HP ownership: {}".format(obj.name))
+        surface_bucket = _surface_owner(record["data"], surfaces)
+        if surface_bucket is not None:
+            record.update(bucket=surface_bucket, strong=True, source="lp_surface", has_overlap=True)
+            direct_count += 1
+            continue
         quick = []
         for proxy in all_proxies:
             score = _quick_owner_score(record["data"], proxy)
@@ -621,6 +719,8 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
     floater_assigned = floater_reassigned = 0
     for index, (obj, record) in enumerate(hp_records.items()):
         _progress(progress, 58 + int(index * 12 / max(len(hp_records), 1)), "Attaching HP floaters: {}".format(obj.name))
+        if record["source"] == "lp_surface":
+            continue
         hp_diag = record["data"]["diag"]
         if record["strong"] and record["source"] == "lp" and hp_diag >= median_hp_diag * 0.70:
             continue
@@ -648,6 +748,7 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
     _progress(progress, 70, "Checking LP meshes for missing HP")
     audit_checked = audit_candidates = audit_assigned = audit_reassigned = audit_container_conflicts = 0
     best_audit = {}
+    container_conflicts = set()
     audit_proxies = sorted(all_proxies, key=lambda proxy: (1 if proxy.get("is_container") else 0, proxy["data"]["volume"]))
     for index, proxy in enumerate(audit_proxies):
         _progress(progress, 70 + int(index * 10 / max(len(audit_proxies), 1)), "Auditing LP region: {}".format(proxy["lp_object"].name))
@@ -656,27 +757,36 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
             continue
         audit_checked += 1
         quick = []
-        for obj, record in hp_records.items():
-            if record["bucket"] is target_bucket:
+        total_hp = len(hp_records)
+        value = 70 + int(index * 10 / max(len(audit_proxies), 1))
+        for scanned, (obj, record) in enumerate(hp_records.items(), 1):
+            if progress and scanned % 256 == 0:
+                _progress(progress, value, "Auditing LP region: {} ({}/{})".format(
+                    proxy["lp_object"].name, scanned, total_hp))
+            if record["source"] == "lp_surface" or record["bucket"] is target_bucket:
                 continue
             score = _audit_quick_score(proxy, record["data"], scene_diag)
             if score is not None:
                 quick.append((score, obj, record))
-        for _score, obj, record in sorted(quick, key=lambda item: item[0], reverse=True)[:24]:
+        for _score, obj, record in heapq.nlargest(24, quick, key=lambda item: item[0]):
             result = _audit_score(proxy, record["data"], scene_diag)
             if not result or not result["strong"]:
                 continue
             audit_candidates += 1
+            if proxy.get("is_container"):
+                container_conflicts.add(obj)
+                continue
             current = best_audit.get(obj)
             if current is None or result["score"] > current["score"]:
-                best_audit[obj] = {"score": result["score"], "bucket": target_bucket, "proxy": proxy}
-    for obj, candidate in best_audit.items():
+                best_audit[obj] = {"score": result["score"], "bucket": target_bucket}
+    audit_container_conflicts = len(container_conflicts)
+    for index, (obj, candidate) in enumerate(best_audit.items()):
+        if index % 8 == 0:
+            _progress(progress, 80 + int(index * 12 / max(len(best_audit), 1)),
+                      "Verifying HP ownership: {} ({}/{})".format(obj.name, index + 1, len(best_audit)))
         record = hp_records[obj]
         target_bucket, current_bucket = candidate["bucket"], record["bucket"]
         if target_bucket is current_bucket:
-            continue
-        if candidate["proxy"].get("is_container"):
-            audit_container_conflicts += 1
             continue
         current_score = _best_bucket_audit_score(current_bucket, record["data"], scene_diag)
         needs_repair = (
@@ -708,7 +818,9 @@ def analyze_material_distribution(hp_root, lp_root, progress=None, context=None)
 
     result_buckets = tuple(MaterialBucket(
         signature=tuple(bucket["signature"]), label=bucket["label"],
-        lp_objects=tuple(bucket["lp"]), hp_objects=tuple(bucket["hp"]),
+        lp_objects=tuple(obj for obj, material in bucket["lp"] if material is None),
+        hp_objects=tuple(bucket["hp"]),
+        lp_regions=tuple((obj, material) for obj, material in bucket["lp"] if material is not None),
     ) for bucket in buckets)
     diagnostics = MaterialDistributionDiagnostics(
         lp_proxy_count=len(all_proxies), container_count=container_count,

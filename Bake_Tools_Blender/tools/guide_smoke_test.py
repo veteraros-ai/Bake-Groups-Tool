@@ -18,7 +18,7 @@ from Bake_Tools_Blender.addon.bake_tools_blender.qt_window import _HELP_TOPICS
 
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-assert CURRENT_VERSION == "1.0.1"
+assert CURRENT_VERSION == "1.0.2"
 targets = set(_HELP_TOPICS.values()) | {"release.whats_new", "overview"}
 for language in ("en", "ru", "ja", "zh-CN"):
     document = build_document(language)
@@ -29,7 +29,7 @@ for language in ("en", "ru", "ja", "zh-CN"):
     if language == "en":
         headings = [entry.get("text") for entry in document["items"]
                     if entry.get("anchor") == "release.whats_new" and entry.get("type") == "text"]
-        assert "New in version 1.0.1" in headings, headings
+        assert "New in version 1.0.2" in headings, headings
     anchors = {entry.get("anchor") for entry in document["items"] if entry.get("type") == "rect"}
     missing = targets - anchors
     assert not missing, (language, sorted(missing))

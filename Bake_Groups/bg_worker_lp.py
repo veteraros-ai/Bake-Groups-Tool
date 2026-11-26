@@ -66,95 +66,48 @@ class LPMatchingWorker(QtCore.QThread):
         dz = center_a[2] - center_b[2]
         return (dx * dx + dy * dy + dz * dz) ** 0.5
 
-    def get_best_match(self, lp_data, lp_verts_flat):
-        """
-        Restored fast logic from the older worker:
-        - bbox overlap prefilter
-        - topology/position fast-confirm
-        - one-way C++ distance: LP -> HP
-
-        The previous v4 used bidirectional distance and weighted group scoring;
-        that is more expensive and is not needed for the fast LP assignment pass.
-        """
-        best_grp = None
-        min_avg_distance = float('inf')
-
+    def get_best_match(self, lp_data, lp_verts_flat, require_geometry=False):
+        """Rank spatially plausible HP candidates by measured geometry."""
         center_lp = self._center_from_min_max(lp_data)
-        size_lp = [
-            lp_data["max"][0] - lp_data["min"][0],
-            lp_data["max"][1] - lp_data["min"][1],
-            lp_data["max"][2] - lp_data["min"][2],
-        ]
-        diag_sq_lp = size_lp[0] * size_lp[0] + size_lp[1] * size_lp[1] + size_lp[2] * size_lp[2]
-
-        for grp, hp_paths in self.hp_groups.items():
+        best_key = None
+        best_group = None
+        for group, hp_paths in self.hp_groups.items():
             if self.is_cancelled:
                 return None
-
-            fast_confirm = False
-
             for hp_path in hp_paths:
                 hp_data = self.hp_data.get(hp_path)
-                if not hp_data:
+                if not hp_data or not bg_core.MathUtils.is_overlapping(
+                        lp_data, hp_data, padding=1.05, include_flat=True):
                     continue
 
-                # Cheap broad-phase filter: only expensive C++ distance for plausible candidates.
-                if not bg_core.MathUtils.is_overlapping(lp_data, hp_data, padding=1.05):
+                hp_verts = self.hp_verts_cache.get(hp_path)
+                measured = bool(HAS_MATH_CORE and hp_verts and lp_verts_flat)
+                if require_geometry and not measured:
                     continue
-
-                # Fast path for duplicated LP/HP topology in the same place.
-                is_topo_match = (
-                    lp_data.get("vtx", -1) == hp_data.get("vtx", -2) and
-                    lp_data.get("edges", -1) == hp_data.get("edges", -2)
-                )
-
-                if is_topo_match:
-                    size_hp = [
-                        hp_data["max"][0] - hp_data["min"][0],
-                        hp_data["max"][1] - hp_data["min"][1],
-                        hp_data["max"][2] - hp_data["min"][2],
-                    ]
-                    dims_match = all(
-                        abs(size_lp[i] - size_hp[i]) / (size_lp[i] if size_lp[i] > 1e-6 else 1e-6) < 0.001
-                        for i in range(3)
-                    )
-
-                    if dims_match:
-                        center_hp = self._center_from_min_max(hp_data)
-                        dx = center_lp[0] - center_hp[0]
-                        dy = center_lp[1] - center_hp[1]
-                        dz = center_lp[2] - center_hp[2]
-                        center_dist_sq = dx * dx + dy * dy + dz * dz
-
-                        if center_dist_sq <= diag_sq_lp * 0.001:
-                            fast_confirm = True
-                            break
-
-                hp_verts_flat = self.hp_verts_cache.get(hp_path, [])
-
-                if HAS_MATH_CORE and hp_verts_flat and lp_verts_flat:
-                    # Fast old behavior: one-way nearest-neighbour average LP -> HP.
-                    avg_dist = bg_math_core.calculate_avg_distance(lp_verts_flat, hp_verts_flat)
+                if measured:
+                    vertex_count = lp_data.get("vtx", 0)
+                    coord_count = vertex_count * 3
+                    if (0 < coord_count <= min(len(lp_verts_flat), len(hp_verts)) and
+                            vertex_count == hp_data.get("vtx") and
+                            lp_data.get("edges") == hp_data.get("edges")):
+                        # Compare the authored vertices. The LP and HP caches
+                        # can contain different numbers of interpolated points.
+                        low = lp_verts_flat[:coord_count]
+                        high = hp_verts[:coord_count]
+                        distance = max(bg_math_core.calculate_avg_distance(low, high),
+                                       bg_math_core.calculate_avg_distance(high, low))
+                    else:
+                        distance = bg_math_core.calculate_avg_distance(lp_verts_flat, hp_verts)
                 else:
-                    # Safe fallback when .pyd is missing or some cache is empty.
-                    center_hp = self._center_from_min_max(hp_data)
-                    avg_dist = self._center_distance(center_lp, center_hp)
-
-                if avg_dist < min_avg_distance:
-                    min_avg_distance = avg_dist
-                    best_grp = grp
-
-            if fast_confirm:
-                return grp
-
-        if best_grp:
-            threshold = lp_data.get("diag", 1.0) * self.lp_threshold_coef
-            if "ZBrush" in best_grp or "zbrush" in best_grp.lower():
-                threshold *= 3.0
-            if min_avg_distance < threshold:
-                return best_grp
-
-        return None
+                    distance = self._center_distance(center_lp, self._center_from_min_max(hp_data))
+                threshold = lp_data.get("diag", 1.0) * self.lp_threshold_coef
+                if "zbrush" in group.lower():
+                    threshold *= 3.0
+                if distance <= threshold:
+                    key = (not measured, distance, group)
+                    if best_key is None or key < best_key:
+                        best_key, best_group = key, group
+        return best_group
 
     def run(self):
         matches = {grp: set() for grp in self.hp_groups.keys()}

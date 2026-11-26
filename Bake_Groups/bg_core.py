@@ -186,21 +186,12 @@ class BakeSessionModel(object):
                 p['locked'] = []
             if 'final_smooth_states' not in p or not isinstance(p.get('final_smooth_states'), dict):
                 p['final_smooth_states'] = {}
-            # Per-subgroup cage max-offset overrides (empty = use global default).
-            if 'cage_overrides' not in p or not isinstance(p.get('cage_overrides'), dict):
-                p['cage_overrides'] = {}
-            # Global cage settings for this chapter (percent of bbox diagonal).
-            if 'cage_settings' not in p or not isinstance(p.get('cage_settings'), dict):
-                p['cage_settings'] = {}
+            # Retired feature metadata is ignored; existing scene geometry is
+            # deliberately left untouched when loading an older session.
+            p.pop('cage_overrides', None)
+            p.pop('cage_settings', None)
             if 'subgroup_color_indices' not in p or not isinstance(p.get('subgroup_color_indices'), dict):
                 p['subgroup_color_indices'] = {}
-            cs = p['cage_settings']
-            cs.setdefault('inflate', 5.0)   # step 1: uniform inflation (% diag)
-            cs.setdefault('gap', 0.5)       # kept gap between fitted cage and HP
-            cs.setdefault('unit', 'percent')
-            cs.setdefault('fitted', False)  # False = inflate mode, True = fitted
-            cs.setdefault('display_mode', 'solid')  # 'wire' | 'solid' cage look
-            cs.setdefault('export_enabled', False)  # enabled when Cage is created
             seen_ids.add(p['id'])
             
         return data
@@ -209,6 +200,18 @@ class BakeSessionModel(object):
 # MATH & DATA EXTRACTION (Original logic restored)
 # ==========================================
 class MeshDataManager(object):
+    @staticmethod
+    def _world_mesh_bounds(dag_path):
+        if dag_path.hasFn(om.MFn.kTransform):
+            dag_path = om.MDagPath(dag_path)
+            dag_path.extendToShape()
+        points = om.MFnMesh(dag_path).getPoints(om.MSpace.kWorld)
+        if not points:
+            return None
+        return (
+            [min(float(point[axis]) for point in points) for axis in range(3)],
+            [max(float(point[axis]) for point in points) for axis in range(3)])
+
     @staticmethod
     def get_mesh_data(mesh_name):
         if not cmds.objExists(mesh_name): return None
@@ -233,7 +236,8 @@ class MeshDataManager(object):
                     v_min = min([float(v) for v in v_values])
                     v_max = max([float(v) for v in v_values])
                     try:
-                        _uv_shell_ids, uv_shell_count = fnMesh.getUvShellsIds()
+                        uv_shell_count, _uv_shell_ids = fnMesh.getUvShellsIds()
+                        uv_shell_count = int(uv_shell_count)
                     except Exception:
                         uv_shell_count = 0
                     uv_signature = "{}:{}:{:.4f}:{:.4f}".format(
@@ -245,24 +249,23 @@ class MeshDataManager(object):
             except Exception:
                 pass
             
-            selListTransform = om.MSelectionList(); selListTransform.add(mesh_name)
-            dagPath = selListTransform.getDagPath(0)
-            
-            fnDag = om.MFnDagNode(dagPath)
-            bbox = fnDag.boundingBox
-            bbox.transformUsing(dagPath.inclusiveMatrix())
-            
-            p_min = bbox.min; p_max = bbox.max; center = bbox.center
+            world_bounds = MeshDataManager._world_mesh_bounds(shapeDagPath)
+            if not world_bounds:
+                return None
+            p_min = tuple(world_bounds[0])
+            p_max = tuple(world_bounds[1])
+            center = tuple((p_min[i] + p_max[i]) * 0.5 for i in range(3))
             display_layers = cmds.listConnections(mesh_name, type="displayLayer") or []
             is_zbrush = any("zbrush" in layer.lower() for layer in display_layers)
 
-            vol = (p_max.x - p_min.x) * (p_max.y - p_min.y) * (p_max.z - p_min.z)
-            diag = ((p_max.x - p_min.x)**2 + (p_max.y - p_min.y)**2 + (p_max.z - p_min.z)**2)**0.5
+            size = tuple(p_max[i] - p_min[i] for i in range(3))
+            vol = size[0] * size[1] * size[2]
+            diag = (size[0]**2 + size[1]**2 + size[2]**2)**0.5
             
             return {
                 "name": mesh_name, "vtx": vtx_count, "edges": edge_count,
-                "min": (p_min.x, p_min.y, p_min.z), "max": (p_max.x, p_max.y, p_max.z),
-                "center": (center.x, center.y, center.z),
+                "min": p_min, "max": p_max,
+                "center": center,
                 "volume": vol, "diag": diag, "is_zbrush": is_zbrush,
                 "uv_count": uv_count, "uv_shell_count": uv_shell_count,
                 "uv_signature": uv_signature
@@ -272,21 +275,18 @@ class MeshDataManager(object):
     @staticmethod
     def get_bbox_data_gt(dag_path_str):
         try:
-            selList = om.MSelectionList()
-            selList.add(dag_path_str)
-            dagPath = selList.getDagPath(0)
-            if dagPath.hasFn(om.MFn.kTransform):
-                try: dagPath.extendToShape()
-                except RuntimeError: pass
-            fnDag = om.MFnDagNode(dagPath)
-            bbox = fnDag.boundingBox
-            bbox.transformUsing(dagPath.inclusiveMatrix())
-            pmin = bbox.min; pmax = bbox.max
+            selection = om.MSelectionList()
+            selection.add(dag_path_str)
+            dag_path = selection.getDagPath(0)
+            world_bounds = MeshDataManager._world_mesh_bounds(dag_path)
+            if not world_bounds:
+                return None
+            pmin, pmax = world_bounds
             return {
-                'min': [pmin.x, pmin.y, pmin.z],
-                'max': [pmax.x, pmax.y, pmax.z],
-                'center': [(pmin.x + pmax.x) * 0.5, (pmin.y + pmax.y) * 0.5, (pmin.z + pmax.z) * 0.5],
-                'size': [pmax.x - pmin.x, pmax.y - pmin.y, pmax.z - pmin.z],
+                'min': pmin,
+                'max': pmax,
+                'center': [(pmin[i] + pmax[i]) * 0.5 for i in range(3)],
+                'size': [pmax[i] - pmin[i] for i in range(3)],
                 'node': dag_path_str
             }
         except Exception: return None
@@ -311,7 +311,7 @@ class MathUtils(object):
         return ((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2) ** 0.5
 
     @staticmethod
-    def is_overlapping(m1, m2, padding=1.02):
+    def is_overlapping(m1, m2, padding=1.02, include_flat=False):
         dist = MathUtils.distance(m1["center"], m2["center"])
         rad_sum = (m1["diag"] + m2["diag"]) * 0.5 * padding
         if dist > rad_sum: return False
@@ -323,6 +323,11 @@ class MathUtils(object):
 
         min1, max1 = expand_bbox(m1, padding)
         min2, max2 = expand_bbox(m2, padding)
+
+        if include_flat:
+            tolerance = max(m1["diag"], m2["diag"], 1e-6) * 1e-6
+            return all(min(max1[i], max2[i]) + tolerance >= max(min1[i], min2[i])
+                       for i in range(3))
 
         dx = max(0.0, min(max1[0], max2[0]) - max(min1[0], min2[0]))
         dy = max(0.0, min(max1[1], max2[1]) - max(min1[1], min2[1]))
@@ -433,6 +438,89 @@ class GeoMatcher(object):
         except Exception: return []
 
     @staticmethod
+    def find_hp_surface_supports(meshes, holes, surfaces, cancelled):
+        """Measure opening rims and compact repeats against the actual larger HP surfaces."""
+        from collections import Counter
+
+        topology = Counter((m.get("vtx"), m.get("edges")) for m in meshes.values())
+        diags = [m["diag"] for m in meshes.values() if m.get("diag", 0) > 0]
+        compact_limit = StatsUtils.median(diags) * 1.5 if diags else 0
+        candidates = [(name, m["bbox"], m["diag"]) for name, m in meshes.items()
+                      if m.get("bbox") and m.get("diag", 0) > 0]
+        intersectors = {}
+        supports = {}
+        for name, box, diag in candidates:
+            if cancelled():
+                break
+            loops = holes.get(name, {}).get("loops", ())
+            rim = max((loop for loop in loops if loop.get("closed", True)),
+                      key=lambda loop: loop["edge_count"], default=None)
+            mesh = meshes[name]
+            if mesh.get("is_zbrush"):
+                continue
+            repeated = topology[mesh.get("vtx"), mesh.get("edges")] > 1
+            if rim:
+                points = rim["points"]
+                quantile = 0.75
+            elif not loops and repeated and diag <= compact_limit:
+                points = surfaces.get(name, {}).get("samples", ())
+                quantile = 0.25
+            else:
+                continue
+            count = len(points) // 3
+            if count < 3:
+                continue
+            probes = [om.MPoint(*points[i * 3:i * 3 + 3])
+                      for i in range(0, count, max(1, math.ceil(count / 32)))]
+            if rim:
+                probes.append(om.MPoint(*rim["center"]))
+            tolerance = diag * 0.22
+            search_gap = diag * 0.42 if rim else tolerance
+            min_parent_ratio = 1.10 if rim else 2.5
+            for parent, parent_box, parent_diag in candidates:
+                if parent_diag < diag * min_parent_ratio or any(
+                        box[i] > parent_box[i + 3] + search_gap or
+                        parent_box[i] > box[i + 3] + search_gap for i in range(3)):
+                    continue
+                if parent not in intersectors:
+                    try:
+                        sel = om.MSelectionList()
+                        sel.add(parent)
+                        path = sel.getDagPath(0)
+                        path.extendToShape()
+                        intersector = om.MMeshIntersector()
+                        intersector.create(path.node())
+                        matrix = path.inclusiveMatrix()
+                        intersectors[parent] = (intersector, matrix, matrix.inverse())
+                    except (RuntimeError, TypeError, ValueError):
+                        intersectors[parent] = None
+                target = intersectors[parent]
+                if target is None:
+                    continue
+                intersector, matrix, inverse = target
+                distances = []
+                for point in probes:
+                    try:
+                        near = om.MPoint(intersector.getClosestPoint(point * inverse).point) * matrix
+                        distances.append(point.distanceTo(near))
+                    except RuntimeError:
+                        distances.append(float("inf"))
+                distances.sort()
+                distance = distances[math.ceil((len(distances) - 1) * quantile)]
+                # Long relief strips can span most of their panel. A near-size
+                # parent is credible only with substantially tighter contact.
+                limit = min(tolerance, diag * 0.04) if rim and parent_diag < diag * 1.8 else tolerance
+                # Recessed decals can have a small, uniform offset to the
+                # skin of the host even though the full rim follows it.
+                uniform_offset = (rim and parent_diag >= diag * 8.0 and distance <= search_gap
+                                  and distances[-1] - distances[0] <= diag * 0.015)
+                if distance <= limit or uniform_offset:
+                    supports.setdefault(name, []).append((parent, distance / diag))
+        for candidates in supports.values():
+            candidates.sort(key=lambda record: (record[1], record[0]))
+        return supports
+
+    @staticmethod
     def build_group_intersectors(hp_paths):
         intersectors = {}
         for path in hp_paths:
@@ -477,30 +565,42 @@ class MayaCore(object):
     def __init__(self): self._node_cache = {}
 
     def get_node_from_cache_or_uuid(self, uuid_str):
-        if not uuid_str: return None
-        if self._node_cache.get(uuid_str) and cmds.objExists(self._node_cache[uuid_str]): return self._node_cache[uuid_str]
-        nodes = cmds.ls(uuid_str, long=True) or []
-        if nodes:
-            self._node_cache[uuid_str] = nodes[0]; return nodes[0]
+        if not uuid_str:
+            return None
+        cached = self._node_cache.get(uuid_str)
+        if cached and cmds.ls(cached, uuid=True) == [uuid_str]:
+            return cached
+        self._node_cache.pop(uuid_str, None)
+        nodes = cmds.ls(uuid_str, long=True, type='transform') or []
+        if len(nodes) == 1:
+            self._node_cache[uuid_str] = nodes[0]
+            return nodes[0]
         return None
 
     def resolve_main_nodes(self, pair):
-        hp_node = self.get_node_from_cache_or_uuid(pair.get('hp_uuid'))
-        lp_node = self.get_node_from_cache_or_uuid(pair.get('lp_uuid'))
         base = pair.get('base', '')
-        def find_n(suffix):
-            f = cmds.ls("*{}*{}".format(base, suffix), type='transform', long=True) or []
-            for n in f:
-                if n.split('|')[-1] == "{}{}".format(base, suffix): return n
-            return f[0] if f else None
-        if not hp_node and base: hp_node = find_n(BakeConfig.SUFFIX_HP)
-        if not lp_node and base: lp_node = find_n(BakeConfig.SUFFIX_LP)
         needs_save = False
-        for node, key in [(hp_node, 'hp_uuid'), (lp_node, 'lp_uuid')]:
-            if node and cmds.objExists(node):
-                n_uuid = cmds.ls(node, uuid=True)[0]
-                self._node_cache[n_uuid] = node
-                if n_uuid != pair.get(key): pair[key] = n_uuid; needs_save = True
+
+        def resolve(key, suffix):
+            nonlocal needs_save
+            stored_uuid = pair.get(key)
+            if stored_uuid or not base:
+                return self.get_node_from_cache_or_uuid(stored_uuid)
+            # Legacy chapter records can lack UUIDs. Only migrate an unambiguous exact name.
+            name = base + suffix
+            candidates = [node for node in cmds.ls(name, long=True, type='transform') or []
+                          if node.rsplit('|', 1)[-1] == name]
+            if len(candidates) != 1:
+                return None
+            node = candidates[0]
+            node_uuid = cmds.ls(node, uuid=True)[0]
+            pair[key] = node_uuid
+            self._node_cache[node_uuid] = node
+            needs_save = True
+            return node
+
+        hp_node = resolve('hp_uuid', BakeConfig.SUFFIX_HP)
+        lp_node = resolve('lp_uuid', BakeConfig.SUFFIX_LP)
         return hp_node, lp_node, needs_save
 
     @staticmethod

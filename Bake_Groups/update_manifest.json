@@ -1,8 +1,8 @@
 {
-  "latest_version": "1.4.7",
-  "package_sha256": "c5d32e84ca5f47e003fb6c7d73e2e13525dc0b0da1c27926a2263c8c6cb22883",
+  "latest_version": "1.5.0",
+  "package_sha256": "3bc2efbc6c9e768381f8503d6c3c603ab702ba23057f7045da78bfd0d3edd95d",
   "github_url": "https://github.com/veteraros-ai/Bake-Groups-Tool",
   "releases_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases",
-  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.4.7/Bake_Groups_1.4.7.zip",
-  "release_notes": "Maya 1.4.7: Help opens a context-help instruction card; the Guide release banner covers 1.4.6 - 1.4.7. LP normals can be preserved before triangulation (enabled by default). Marmoset receives base HP without baked Preview smoothing, supports HP-only/LP-only export and safer synchronization. Subgroup visibility and chapter export exclusions are fixed. Cage editing adds undo-safe adjustments and validated LP/Cage export pairing."
+  "package_url": "https://github.com/veteraros-ai/Bake-Groups-Tool/releases/download/1.5.0/Bake_Groups_1.5.0.zip",
+  "release_notes": "Mesh Check, LP surface-based chapter distribution, Color HP palettes, context help and mirrored LP FBX export fixes."
 }

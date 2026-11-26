@@ -1,0 +1,25 @@
+﻿Bake Groups Tool 1.5.0 | Maya 2022–2027 | Windows x64
+
+ENGLISH
+1. Extract the entire archive. Keep Install_Bake_Groups.py beside Bake_Groups.
+2. Open Maya and select the Shelf tab where you want the Bake Groups button.
+3. Drag Install_Bake_Groups.py from Explorer into the Maya viewport.
+4. The installer copies the plugin into Maya's user scripts, adds or updates the Shelf button and saves the Shelf. Use that button to open Bake Groups.
+
+РУССКИЙ
+1. Распакуйте архив целиком. Сохраните Install_Bake_Groups.py рядом с папкой Bake_Groups.
+2. Откройте Maya и выберите вкладку Shelf для кнопки Bake Groups.
+3. Перетащите Install_Bake_Groups.py из Проводника во вьюпорт Maya.
+4. Установщик скопирует плагин в папку пользовательских скриптов Maya, добавит или обновит кнопку и сохранит Shelf. Открывайте Bake Groups этой кнопкой.
+
+日本語
+1. ZIP をすべて展開します。Install_Bake_Groups.py と Bake_Groups フォルダーは同じ階層に置きます。
+2. Maya を開き、Bake Groups ボタンを追加するシェルフのタブを選択します。
+3. エクスプローラーから Install_Bake_Groups.py を Maya のビューポートにドラッグします。
+4. インストーラーはプラグインを Maya のユーザースクリプトフォルダーにコピーし、ボタンを追加または更新してシェルフを保存します。そのボタンから Bake Groups を開けます。
+
+简体中文
+1. 完整解压 ZIP，将 Install_Bake_Groups.py 与 Bake_Groups 文件夹放在同一级目录。
+2. 打开 Maya，选择要添加 Bake Groups 按钮的工具架标签。
+3. 将 Install_Bake_Groups.py 从文件资源管理器拖入 Maya 视口。
+4. 安装器会将插件复制到 Maya 用户脚本目录，添加或更新工具架按钮并保存工具架。点击该按钮即可打开 Bake Groups。

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import bpy
 
 from .object_repository import ObjectRepository
@@ -36,12 +39,55 @@ def ensure_pair_color_indices(pair):
         next_index += 1
 
 
-def subgroup_rgb(subgroup):
-    if getattr(subgroup, "use_custom_color", False):
-        return tuple(float(value) for value in subgroup.custom_color[:3])
-    index = max(0, int(getattr(subgroup, "color_index", 0)))
-    base = PALETTE[index % len(PALETTE)]
-    shade_pass = index // len(PALETTE)
+def _palette_path():
+    return Path(bpy.utils.user_resource("CONFIG", path="bake_tools_blender", create=True)) / "hp_palette.json"
+
+
+def load_palette_settings():
+    try:
+        data = json.loads(_palette_path().read_text(encoding="utf8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_palette_settings(settings):
+    path = _palette_path()
+    pending = path.with_suffix(".tmp")
+    pending.write_text(json.dumps(settings, ensure_ascii=False), encoding="utf8")
+    pending.replace(path)
+
+
+_active_palette = None
+
+
+def get_palette():
+    global _active_palette
+    if _active_palette is None:
+        saved = load_palette_settings().get("default", {})
+        _active_palette = (saved.get("colors", PALETTE), saved.get("overrides", {}))
+    return _active_palette
+
+
+def set_palette(colors, overrides):
+    global _active_palette
+    _active_palette = (tuple(tuple(rgb) for rgb in colors), dict(overrides))
+
+
+def subgroup_rgb(subgroup, custom_color=None):
+    colors, overrides = get_palette()
+    custom = overrides.get(subgroup.name, custom_color)
+    if custom is None and getattr(subgroup, "use_custom_color", False):
+        custom = subgroup.custom_color
+    if custom is not None:
+        return tuple(float(value) for value in custom[:3])
+    return indexed_rgb(subgroup.color_index, colors)
+
+
+def indexed_rgb(index, colors):
+    index = max(0, int(index))
+    base = colors[index % len(colors)]
+    shade_pass = index // len(colors)
     shade = 1.0 if shade_pass == 0 else max(0.38, 0.62 ** shade_pass)
     return tuple(max(0.0, min(1.0, channel * shade)) for channel in base)
 
@@ -85,8 +131,10 @@ def _enable_object_colors():
         # Object Color is evaluated by Workbench/Solid shading. Merely changing
         # color_type has no visible effect while the artist is in Material
         # Preview or Rendered mode, which made Color HP appear broken.
-        space.shading.type = "SOLID"
-        space.shading.color_type = "OBJECT"
+        if space.shading.type != "SOLID":
+            space.shading.type = "SOLID"
+        if space.shading.color_type != "OBJECT":
+            space.shading.color_type = "OBJECT"
         try:
             area.tag_redraw()
         except (AttributeError, ReferenceError, RuntimeError):
@@ -107,18 +155,22 @@ def _restore_shading_modes():
     _shading_modes.clear()
 
 
+def _restore_object_color(obj):
+    original = obj.get(_ORIGINAL_COLOR)
+    if original is not None and len(original) >= 4:
+        obj.color = tuple(float(channel) for channel in original[:4])
+    for key in (_ORIGINAL_COLOR, _PREVIEW_MARKER):
+        if key in obj:
+            del obj[key]
+
+
 def restore_color_preview(restore_shading=True):
     """Restore every mesh touched by the preview, including after a file reload."""
     restored = 0
     for obj in bpy.data.objects:
         if not obj.get(_PREVIEW_MARKER, False):
             continue
-        original = obj.get(_ORIGINAL_COLOR)
-        if original is not None and len(original) >= 4:
-            obj.color = tuple(float(channel) for channel in original[:4])
-        for key in (_ORIGINAL_COLOR, _PREVIEW_MARKER):
-            if key in obj:
-                del obj[key]
+        _restore_object_color(obj)
         restored += 1
     if restore_shading:
         _restore_shading_modes()
@@ -129,24 +181,29 @@ def restore_color_preview(restore_shading=True):
 
 def refresh_color_preview(state, pair=None):
     """Apply the active chapter palette or restore the artist's object colors."""
-    restore_color_preview(restore_shading=not state.color_subgroups or pair is None)
     if not state.color_subgroups or pair is None:
+        restore_color_preview()
         return 0
 
     ensure_pair_color_indices(pair)
-    colored = 0
+    targets = {}
     for subgroup in pair.subgroups:
-        rgb = subgroup_rgb(subgroup)
+        color = (*subgroup_rgb(subgroup), 1.0)
         for obj in ObjectRepository.valid_members(subgroup, "HP"):
-            if obj.type != "MESH":
-                continue
-            if _ORIGINAL_COLOR not in obj:
-                obj[_ORIGINAL_COLOR] = tuple(float(channel) for channel in obj.color)
+            if obj.type == "MESH":
+                targets[obj] = color
+
+    for obj in bpy.data.objects:
+        if obj.get(_PREVIEW_MARKER, False) and obj not in targets:
+            _restore_object_color(obj)
+    for obj, color in targets.items():
+        if not obj.get(_PREVIEW_MARKER, False):
+            obj[_ORIGINAL_COLOR] = tuple(obj.color)
             obj[_PREVIEW_MARKER] = True
-            obj.color = (rgb[0], rgb[1], rgb[2], 1.0)
-            colored += 1
-    if colored:
+        if any(abs(old - new) > 1e-6 for old, new in zip(obj.color, color)):
+            obj.color = color
+    if targets:
         _enable_object_colors()
     else:
         _restore_shading_modes()
-    return colored
+    return len(targets)
